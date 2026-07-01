@@ -26,6 +26,8 @@ Claude / Hermes / Codex.
 
 ## Статус
 
-Работает: детерминированное ядро + скилл `curate` + часовая Orca-автоматизация (end-to-end
-проверено). В работе — on-session-end триггер, парсеры Hermes/Codex (см. бэклог control-panel).
+Работает: детерминированное ядро + скилл `curate` + Orca-автоматизация с двумя триггерами (оба через
+`orca automations run` = `runNow`): on-session-end (`hooks/session-end-trigger.sh` через `SessionEnd`-хук
+Claude) и часовой sweep — system-timer `curator-sweep.timer` (Orca-rrule в headless serve не срабатывает).
+В работе — парсеры Hermes/Codex (SessionEnd-триггер пока только у Claude-голов), см. бэклог control-panel.
 Дизайн: `control-panel/docs/ARCHITECTURE.md`.
