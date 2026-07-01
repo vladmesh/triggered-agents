@@ -1,0 +1,23 @@
+# Portable automation spec for the curator triggered-agent.
+#
+# This is the canon for HOW the agent is scheduled and dispatched. Host bindings that Orca
+# generates (workspace path, repo/setup/automation UUIDs) are NOT here — deploy/provision.py
+# resolves them on the host and applies this spec idempotently (match Orca automation by
+# `name`, edit in place so the automation id — and thus the systemd unit — stays stable).
+
+name = "curator"          # Orca automation name; the match key across re-provisions
+skill = "/curate"         # automation prompt = skill invocation (skill lives in .claude/skills/curate)
+provider = "claude"
+reuse_session = true
+precheck = ""             # optional precheck command; "" = none. When set, Orca skips a run on non-zero exit.
+
+[trigger]
+# Orca's own rrule does not tick in headless `orca serve`; kept for correctness but the real
+# clock is the systemd timer below.
+orca = "hourly"
+
+[systemd]
+# The actual scheduler on this headless box. Unit name is derived as ta-<name>.
+calendar = "hourly"
+randomized_delay_sec = 90   # jitter so the sweep never races a SessionEnd trigger at exactly :00
+legacy_unit = "curator-sweep"  # one-time: remove the pre-provisioning hand-written unit of this name

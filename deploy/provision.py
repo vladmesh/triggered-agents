@@ -1,0 +1,204 @@
+#!/usr/bin/env python3
+"""Provision a triggered-agent's Orca automation + systemd timer from its in-repo spec.
+
+The spec (triggered_agents/agents/<agent>/automation.toml) is the canon for how an agent is
+scheduled and dispatched. Host bindings Orca generates (workspace path, repo/automation
+UUIDs) are resolved here, not stored in the spec. This applies the spec idempotently:
+
+  * register the repo in Orca (once),
+  * mark the workspace folder trusted for Claude Code (else headless hangs on the dialog),
+  * upsert the Orca automation matched BY NAME — edit in place so its id (and thus the
+    systemd ExecStart) stays stable across re-provisions; create only if missing,
+  * generate the ta-<agent> systemd service+timer from the spec (the real clock on this
+    headless box), and remove a one-time legacy unit if the spec names one.
+
+Re-runnable. Usage: python3 deploy/provision.py [<agent> ...]  (default: every agent with a spec)
+"""
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import tomllib
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+AGENTS_DIR = REPO_ROOT / "triggered_agents" / "agents"
+CLAUDE_JSON = Path.home() / ".claude.json"
+SYSTEMD_DIR = Path("/etc/systemd/system")
+ORCA = os.environ.get("ORCA_BIN") or subprocess.run(
+    ["bash", "-lc", "command -v orca"], capture_output=True, text=True
+).stdout.strip() or "/home/dev/.local/bin/orca"
+
+
+def log(msg: str) -> None:
+    print(f"[provision] {msg}")
+
+
+def run(cmd: list[str], check: bool = True, input_bytes: bytes | None = None) -> subprocess.CompletedProcess:
+    p = subprocess.run(cmd, capture_output=True, text=True, input=input_bytes.decode() if input_bytes else None)
+    if check and p.returncode != 0:
+        raise SystemExit(f"[provision] command failed ({p.returncode}): {' '.join(cmd)}\n{p.stderr or p.stdout}")
+    return p
+
+
+def orca_json(args: list[str]) -> dict:
+    p = run([ORCA, *args, "--json"])
+    return json.loads(p.stdout)
+
+
+def _unwrap(d: dict, key: str):
+    # orca wraps payloads as {"ok":true,"result":{...}}; tolerate both shapes.
+    res = d.get("result", d)
+    return res.get(key, d.get(key))
+
+
+# ---- steps --------------------------------------------------------------------------
+
+def ensure_repo_registered(root: Path) -> None:
+    listing = run([ORCA, "repo", "list"]).stdout
+    if any(line.split() and line.split()[-1] == str(root) for line in listing.splitlines()):
+        log(f"repo already registered: {root}")
+        return
+    run([ORCA, "repo", "add", "--path", str(root)])
+    log(f"repo registered: {root}")
+
+
+def ensure_trust(workspace: Path) -> None:
+    key = str(workspace)
+    d = json.loads(CLAUDE_JSON.read_text())
+    projs = d.setdefault("projects", {})
+    entry = projs.setdefault(key, {})
+    if entry.get("hasTrustDialogAccepted") is True:
+        log(f"folder trust already set: {key}")
+        return
+    entry["hasTrustDialogAccepted"] = True
+    fd, tmp = tempfile.mkstemp(dir=str(CLAUDE_JSON.parent), prefix=".claude.json.")
+    with os.fdopen(fd, "w") as f:
+        json.dump(d, f, indent=2, ensure_ascii=False)
+    os.replace(tmp, CLAUDE_JSON)
+    log(f"folder trust set: {key}")
+
+
+def _automation_id_by_name(name: str) -> str | None:
+    data = orca_json(["automations", "list"])
+    for a in (_unwrap(data, "automations") or []):
+        if a.get("name") == name:
+            return a.get("id")
+    return None
+
+
+def ensure_automation(spec: dict, workspace: Path) -> str:
+    name = spec["name"]
+    common = [
+        "--prompt", spec["skill"],
+        "--provider", spec["provider"],
+        "--trigger", spec.get("trigger", {}).get("orca", "hourly"),
+        "--workspace", f"path:{workspace}",
+        "--workspace-mode", "existing",
+        "--reuse-session" if spec.get("reuse_session") else "--fresh-session",
+    ]
+    if spec.get("precheck"):
+        common += ["--precheck", spec["precheck"]]
+
+    aid = _automation_id_by_name(name)
+    if aid:
+        run([ORCA, "automations", "edit", aid, *common])
+        log(f"automation edited (id preserved): {name} {aid}")
+    else:
+        data = orca_json(["automations", "create", "--name", name, *common, "--enabled"])
+        aid = (_unwrap(data, "automation") or {}).get("id")
+        if not aid:
+            raise SystemExit(f"[provision] could not read new automation id for {name}")
+        log(f"automation created: {name} {aid}")
+    return aid
+
+
+def _service_unit(agent: str, aid: str, calendar: str) -> str:
+    return f"""[Unit]
+Description=triggered-agents: {agent} run ({calendar} backstop; drives the same Orca automation as the event trigger)
+Documentation=file:///home/dev/control-panel/docs/ARCHITECTURE.md
+# Orca's rrule does not tick in headless serve; this timer drives the run via `automations run`.
+After=orca-server.service network-online.target
+Wants=orca-server.service
+
+[Service]
+Type=oneshot
+User=dev
+Group=dev
+WorkingDirectory=/home/dev
+Environment=HOME=/home/dev
+ExecStart={ORCA} automations run {aid}
+"""
+
+
+def _timer_unit(agent: str, calendar: str, delay: int) -> str:
+    return f"""[Unit]
+Description=triggered-agents: {agent} {calendar} sweep
+
+[Timer]
+OnCalendar={calendar}
+Persistent=true
+RandomizedDelaySec={delay}
+
+[Install]
+WantedBy=timers.target
+"""
+
+
+def _sudo_write(path: Path, content: str) -> None:
+    run(["sudo", "tee", str(path)], input_bytes=content.encode())
+
+
+def remove_legacy_unit(legacy: str) -> None:
+    if not legacy:
+        return
+    timer = f"{legacy}.timer"
+    if subprocess.run(["systemctl", "cat", timer], capture_output=True).returncode != 0:
+        return
+    log(f"removing legacy unit: {legacy}")
+    run(["sudo", "systemctl", "disable", "--now", timer], check=False)
+    for suffix in ("service", "timer"):
+        run(["sudo", "rm", "-f", str(SYSTEMD_DIR / f"{legacy}.{suffix}")], check=False)
+
+
+def ensure_systemd(agent: str, spec: dict, aid: str) -> None:
+    sysd = spec.get("systemd", {})
+    calendar = sysd.get("calendar", "hourly")
+    delay = int(sysd.get("randomized_delay_sec", 0))
+    unit = f"ta-{agent}"
+    _sudo_write(SYSTEMD_DIR / f"{unit}.service", _service_unit(agent, aid, calendar))
+    _sudo_write(SYSTEMD_DIR / f"{unit}.timer", _timer_unit(agent, calendar, delay))
+    remove_legacy_unit(sysd.get("legacy_unit", ""))
+    run(["sudo", "systemctl", "daemon-reload"])
+    run(["sudo", "systemctl", "enable", "--now", f"{unit}.timer"])
+    log(f"systemd unit active: {unit}.timer ({calendar}, id {aid})")
+
+
+def provision(agent: str) -> None:
+    spec_path = AGENTS_DIR / agent / "automation.toml"
+    if not spec_path.is_file():
+        raise SystemExit(f"[provision] no spec: {spec_path}")
+    spec = tomllib.loads(spec_path.read_text())
+    log(f"=== provisioning {agent} (workspace {REPO_ROOT}) ===")
+    ensure_repo_registered(REPO_ROOT)
+    ensure_trust(REPO_ROOT)
+    aid = ensure_automation(spec, REPO_ROOT)
+    ensure_systemd(agent, spec, aid)
+    log(f"=== {agent} done ===")
+
+
+def main(argv: list[str]) -> int:
+    agents = argv or sorted(p.name for p in AGENTS_DIR.iterdir() if (p / "automation.toml").is_file())
+    if not agents:
+        log("no agent specs found")
+        return 1
+    for a in agents:
+        provision(a)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))
