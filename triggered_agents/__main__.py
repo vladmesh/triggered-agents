@@ -13,7 +13,7 @@ from __future__ import annotations
 import sys
 from importlib import import_module
 
-AGENTS = ("curator",)
+AGENTS = ("curator", "board")
 
 
 def main(argv=None) -> int:
