@@ -22,6 +22,9 @@ def main(argv=None) -> int:
         print(__doc__)
         print("agents:", ", ".join(AGENTS))
         return 0
+    if argv[0] == "health":  # cross-agent, not a per-agent cmd
+        from .runtime import health
+        return health.check(AGENTS)
     agent, rest = argv[0], argv[1:]
     if agent not in AGENTS:
         print(f"triggered_agents: unknown agent {agent!r} (known: {', '.join(AGENTS)})", file=sys.stderr)
