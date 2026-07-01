@@ -236,7 +236,7 @@ def ensure_systemd(agent: str, spec: dict, workspace: Path) -> None:
     remove_legacy_unit(sysd.get("legacy_unit", ""))
     run(["sudo", "systemctl", "daemon-reload"])
     run(["sudo", "systemctl", "enable", "--now", f"{unit}.timer"])
-    log(f"systemd unit active: {unit}.timer ({calendar}, id {aid})")
+    log(f"systemd unit active: {unit}.timer ({calendar})")
 
 
 def provision(agent: str) -> None:

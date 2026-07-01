@@ -1,26 +1,26 @@
 """Singleton terminal driver, shared by every triggered-agent.
 
-Replaces `orca automations run` in the systemd trigger. One agent = one warm claude terminal
-in its worktree. On a trigger (after precheck passes) this converges the workspace to a single
-agent terminal and dispatches the skill into it:
+Replaces `orca automations run` in the systemd trigger. One agent = one claude terminal in its
+worktree. On a trigger (after precheck passes, under the run lock) it decides:
 
-  * no agent terminal open        -> create one running `claude ... <skill>`
-  * an idle agent terminal open   -> `/clear` it and re-send <skill> (warm reuse, no re-init)
-  * agent terminal busy (fresh)   -> leave it working, don't re-dispatch (and close any dups)
-  * agent terminal busy but stuck -> watchdog: close it and start fresh
+  * an agent terminal is busy and fresh  -> leave it working, dispatch nothing
+  * otherwise (none / all idle / stuck)  -> reset the workspace and start one fresh agent
 
-Why not just Orca's `reuse_session`: it spawns a NEW terminal when the prior session is busy, so
-tick agents pile up warm/stuck duplicates (a leak). We want the opposite policy — busy means
-skip, not spawn — which Orca doesn't do natively, so the trigger drives terminals directly.
+Why `orca automations run` was wrong: it dispatches trigger=manual and spawns a NEW head every
+tick (reuse only kicks in for scheduled runs, which don't tick headless), so `/board`/`/curate`
+piled up as warm/stuck duplicates — a leak.
 
-"Busy vs idle" is Orca's tui-idle condition; "stuck" is busy with no terminal output for
-WATCHDOG_SECONDS. Orca's own agent status is known to wedge on 'working' after a silent exit, so
-a bare busy check would disable the agent forever — the watchdog is what makes "skip when busy"
-safe.
+Why reset-and-recreate instead of warm `/clear` reuse: Orca's per-terminal `close` doesn't
+remove a pane, it kills the pty and respawns a bare shell in its place, so closing duplicates
+just trades claude panes for orphan shells (UI noise). `terminal stop --worktree` is the only
+clean sweep (down to Orca's one floor shell). So the steady state is exactly 1 floor shell + 1
+agent terminal; a fresh claude per run is also more deterministic (no leaked cross-run context).
 
-Runs under the agent's run lock so a manual trigger can't race the timer into two terminals.
-Dispatch only SENDS the skill and returns; the head reaches `advance` (same lock) minutes later,
-so there's no deadlock.
+"Busy vs idle" is Orca's tui-idle condition; "stuck" is busy with no output for
+WATCHDOG_SECONDS. Orca's agent status is known to wedge on 'working' after a silent exit, so a
+bare busy check would freeze the agent forever — the watchdog is what makes "skip when busy"
+safe. Dispatch only starts the agent and returns; the head reaches `advance` (same lock) minutes
+later, so there's no deadlock.
 """
 from __future__ import annotations
 
@@ -29,8 +29,9 @@ import os
 import shutil
 import subprocess
 import time
-import tomllib
 from pathlib import Path
+
+import tomllib
 
 from .state import AgentState
 
@@ -65,7 +66,7 @@ def _launch_cmd(agent: str) -> tuple[str, str]:
 
 
 def _agent_terminals(ws: str) -> list[dict]:
-    """Live terminals in the workspace that are running a claude agent (title carries 'Claude')."""
+    """Live terminals in the workspace running a claude agent (title carries 'Claude')."""
     terms = _orca_json(["terminal", "list", "--worktree", f"path:{ws}"]).get("terminals", []) or []
     return [t for t in terms if "Claude" in (t.get("title") or "")]
 
@@ -84,52 +85,22 @@ def _quiet_seconds(term: dict, now: float) -> float:
     return (now - last / 1000.0) if last else 0.0
 
 
-def _close(handle: str) -> None:
-    _orca(["terminal", "close", "--terminal", handle])
-
-
-def _send(handle: str, text: str) -> None:
-    _orca(["terminal", "send", "--terminal", handle, "--text", text, "--enter"])
-
-
-def _create(ws: str, command: str) -> None:
-    _orca(["terminal", "create", "--worktree", f"path:{ws}", "--command", command])
-
-
 def run(agent: str) -> int:
     skill, launch = _launch_cmd(agent)
     ws = _workspace(agent)
     with AgentState(agent).lock():
-        terms = _agent_terminals(ws)
-        if not terms:
-            _create(ws, launch)
-            print(f"dispatch[{agent}]: no terminal — created fresh -> {skill}")
-            return 0
-
-        idle = [t for t in terms if _is_idle(t["handle"])]
-        if idle:
-            survivor = idle[0]
-            for t in terms:
-                if t["handle"] != survivor["handle"]:
-                    _close(t["handle"])
-            _send(survivor["handle"], "/clear")
-            time.sleep(1.0)  # let /clear settle before the skill lands
-            _send(survivor["handle"], skill)
-            print(f"dispatch[{agent}]: reused idle terminal (/clear -> {skill}); closed {len(terms) - 1} extra")
-            return 0
-
-        # all busy — watchdog on the freshest; if even it is silent too long, everything's stuck.
         now = time.time()
-        newest = max(terms, key=lambda t: t.get("lastOutputAt") or 0)
-        quiet = _quiet_seconds(newest, now)
-        if quiet > WATCHDOG_SECONDS:
-            for t in terms:
-                _close(t["handle"])
-            _create(ws, launch)
-            print(f"dispatch[{agent}]: busy but stuck ({int(quiet)}s silent) — watchdog restart -> {skill}")
-            return 0
-        for t in terms:  # genuinely working: keep the freshest, drop older duplicates, no re-dispatch
-            if t["handle"] != newest["handle"]:
-                _close(t["handle"])
-        print(f"dispatch[{agent}]: busy ({int(quiet)}s silent) — left it running; closed {len(terms) - 1} dup(s)")
+        for t in _agent_terminals(ws):
+            if _is_idle(t["handle"]):
+                continue
+            quiet = _quiet_seconds(t, now)
+            if quiet <= WATCHDOG_SECONDS:  # a fresh, working agent — don't interrupt or pile on
+                print(f"dispatch[{agent}]: agent busy ({int(quiet)}s silent) — left running, no dispatch")
+                return 0
+            # else: busy but silent too long -> stuck; fall through to reset
+        # none / all idle / stuck: sweep the workspace clean, start exactly one fresh agent
+        _orca(["terminal", "stop", "--worktree", f"path:{ws}"])
+        time.sleep(1.0)
+        _orca(["terminal", "create", "--worktree", f"path:{ws}", "--command", launch])
+        print(f"dispatch[{agent}]: reset workspace -> fresh {skill}")
         return 0
