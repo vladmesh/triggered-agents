@@ -10,11 +10,11 @@ Claude / Hermes / Codex.
 
 - **Вход:** переписки всех голов (парсер на голову) + родные файлы агентов
   (CLAUDE.md / GEMINI.md / USER.md).
-- **Экстракция:** дешёвой моделью вытаскивает durable-факты (формат «утверждение + почему»).
+- **Экстракция:** агент (Sonnet через Orca-автоматизацию) вытаскивает durable-факты
+  (формат «утверждение + почему»).
 - **Дедуп/конфликты:** near-dup → skip/merge, конфликт → supersede старого.
 - **Redaction:** сырые секреты из транскриптов не попадают в канон (git вечен).
 - **Запись:** коммитит markdown в `panelmem-kb`. Индекс не трогает — его ребилдит memory-mcp.
-- **Baseline:** обновляет `baseline.md` в `panelmem-kb` (его импортирует персона секретаря).
 
 ## Инварианты
 
@@ -26,4 +26,6 @@ Claude / Hermes / Codex.
 
 ## Статус
 
-Скелет. Реализация — в бэклоге (см. control-panel). Дизайн: `control-panel/docs/secretary.md`.
+Работает: детерминированное ядро + скилл `curate` + часовая Orca-автоматизация (end-to-end
+проверено). В работе — on-session-end триггер, парсеры Hermes/Codex (см. бэклог control-panel).
+Дизайн: `control-panel/docs/ARCHITECTURE.md`.
