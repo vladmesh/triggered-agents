@@ -15,7 +15,9 @@ import os
 from pathlib import Path
 
 # Claude project-dir naming: cwd path with every "/" turned into "-", leading "-".
-CLAUDE_PROJECTS = Path.home() / ".claude" / "projects"
+# Overridable via TA_CLAUDE_PROJECTS_DIR so a run (e.g. an e2e on fixtures) can point the
+# scan at a synthetic tree instead of the live ~/.claude/projects.
+CLAUDE_PROJECTS = Path(os.environ.get("TA_CLAUDE_PROJECTS_DIR", str(Path.home() / ".claude" / "projects")))
 
 # cwd prefixes whose sessions we never harvest — the triggered-agents' own runs, so no
 # triggered-agent (curator included) harvests itself or its siblings:
