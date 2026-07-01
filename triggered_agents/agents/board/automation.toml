@@ -9,7 +9,9 @@ name = "board"            # Orca automation name; the match key across re-provis
 skill = "/board"          # automation prompt = skill invocation (skill lives in .claude/skills/board)
 provider = "claude"
 reuse_session = true
-precheck = ""             # PoC: no change-detection yet; git-sha precheck lands when it earns its keep
+# Git-sha change-detection: skip the hourly sweep when no plan project moved. Gated in the
+# systemd unit, not Orca's field (manual `automations run` ignores --precheck; see provision.py).
+precheck = "python3 -m triggered_agents board precheck"
 
 [trigger]
 # Orca's own rrule does not tick in headless `orca serve`; kept for correctness but the real

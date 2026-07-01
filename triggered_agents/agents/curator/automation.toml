@@ -9,7 +9,9 @@ name = "curator"          # Orca automation name; the match key across re-provis
 skill = "/curate"         # automation prompt = skill invocation (skill lives in .claude/skills/curate)
 provider = "claude"
 reuse_session = true
-precheck = ""             # optional precheck command; "" = none. When set, Orca skips a run on non-zero exit.
+# Skip the run when no session has new turns since the watermark. Gated in the systemd unit,
+# not Orca's field (manual `automations run` ignores --precheck; see provision.py).
+precheck = "python3 -m triggered_agents curator precheck"
 
 [trigger]
 # Orca's own rrule does not tick in headless `orca serve`; kept for correctness but the real

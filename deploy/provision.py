@@ -163,7 +163,21 @@ def ensure_automation(spec: dict, workspace: Path) -> str:
     return aid
 
 
-def _service_unit(agent: str, aid: str, calendar: str) -> str:
+def _service_unit(agent: str, aid: str, calendar: str, workspace: Path, precheck: str) -> str:
+    dispatch = f"{ORCA} automations run {aid}"
+    if precheck:
+        # The change-detection gate lives HERE, not in Orca's automation --precheck field:
+        # `automations run` dispatches with trigger=manual, and Orca only honors precheck for
+        # trigger=scheduled (service.ts) — which never ticks in headless serve. So gate the
+        # dispatch in the unit: run the precheck in the workspace (cwd on sys.path for
+        # `python3 -m triggered_agents`), dispatch only on exit 0, exit 0 either way so a
+        # skip isn't logged as a unit failure.
+        exec_start = (
+            f"/bin/bash -lc 'if {precheck}; then exec {dispatch}; "
+            f'else echo "[ta-{agent}] precheck: no change, run skipped"; fi\''
+        )
+    else:
+        exec_start = dispatch
     return f"""[Unit]
 Description=triggered-agents: {agent} run ({calendar} backstop; drives the same Orca automation as the event trigger)
 Documentation=file:///home/dev/control-panel/docs/ARCHITECTURE.md
@@ -175,9 +189,9 @@ Wants=orca-server.service
 Type=oneshot
 User=dev
 Group=dev
-WorkingDirectory=/home/dev
+WorkingDirectory={workspace}
 Environment=HOME=/home/dev
-ExecStart={ORCA} automations run {aid}
+ExecStart={exec_start}
 """
 
 
@@ -211,12 +225,13 @@ def remove_legacy_unit(legacy: str) -> None:
         run(["sudo", "rm", "-f", str(SYSTEMD_DIR / f"{legacy}.{suffix}")], check=False)
 
 
-def ensure_systemd(agent: str, spec: dict, aid: str) -> None:
+def ensure_systemd(agent: str, spec: dict, aid: str, workspace: Path) -> None:
     sysd = spec.get("systemd", {})
     calendar = sysd.get("calendar", "hourly")
     delay = int(sysd.get("randomized_delay_sec", 0))
     unit = f"ta-{agent}"
-    _sudo_write(SYSTEMD_DIR / f"{unit}.service", _service_unit(agent, aid, calendar))
+    _sudo_write(SYSTEMD_DIR / f"{unit}.service",
+                _service_unit(agent, aid, calendar, workspace, spec.get("precheck", "")))
     _sudo_write(SYSTEMD_DIR / f"{unit}.timer", _timer_unit(agent, calendar, delay))
     remove_legacy_unit(sysd.get("legacy_unit", ""))
     run(["sudo", "systemctl", "daemon-reload"])
@@ -235,7 +250,7 @@ def provision(agent: str) -> None:
     migrate_state(agent, workspace)
     ensure_trust(workspace)
     aid = ensure_automation(spec, workspace)
-    ensure_systemd(agent, spec, aid)
+    ensure_systemd(agent, spec, aid, workspace)
     log(f"=== {agent} done (workspace {workspace}) ===")
 
 
