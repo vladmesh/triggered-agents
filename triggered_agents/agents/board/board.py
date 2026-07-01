@@ -88,9 +88,18 @@ def ensure_structure() -> dict:
         if name not in have:
             call("addSwimlane", project_id=pid, name=name)
             added.append(name)
+    # Board is a projection: keep only project swimlanes active. Disable strays — notably
+    # Kanboard's built-in "Default swimlane", which otherwise sits empty taking board width.
+    keep = set(projects)
+    disabled = []
+    for s in call("getActiveSwimlanes", project_id=pid) or []:
+        if s["name"] not in keep:
+            call("disableSwimlane", project_id=pid, swimlane_id=int(s["id"]))
+            disabled.append(s["name"])
+
     admin_added = _ensure_admin_member(pid)
-    return {"board_id": pid, "columns": COLUMNS, "swimlanes": projects,
-            "swimlanes_added": added, "admin_member_added": admin_added}
+    return {"board_id": pid, "columns": COLUMNS, "swimlanes": projects, "swimlanes_added": added,
+            "swimlanes_disabled": disabled, "admin_member_added": admin_added}
 
 
 def list_cards(swimlane: str | None = None) -> list[dict]:
