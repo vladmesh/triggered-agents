@@ -7,9 +7,9 @@ search actually fired near an answer (the "answered from memory without memory_s
 Path is overridable via TA_SEARCH_LOG (default ~/memory-mcp/search-log.jsonl). The file may not
 exist yet — that is not an error, it just means an empty tail.
 
-Timestamps: Claude transcript ts are UTC (trailing Z); the search log writes naive local time.
-We normalize both to naive UTC for comparison, so this assumes the box runs in UTC. It's only a
-correlation aid, so a small window slack absorbs minor skew.
+Timestamps: Claude transcript ts are UTC (trailing Z); the search log writes naive UTC
+(memory-mcp uses datetime.utcnow().isoformat()). Both normalize to naive UTC for comparison;
+the window slack absorbs minor skew.
 """
 from __future__ import annotations
 
