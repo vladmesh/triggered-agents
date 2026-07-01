@@ -26,6 +26,9 @@ def main(argv=None) -> int:
     if agent not in AGENTS:
         print(f"triggered_agents: unknown agent {agent!r} (known: {', '.join(AGENTS)})", file=sys.stderr)
         return 2
+    if rest and rest[0] == "dispatch":  # generic singleton terminal driver, one for every agent
+        from .runtime import dispatch
+        return dispatch.run(agent)
     cli = import_module(f"triggered_agents.agents.{agent}.cli")
     return cli.main(rest)
 

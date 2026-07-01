@@ -163,25 +163,25 @@ def ensure_automation(spec: dict, workspace: Path) -> str:
     return aid
 
 
-def _service_unit(agent: str, aid: str, calendar: str, workspace: Path, precheck: str) -> str:
-    dispatch = f"{ORCA} automations run {aid}"
+def _service_unit(agent: str, calendar: str, workspace: Path, precheck: str) -> str:
+    # Dispatch is our singleton terminal driver, NOT `orca automations run`: the latter dispatches
+    # with trigger=manual and spawns a new head every tick (Orca's reuse only kicks in for
+    # scheduled runs, which don't tick headless), so heads pile up. The driver converges the
+    # workspace to one warm claude terminal and reuses it. See runtime/dispatch.py.
+    dispatch = f"python3 -m triggered_agents {agent} dispatch"
     if precheck:
-        # The change-detection gate lives HERE, not in Orca's automation --precheck field:
-        # `automations run` dispatches with trigger=manual, and Orca only honors precheck for
-        # trigger=scheduled (service.ts) — which never ticks in headless serve. So gate the
-        # dispatch in the unit: run the precheck in the workspace (cwd on sys.path for
-        # `python3 -m triggered_agents`), dispatch only on exit 0, exit 0 either way so a
-        # skip isn't logged as a unit failure.
-        exec_start = (
-            f"/bin/bash -lc 'if {precheck}; then exec {dispatch}; "
-            f'else echo "[ta-{agent}] precheck: no change, run skipped"; fi\''
-        )
+        # Change-detection gate. Also NOT Orca's automation --precheck field: `automations run`
+        # is trigger=manual and Orca only honors precheck for trigger=scheduled (service.ts),
+        # which never ticks headless. So gate here: precheck in the workspace (cwd on sys.path
+        # for `python3 -m`), dispatch only on exit 0, exit 0 either way so a skip isn't a unit
+        # failure.
+        gate = (f"if {precheck}; then exec {dispatch}; "
+                f'else echo "[ta-{agent}] precheck: no change, run skipped"; fi')
     else:
-        exec_start = dispatch
+        gate = f"exec {dispatch}"
     return f"""[Unit]
-Description=triggered-agents: {agent} run ({calendar} backstop; drives the same Orca automation as the event trigger)
+Description=triggered-agents: {agent} {calendar} tick (precheck gate + singleton terminal dispatch)
 Documentation=file:///home/dev/control-panel/docs/ARCHITECTURE.md
-# Orca's rrule does not tick in headless serve; this timer drives the run via `automations run`.
 After=orca-server.service network-online.target
 Wants=orca-server.service
 
@@ -191,7 +191,7 @@ User=dev
 Group=dev
 WorkingDirectory={workspace}
 Environment=HOME=/home/dev
-ExecStart={exec_start}
+ExecStart=/bin/bash -lc '{gate}'
 """
 
 
@@ -225,13 +225,13 @@ def remove_legacy_unit(legacy: str) -> None:
         run(["sudo", "rm", "-f", str(SYSTEMD_DIR / f"{legacy}.{suffix}")], check=False)
 
 
-def ensure_systemd(agent: str, spec: dict, aid: str, workspace: Path) -> None:
+def ensure_systemd(agent: str, spec: dict, workspace: Path) -> None:
     sysd = spec.get("systemd", {})
     calendar = sysd.get("calendar", "hourly")
     delay = int(sysd.get("randomized_delay_sec", 0))
     unit = f"ta-{agent}"
     _sudo_write(SYSTEMD_DIR / f"{unit}.service",
-                _service_unit(agent, aid, calendar, workspace, spec.get("precheck", "")))
+                _service_unit(agent, calendar, workspace, spec.get("precheck", "")))
     _sudo_write(SYSTEMD_DIR / f"{unit}.timer", _timer_unit(agent, calendar, delay))
     remove_legacy_unit(sysd.get("legacy_unit", ""))
     run(["sudo", "systemctl", "daemon-reload"])
@@ -249,8 +249,11 @@ def provision(agent: str) -> None:
     workspace = ensure_worktree(agent, repo_id)   # per-agent named worktree, not the base 'main'
     migrate_state(agent, workspace)
     ensure_trust(workspace)
-    aid = ensure_automation(spec, workspace)
-    ensure_systemd(agent, spec, aid, workspace)
+    # The Orca automation is now vestigial (the timer drives runtime/dispatch.py, not
+    # `automations run`); kept so the agent still shows in Orca's GUI and its precheck/config
+    # is recorded. Its own scheduler doesn't tick headless, so it won't fire on its own.
+    ensure_automation(spec, workspace)
+    ensure_systemd(agent, spec, workspace)
     log(f"=== {agent} done (workspace {workspace}) ===")
 
 
