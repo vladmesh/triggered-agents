@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import os
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 
 # repo root = triggered_agents/runtime/state.py -> up 3 to the checkout root.
@@ -48,6 +49,17 @@ class AgentState:
         tmp = self.watermark_file.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(mark, indent=2, ensure_ascii=False), encoding="utf-8")
         tmp.replace(self.watermark_file)
+
+    def log_run(self, event: str, **fields) -> None:
+        """Append a run-telemetry line to runs.jsonl. Best-effort: a logging failure
+        must never break the run itself, so any error is swallowed."""
+        try:
+            self.ensure_dir()
+            rec = {"ts": datetime.now(timezone.utc).isoformat(), "event": event, **fields}
+            with (self.dir / "runs.jsonl").open("a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
 
     @contextmanager
     def lock(self):

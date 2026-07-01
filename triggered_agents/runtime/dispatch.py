@@ -118,13 +118,15 @@ def _reap_ghosts(ws: str) -> int:
 def run(agent: str) -> int:
     skill, launch = _launch_cmd(agent)
     ws = _workspace(agent)
-    with AgentState(agent).lock():
+    state = AgentState(agent)
+    with state.lock():
         reaped = _reap_ghosts(ws)  # prune dead-pty tabs so ghosts never accumulate
         if reaped:
             print(f"dispatch[{agent}]: reaped {reaped} ghost tab(s)")
         terms = _agent_terminals(ws)
         if not terms:
             _orca(["terminal", "create", "--worktree", f"path:{ws}", "--command", launch])
+            state.log_run("dispatch", action="created")
             print(f"dispatch[{agent}]: no terminal — created fresh -> {skill}")
             return 0
 
@@ -132,12 +134,14 @@ def run(agent: str) -> int:
         if not _is_idle(survivor["handle"]):
             quiet = _quiet_seconds(survivor, time.time())
             if quiet <= WATCHDOG_SECONDS:  # a fresh, working agent — don't interrupt or pile on
+                state.log_run("dispatch", action="busy-skip")
                 print(f"dispatch[{agent}]: agent busy ({int(quiet)}s silent) — left running, no dispatch")
                 return 0
             # busy but silent too long -> stuck: sweep and restart (makes a ghost, but rare)
             _orca(["terminal", "stop", "--worktree", f"path:{ws}"])
             time.sleep(1.0)
             _orca(["terminal", "create", "--worktree", f"path:{ws}", "--command", launch])
+            state.log_run("dispatch", action="watchdog-restart")
             print(f"dispatch[{agent}]: busy but stuck ({int(quiet)}s silent) — watchdog restart -> {skill}")
             return 0
 
@@ -148,6 +152,7 @@ def run(agent: str) -> int:
         _orca(["terminal", "send", "--terminal", survivor["handle"], "--text", "/clear", "--enter"])
         time.sleep(1.0)  # let /clear settle before the skill lands
         _orca(["terminal", "send", "--terminal", survivor["handle"], "--text", skill, "--enter"])
+        state.log_run("dispatch", action="reused")
         tail = f"; closed {len(extras)} dup(s)" if extras else ""
         print(f"dispatch[{agent}]: reused idle terminal (/clear -> {skill}){tail}")
         return 0

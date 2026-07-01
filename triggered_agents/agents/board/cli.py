@@ -51,8 +51,10 @@ def cmd_precheck() -> int:
     gone = sorted(p for p in mark if p not in current)
     if first or moved or gone:
         why = "first sweep" if first else "moved: " + ", ".join(moved + [f"-{g}" for g in gone])
+        STATE.log_run("precheck", result="change")
         print(f"board: dispatch ({why})", file=sys.stderr)
         return 0
+    STATE.log_run("precheck", result="no-change")
     print("board: no plan project moved since last sweep", file=sys.stderr)
     return 1
 
@@ -64,6 +66,7 @@ def cmd_advance() -> int:
     current, _ = changes.fingerprints()
     with STATE.lock():
         STATE.save_watermark(current)
+    STATE.log_run("advance")
     print(f"board: watermark recorded for {len(current)} project(s)")
     return 0
 

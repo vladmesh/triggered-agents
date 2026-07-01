@@ -44,6 +44,7 @@ def cmd_advance() -> int:
     with STATE.lock():
         harvest.advance(STATE, pending)
         STATE.pending_file.unlink()
+    STATE.log_run("advance")
     print(f"curator: watermark advanced for {len(pending)} source(s)")
     return 0
 
@@ -52,7 +53,9 @@ def cmd_precheck() -> int:
     """Exit 0 if there are new turns to curate, non-zero if nothing new (skip the run)."""
     batch = harvest.harvest(STATE)
     if batch["sessions"]:
+        STATE.log_run("precheck", result="change")
         return 0
+    STATE.log_run("precheck", result="no-change")
     print("curator: no new turns since watermark", file=sys.stderr)
     return 1
 
