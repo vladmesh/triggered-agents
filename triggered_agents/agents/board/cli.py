@@ -34,7 +34,8 @@ def main(argv=None) -> int:
     sub = parser.add_subparsers(dest="cmd")
 
     sub.add_parser("setup")
-    sub.add_parser("projects")
+    p_proj = sub.add_parser("projects")
+    p_proj.add_argument("--only", help="scope to a single project (for a targeted re-sync)")
 
     p_cards = sub.add_parser("cards")
     p_cards.add_argument("--swimlane")
@@ -58,7 +59,7 @@ def main(argv=None) -> int:
         if args.cmd == "setup":
             return _emit(board.ensure_structure())
         if args.cmd == "projects":
-            return _emit(registry.plan_projects())
+            return _emit(registry.plan_projects(only=args.only))
         if args.cmd == "cards":
             return _emit(board.list_cards(swimlane=args.swimlane))
         if args.cmd == "upsert":

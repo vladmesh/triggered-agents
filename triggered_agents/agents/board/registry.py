@@ -25,11 +25,12 @@ def _projects_md() -> Path:
     return Path(os.environ.get("CONTROL_PANEL_PROJECTS", str(_DEFAULT)))
 
 
-def plan_projects() -> list[dict]:
+def plan_projects(only: str | None = None) -> list[dict]:
     """Projects that have a plan source, as [{"name", "plan"}].
 
     Rows whose plan cell starts with "нет" (no plan / frozen README) are skipped — nothing
-    for the board to pull, so no swimlane.
+    for the board to pull, so no swimlane. Pass `only` to scope to a single project (empty
+    list if it has no plan / doesn't exist).
     """
     path = _projects_md()
     text = path.read_text(encoding="utf-8")
@@ -49,5 +50,8 @@ def plan_projects() -> list[dict]:
         plan = cells[1]
         if plan.lower().startswith("нет"):
             continue
-        out.append({"name": m.group(1), "plan": plan})
+        name = m.group(1)
+        if only and name != only:
+            continue
+        out.append({"name": name, "plan": plan})
     return out
