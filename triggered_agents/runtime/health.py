@@ -66,6 +66,11 @@ def _age_s(ts: str) -> float:
 def check(agents: tuple[str, ...]) -> int:
     rc = 0
     for agent in agents:
+        # No automation.toml means the agent is CLI-only (no timer, no runs); it has nothing to
+        # be red about, so report it neutrally and move on.
+        if not (_REPO_ROOT / "triggered_agents" / "agents" / agent / "automation.toml").is_file():
+            print(f"SKIP {agent}: no automation (CLI-only)")
+            continue
         problems = []
         if not _timer_active(agent):
             problems.append(f"ta-{agent}.timer not active")
