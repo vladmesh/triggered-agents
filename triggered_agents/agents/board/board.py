@@ -10,6 +10,8 @@ plans -> board, board read-only (no comments pulled back).
 """
 from __future__ import annotations
 
+import os
+
 from . import registry
 from .kanboard import KanboardError, call
 
@@ -46,6 +48,26 @@ def _swimlane_id(pid: int, name: str) -> int:
     raise KanboardError(f"no swimlane {name!r} on board (run `board setup`)")
 
 
+def _ensure_admin_member(pid: int) -> str | None:
+    """Add the admin user as project manager so the board shows on their Kanboard dashboard.
+
+    A project created via the API has no members; Kanboard's dashboard ("My projects" / "My
+    tasks") only lists projects the logged-in user belongs to, so without this the board looks
+    empty in the UI even though it exists. Idempotent; skipped if KANBOARD_ADMIN_USER is unset.
+    """
+    admin = os.environ.get("KANBOARD_ADMIN_USER")
+    if not admin:
+        return None
+    members = call("getProjectUsers", project_id=pid) or {}
+    if admin in members.values():
+        return None
+    user = call("getUserByName", username=admin)
+    if not user:
+        return None
+    call("addProjectUser", project_id=pid, user_id=int(user["id"]), role="project-manager")
+    return admin
+
+
 def ensure_structure() -> dict:
     """Idempotently bring columns to COLUMNS and a swimlane to exist per plan project."""
     pid = board_id()
@@ -66,7 +88,9 @@ def ensure_structure() -> dict:
         if name not in have:
             call("addSwimlane", project_id=pid, name=name)
             added.append(name)
-    return {"board_id": pid, "columns": COLUMNS, "swimlanes": projects, "swimlanes_added": added}
+    admin_added = _ensure_admin_member(pid)
+    return {"board_id": pid, "columns": COLUMNS, "swimlanes": projects,
+            "swimlanes_added": added, "admin_member_added": admin_added}
 
 
 def list_cards(swimlane: str | None = None) -> list[dict]:
