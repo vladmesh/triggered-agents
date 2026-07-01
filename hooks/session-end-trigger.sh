@@ -6,15 +6,15 @@
 # pty, вечно живой интерактивный секретарь).
 #
 # Инварианты:
-#  - НЕ триггерим на выходе самого куратора (cwd == ~/curator) -> иначе петля.
+#  - НЕ триггерим на выходе самого куратора (cwd == ~/triggered-agents) -> иначе петля.
 #  - Дебаунс: схлопываем всплеск SessionEnd (напр. при остановке Orca) в один
 #    прогон. Пропущенное не теряется — watermark инкрементален, добьёт след.
 #    триггер или часовой sweep.
 
 CURATOR_ID="c38765f3-f572-4326-b9f4-3366e025cf28"
-CURATOR_DIR="/home/dev/curator"
+CURATOR_DIR="/home/dev/triggered-agents"
 DEBOUNCE_SECS=120
-STAMP="$CURATOR_DIR/state/.last-session-trigger"
+STAMP="$CURATOR_DIR/state/curator/.last-session-trigger"
 
 payload=$(cat)
 

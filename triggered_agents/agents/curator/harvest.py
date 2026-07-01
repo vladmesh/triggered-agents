@@ -1,9 +1,9 @@
 """Harvest — turn new session lines into a redacted transcript batch for the curator agent.
 
-Two-phase by design: `harvest()` reads everything new since the watermark and returns a
+Two-phase by design: `harvest(st)` reads everything new since the watermark and returns a
 batch WITHOUT advancing the watermark. The agent extracts facts and commits the canon,
-then calls `advance()` to move the watermark. A crash between the two re-harvests the same
-turns next run (at worst a duplicate the agent dedups), never a silent drop.
+then calls `advance(st, pending)` to move the watermark. A crash between the two re-harvests
+the same turns next run (at worst a duplicate the agent dedups), never a silent drop.
 
 Signal only: user text + assistant text blocks. Dropped as noise — thinking blocks,
 tool_use/tool_result payloads, meta/sidechain lines, and local-command wrappers (the
@@ -15,8 +15,8 @@ import json
 import re
 from pathlib import Path
 
-from . import discover, state
-from .redact import redact
+from ...runtime.redact import redact
+from . import discover
 
 # Local-command / harness scaffolding that shows up as user "messages" but isn't a turn.
 _SCAFFOLD = re.compile(r"<(local-command|command-name|command-message|command-args)[\s>]")
@@ -57,27 +57,27 @@ def parse_claude_lines(lines) -> list[dict]:
     return turns
 
 
-def harvest() -> dict:
+def harvest(st) -> dict:
     """Read all new turns since the watermark. Does NOT advance the watermark.
 
     Returns {"sessions": [...], "pending": {source_path: line_count}} where pending is
     the watermark to persist via advance() after the canon commit.
     """
-    mark = state.load_watermark()
+    mark = st.load_watermark()
     sessions_out, pending = [], {}
     for sess in discover.all_sessions():
         path = Path(sess["path"])
         try:
-            st = path.stat()
+            stat = path.stat()
         except FileNotFoundError:
             continue
         prev = mark.get(sess["path"], {})
         prev_lines = prev.get("lines", 0)
-        if prev.get("mtime") == st.st_mtime and prev_lines:
+        if prev.get("mtime") == stat.st_mtime and prev_lines:
             continue  # unchanged since last run
         all_lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
         new_lines = all_lines[prev_lines:]
-        pending[sess["path"]] = {"lines": len(all_lines), "mtime": st.st_mtime}
+        pending[sess["path"]] = {"lines": len(all_lines), "mtime": stat.st_mtime}
         if not new_lines:
             continue
         turns = parse_claude_lines(new_lines) if sess["head"] == "claude" else []
@@ -88,11 +88,11 @@ def harvest() -> dict:
     return {"sessions": sessions_out, "pending": pending}
 
 
-def advance(pending: dict) -> None:
+def advance(st, pending: dict) -> None:
     """Persist the watermark after a successful canon commit."""
-    mark = state.load_watermark()
+    mark = st.load_watermark()
     mark.update(pending)
-    state.save_watermark(mark)
+    st.save_watermark(mark)
 
 
 def render_markdown(batch: dict) -> str:

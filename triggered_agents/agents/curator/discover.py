@@ -6,7 +6,7 @@ reachable only in-process). We read the raw files ourselves. Only heads with liv
 sessions on this host are wired; add a parser + path as new heads produce sessions.
 
 Self-exclusion: the curator must not harvest its own runs. Sessions whose cwd resolves
-under a CURATOR_EXCLUDE path (the curator workspace) are skipped.
+under a TA_CURATOR_EXCLUDE path (the curator's own workspace) are skipped.
 """
 from __future__ import annotations
 
@@ -18,8 +18,11 @@ from pathlib import Path
 CLAUDE_PROJECTS = Path.home() / ".claude" / "projects"
 
 # cwd prefixes whose sessions we never harvest (curator's own workspace, this repo).
+# Both the pre-rename path (~/curator) and the post-rename path (~/triggered-agents) are
+# excluded so the curator never harvests its own past or future runs across the rename.
+_DEFAULT_EXCLUDE = f"{Path.home() / 'curator'}:{Path.home() / 'triggered-agents'}"
 EXCLUDE_CWDS = [
-    p for p in os.environ.get("CURATOR_EXCLUDE", str(Path.home() / "curator")).split(":") if p
+    p for p in os.environ.get("TA_CURATOR_EXCLUDE", _DEFAULT_EXCLUDE).split(":") if p
 ]
 
 

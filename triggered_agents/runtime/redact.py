@@ -1,8 +1,8 @@
 """Secret redaction — scrub raw secrets before a transcript reaches the model or canon.
 
-Git is forever; a key that lands in panelmem-kb history is compromised for good. This
-runs before extraction (so the model never sees the raw secret) and is the last line
-before anything is written. Two layers:
+Git is forever; a key that lands in a canon's history is compromised for good. This runs
+before extraction (so the model never sees the raw secret) and is the last line before
+anything is written. Two layers:
 
   1. Exact-value scrub: load values from known .env files on disk and redact verbatim
      occurrences. Strongest — catches whatever actually lives in this VPS's secrets.
