@@ -15,11 +15,27 @@ import datetime
 import json
 import os
 import subprocess
+import tomllib
 from pathlib import Path
 
 from .dispatch import _workspace
 
-MAX_AGE_S = int(os.environ.get("TA_HEALTH_MAX_AGE_S", str(3 * 3600)))  # hourly timers + slack
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_ENV_MAX_AGE = os.environ.get("TA_HEALTH_MAX_AGE_S")  # global override, wins for every agent
+# Freshness budget per systemd cadence: timer period + slack. Read from the agent's spec so a
+# daily agent (retro) isn't flagged red just for ticking less often than an hourly one.
+_CADENCE_MAX_AGE_S = {"hourly": 3 * 3600, "daily": 26 * 3600}
+
+
+def _max_age_s(agent: str) -> int:
+    if _ENV_MAX_AGE:
+        return int(_ENV_MAX_AGE)
+    try:
+        spec = tomllib.loads((_REPO_ROOT / "triggered_agents" / "agents" / agent / "automation.toml").read_text())
+        cadence = spec.get("systemd", {}).get("calendar", "hourly")
+    except (OSError, tomllib.TOMLDecodeError):
+        cadence = "hourly"
+    return _CADENCE_MAX_AGE_S.get(cadence, 3 * 3600)
 
 
 def _timer_active(agent: str) -> bool:
@@ -60,8 +76,9 @@ def check(agents: tuple[str, ...]) -> int:
         else:
             last_tick = runs[-1]
             age = _age_s(last_tick["ts"])
-            if age > MAX_AGE_S:
-                problems.append(f"last tick {int(age / 60)}min ago (> {MAX_AGE_S // 60}min)")
+            max_age = _max_age_s(agent)
+            if age > max_age:
+                problems.append(f"last tick {int(age / 60)}min ago (> {max_age // 60}min)")
             last_advance = next((r for r in reversed(runs) if r.get("event") == "advance"), None)
         status = "RED " if problems else "OK  "
         tick = last_tick["ts"] if last_tick else "-"
