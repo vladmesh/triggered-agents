@@ -1,0 +1,79 @@
+"""Session discovery — where each head writes its raw session files.
+
+Paths mirror Orca's ai-vault session-scanner (src/main/ai-vault/session-scanner-*),
+which we reuse as reference rather than runtime (it only keeps 5-message previews and is
+reachable only in-process). We read the raw files ourselves. Only heads with live
+sessions on this host are wired; add a parser + path as new heads produce sessions.
+
+Self-exclusion: the curator must not harvest its own runs. Sessions whose cwd resolves
+under a CURATOR_EXCLUDE path (the curator workspace) are skipped.
+"""
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+
+# Claude project-dir naming: cwd path with every "/" turned into "-", leading "-".
+CLAUDE_PROJECTS = Path.home() / ".claude" / "projects"
+
+# cwd prefixes whose sessions we never harvest (curator's own workspace, this repo).
+EXCLUDE_CWDS = [
+    p for p in os.environ.get("CURATOR_EXCLUDE", str(Path.home() / "curator")).split(":") if p
+]
+
+
+def _cwd_from_claude_dir(dirname: str) -> str:
+    # "-home-dev-control-panel" -> "/home/dev/control-panel". Lossy (dirs with real
+    # dashes collide); only a fallback when the file carries no cwd field.
+    return "/" + dirname.lstrip("-").replace("-", "/")
+
+
+def _cwd_from_file(path: Path, fallback: str) -> str:
+    # Claude JSONL lines carry the real `cwd`; read the first that has it (dashes intact).
+    try:
+        with path.open(encoding="utf-8", errors="replace") as fh:
+            for _ in range(10):
+                line = fh.readline()
+                if not line:
+                    break
+                try:
+                    cwd = json.loads(line).get("cwd")
+                except json.JSONDecodeError:
+                    continue
+                if cwd:
+                    return cwd
+    except OSError:
+        pass
+    return fallback
+
+
+def _excluded(cwd: str) -> bool:
+    return any(cwd == e or cwd.startswith(e.rstrip("/") + "/") for e in EXCLUDE_CWDS)
+
+
+def claude_sessions() -> list[dict]:
+    """List Claude session files as {head, path, session_id, cwd}, self-excluded."""
+    out = []
+    if not CLAUDE_PROJECTS.is_dir():
+        return out
+    for proj in sorted(CLAUDE_PROJECTS.iterdir()):
+        if not proj.is_dir():
+            continue
+        fallback = _cwd_from_claude_dir(proj.name)
+        for f in sorted(proj.glob("*.jsonl")):
+            cwd = _cwd_from_file(f, fallback)
+            if _excluded(cwd):
+                continue
+            out.append({"head": "claude", "path": str(f), "session_id": f.stem, "cwd": cwd})
+    return out
+
+
+def all_sessions() -> list[dict]:
+    """All discoverable sessions across heads (Claude only for now)."""
+    return claude_sessions()
+
+
+if __name__ == "__main__":
+    for s in all_sessions():
+        print(s["head"], s["session_id"], s["cwd"], s["path"])

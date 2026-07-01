@@ -1,0 +1,26 @@
+{
+  "model": "claude-sonnet-5",
+  "permissions": {
+    "defaultMode": "bypassPermissions",
+    "allow": [
+      "Bash(python3 -m curator:*)",
+      "Bash(cd ~/curator:*)",
+      "Bash(cd ~/panelmem-kb:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git status:*)",
+      "Bash(git diff:*)",
+      "Bash(git push:*)",
+      "Read",
+      "Edit",
+      "Write",
+      "mcp__memory__memory_search",
+      "mcp__memory__memory_get",
+      "mcp__memory__memory_list"
+    ],
+    "deny": [
+      "Bash(git push --force:*)",
+      "Bash(git push -f:*)"
+    ]
+  }
+}
