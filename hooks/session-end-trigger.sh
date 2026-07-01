@@ -6,15 +6,17 @@
 # pty, вечно живой интерактивный секретарь).
 #
 # Инварианты:
-#  - НЕ триггерим на выходе самого куратора (cwd == ~/triggered-agents) -> иначе петля.
+#  - НЕ триггерим на выходе самих triggered-agents (их воркстри под
+#    ~/orca/workspaces/triggered-agents) -> иначе петля.
 #  - Дебаунс: схлопываем всплеск SessionEnd (напр. при остановке Orca) в один
 #    прогон. Пропущенное не теряется — watermark инкрементален, добьёт след.
-#    триггер или часовой sweep.
+#    триггер или часовой sweep. Штамп — в стабильном хост-пути, не в воркстри.
 
 CURATOR_ID="c38765f3-f572-4326-b9f4-3366e025cf28"
-CURATOR_DIR="/home/dev/triggered-agents"
+EXCLUDE_DIR="/home/dev/orca/workspaces/triggered-agents"
 DEBOUNCE_SECS=120
-STAMP="$CURATOR_DIR/state/curator/.last-session-trigger"
+STAMP_DIR="/home/dev/.local/state/triggered-agents"
+STAMP="$STAMP_DIR/curator-session-trigger"
 
 payload=$(cat)
 
@@ -25,9 +27,9 @@ try:
 except Exception:
     print("")' 2>/dev/null)
 
-# Свои сессии не курируем — выход куратора не должен звать куратора.
+# Свои сессии не курируем — выход triggered-agent не должен звать куратора.
 case "$cwd" in
-  "$CURATOR_DIR" | "$CURATOR_DIR"/*) exit 0 ;;
+  "$EXCLUDE_DIR" | "$EXCLUDE_DIR"/*) exit 0 ;;
 esac
 
 # Дебаунс по mtime-независимому таймстампу.
@@ -36,6 +38,7 @@ if [ -f "$STAMP" ]; then
   last=$(cat "$STAMP" 2>/dev/null || echo 0)
   [ "$((now - last))" -lt "$DEBOUNCE_SECS" ] && exit 0
 fi
+mkdir -p "$STAMP_DIR" 2>/dev/null
 echo "$now" > "$STAMP" 2>/dev/null
 
 # Fire-and-forget. setsid отвязывает прогон в новую сессию — SessionEnd рвёт

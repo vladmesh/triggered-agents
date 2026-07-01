@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -57,13 +58,59 @@ def _unwrap(d: dict, key: str):
 
 # ---- steps --------------------------------------------------------------------------
 
-def ensure_repo_registered(root: Path) -> None:
-    listing = run([ORCA, "repo", "list"]).stdout
-    if any(line.split() and line.split()[-1] == str(root) for line in listing.splitlines()):
+def _repo_id(root: Path) -> str | None:
+    for line in run([ORCA, "repo", "list"]).stdout.splitlines():
+        f = line.split()
+        if f and f[-1] == str(root):
+            return f[0]
+    return None
+
+
+def ensure_repo_registered(root: Path) -> str:
+    rid = _repo_id(root)
+    if rid:
         log(f"repo already registered: {root}")
-        return
+        return rid
     run([ORCA, "repo", "add", "--path", str(root)])
-    log(f"repo registered: {root}")
+    rid = _repo_id(root)
+    log(f"repo registered: {root} ({rid})")
+    return rid
+
+
+def ensure_worktree(agent: str, repo_id: str) -> Path:
+    """One Orca worktree per agent (so each shows as its own named workspace, not 'main').
+
+    Each is a git worktree on branch vladmesh/<agent> off origin/main. Agents never commit
+    to this repo, so we pin the worktree to origin/main on every provision — code stays the
+    deployed version, gitignored state/ survives the reset.
+    """
+    data = orca_json(["worktree", "list", "--repo", f"id:{repo_id}"])
+    path = None
+    for w in (_unwrap(data, "worktrees") or []):
+        if w.get("displayName") == agent:
+            path = Path(w["path"])
+            break
+    if path is None:
+        created = orca_json(["worktree", "create", "--name", agent, "--repo", f"id:{repo_id}",
+                             "--setup", "skip", "--no-parent"])
+        path = Path((_unwrap(created, "worktree") or {})["path"])
+        log(f"worktree created: {agent} -> {path}")
+    else:
+        log(f"worktree exists: {agent} -> {path}")
+    run(["git", "-C", str(path), "fetch", "--quiet", "origin"], check=False)
+    run(["git", "-C", str(path), "reset", "--hard", "origin/main"])
+    log(f"worktree pinned to origin/main: {path}")
+    return path
+
+
+def migrate_state(agent: str, workspace: Path) -> None:
+    """One-time: move an agent's gitignored state from the base checkout into its worktree."""
+    src = REPO_ROOT / "state" / agent
+    dst = workspace / "state" / agent
+    if src.is_dir() and not dst.exists():
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(src), str(dst))
+        log(f"state migrated: {src} -> {dst}")
 
 
 def ensure_trust(workspace: Path) -> None:
@@ -182,12 +229,14 @@ def provision(agent: str) -> None:
     if not spec_path.is_file():
         raise SystemExit(f"[provision] no spec: {spec_path}")
     spec = tomllib.loads(spec_path.read_text())
-    log(f"=== provisioning {agent} (workspace {REPO_ROOT}) ===")
-    ensure_repo_registered(REPO_ROOT)
-    ensure_trust(REPO_ROOT)
-    aid = ensure_automation(spec, REPO_ROOT)
+    log(f"=== provisioning {agent} ===")
+    repo_id = ensure_repo_registered(REPO_ROOT)
+    workspace = ensure_worktree(agent, repo_id)   # per-agent named worktree, not the base 'main'
+    migrate_state(agent, workspace)
+    ensure_trust(workspace)
+    aid = ensure_automation(spec, workspace)
     ensure_systemd(agent, spec, aid)
-    log(f"=== {agent} done ===")
+    log(f"=== {agent} done (workspace {workspace}) ===")
 
 
 def main(argv: list[str]) -> int:

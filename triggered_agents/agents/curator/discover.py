@@ -17,10 +17,16 @@ from pathlib import Path
 # Claude project-dir naming: cwd path with every "/" turned into "-", leading "-".
 CLAUDE_PROJECTS = Path.home() / ".claude" / "projects"
 
-# cwd prefixes whose sessions we never harvest (curator's own workspace, this repo).
-# Both the pre-rename path (~/curator) and the post-rename path (~/triggered-agents) are
-# excluded so the curator never harvests its own past or future runs across the rename.
-_DEFAULT_EXCLUDE = f"{Path.home() / 'curator'}:{Path.home() / 'triggered-agents'}"
+# cwd prefixes whose sessions we never harvest — the triggered-agents' own runs, so no
+# triggered-agent (curator included) harvests itself or its siblings:
+#   ~/curator                              legacy pre-rename base checkout
+#   ~/triggered-agents                     current base checkout (dev/provision cwd)
+#   ~/orca/workspaces/triggered-agents     per-agent Orca worktrees (curator/, board/, …)
+_DEFAULT_EXCLUDE = ":".join([
+    str(Path.home() / "curator"),
+    str(Path.home() / "triggered-agents"),
+    str(Path.home() / "orca" / "workspaces" / "triggered-agents"),
+])
 EXCLUDE_CWDS = [
     p for p in os.environ.get("TA_CURATOR_EXCLUDE", _DEFAULT_EXCLUDE).split(":") if p
 ]
