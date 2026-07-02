@@ -269,6 +269,7 @@ def _card_view(pid: int, task: dict, cols: dict, lanes: dict) -> dict:
         "title": task["title"],
         "column": cols.get(int(task["column_id"]), ""),
         "swimlane": lanes.get(int(task["swimlane_id"]), ""),
+        "position": int(task.get("position", 0) or 0),
         "task_type": meta.get(model.META_TASK_TYPE, ""),
         "project": meta.get(model.META_PROJECT, ""),
         "blocked_by": meta.get(model.META_BLOCKED_BY, ""),
