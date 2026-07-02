@@ -537,5 +537,72 @@ class EnsureTrustTest(unittest.TestCase):
             self.worker.ensure_trust("/ws/x")
 
 
+class EnsureThemeTest(unittest.TestCase):
+    """Onboarding theme picker: unanswered, it hangs a fresh head the same way an untrusted
+    folder does — found live as an orphaned terminal in the curator workspace."""
+
+    def setUp(self):
+        from triggered_agents.agents.pipeline import worker
+        self.worker = worker
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.claude_json = Path(self.tmp.name) / ".claude.json"
+        self._patch = mock.patch.object(worker, "CLAUDE_JSON", self.claude_json)
+        self._patch.start()
+        self.addCleanup(self._patch.stop)
+
+    def test_sets_theme_when_absent(self):
+        self.worker.ensure_theme()
+        import json
+        self.assertEqual(json.loads(self.claude_json.read_text())["theme"], "dark")
+
+    def test_leaves_existing_theme(self):
+        self.claude_json.write_text('{"theme": "light"}')
+        self.worker.ensure_theme()
+        import json
+        self.assertEqual(json.loads(self.claude_json.read_text())["theme"], "light")
+
+    def test_garbage_config_raises_workspace_error(self):
+        self.claude_json.write_text("{not json")
+        with self.assertRaises(self.worker.WorkspaceError):
+            self.worker.ensure_theme()
+
+
+class WorkerHostCallsTest(unittest.TestCase):
+    """The actual `orca` CLI args launch_worker/create_workspace build — everything above this
+    stubs worker.py wholesale, so nothing else exercises the real argument lists."""
+
+    def setUp(self):
+        from triggered_agents.agents.pipeline import worker
+        self.worker = worker
+        self.calls = []
+
+        def fake_orca_json(args):
+            self.calls.append(args)
+            if args[0] == "worktree":
+                return {"worktree": {"path": "/ws/fresh"}}
+            return {"terminal": {"handle": "term-1"}}
+
+        p = mock.patch.object(worker, "_orca_json", fake_orca_json)
+        p.start()
+        self.addCleanup(p.stop)
+
+        self.ensured = []
+        for name in ("ensure_trust", "ensure_theme"):
+            wp = mock.patch.object(worker, name, lambda *a, n=name: self.ensured.append(n))
+            wp.start()
+            self.addCleanup(wp.stop)
+
+    def test_create_workspace_activates_the_worktree(self):
+        self.worker.create_workspace("proj", "worker-1", "main")
+        args = self.calls[0]
+        self.assertIn("--activate", args)
+
+    def test_launch_worker_ensures_trust_and_theme_before_terminal_create(self):
+        self.worker.launch_worker("/ws/fresh", None, "worker-1")
+        self.assertEqual(self.ensured, ["ensure_trust", "ensure_theme"])
+        self.assertEqual(self.calls[0][0], "terminal")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -19,7 +19,7 @@ import subprocess
 import tomllib
 from pathlib import Path
 
-from ...runtime import redact
+from ...runtime import claude_env, redact
 
 ORCA = os.environ.get("ORCA_BIN") or shutil.which("orca") or str(Path.home() / ".local/bin/orca")
 GH = os.environ.get("GH_BIN") or shutil.which("gh") or "gh"
@@ -85,10 +85,15 @@ def read_base_branch(project: str) -> str:
 
 def create_workspace(project: str, name: str, base_branch: str) -> str:
     """Create an Orca worktree off base_branch; return its path. Setup is skipped here — we run
-    the provisioner ourselves next so we own its exit code and log."""
+    the provisioner ourselves next so we own its exit code and log.
+
+    `--activate` reveals the new worktree in the Orca app. Without it a freshly created worktree
+    has no window for the app to adopt a terminal into, so the head `launch_worker` starts next
+    falls back to a background handle and the workspace shows empty in the GUI."""
     data = _orca_json([
         "worktree", "create", "--repo", f"path:{project_root(project)}",
         "--name", name, "--base-branch", base_branch, "--setup", "skip", "--no-parent",
+        "--activate",
     ])
     wt = data.get("worktree", data)
     path = wt.get("path")
@@ -147,26 +152,26 @@ def _launch_command(model: str | None, worker_id: str) -> str:
 def ensure_trust(workspace: str) -> None:
     """Проставить folder trust Claude Code для свежего worktree. Без этого голова виснет на
     интерактивном вопросе «доверяешь ли папке» (та же логика — deploy/provision.py у агентов)."""
-    import json
-    import tempfile
-
     try:
-        d = json.loads(CLAUDE_JSON.read_text(encoding="utf-8")) if CLAUDE_JSON.is_file() else {}
-    except (OSError, json.JSONDecodeError) as e:
-        raise WorkspaceError(f"cannot set folder trust, {CLAUDE_JSON} unreadable: {e}") from e
-    entry = d.setdefault("projects", {}).setdefault(str(workspace), {})
-    if entry.get("hasTrustDialogAccepted") is True:
-        return
-    entry["hasTrustDialogAccepted"] = True
-    fd, tmp = tempfile.mkstemp(dir=str(CLAUDE_JSON.parent), prefix=".claude.json.")
-    with os.fdopen(fd, "w") as f:
-        json.dump(d, f, indent=2, ensure_ascii=False)
-    os.replace(tmp, CLAUDE_JSON)
+        claude_env.ensure_trust(CLAUDE_JSON, workspace)
+    except claude_env.ClaudeConfigError as e:
+        raise WorkspaceError(str(e)) from e
+
+
+def ensure_theme() -> None:
+    """Проставить тему в ~/.claude.json — иначе свежая голова виснет на первом онбординге
+    («выбери стиль текста»), тот же класс бага, что и folder trust, но ключ глобальный, а не
+    per-workspace."""
+    try:
+        claude_env.ensure_theme(CLAUDE_JSON)
+    except claude_env.ClaudeConfigError as e:
+        raise WorkspaceError(str(e)) from e
 
 
 def launch_worker(workspace: str, model: str | None, worker_id: str) -> str:
     """Spawn the worker head in the workspace; return the terminal handle."""
     ensure_trust(workspace)
+    ensure_theme()
     data = _orca_json(["terminal", "create", "--worktree", f"path:{workspace}",
                        "--title", f"Claude worker {worker_id}",
                        "--command", _launch_command(model, worker_id)])

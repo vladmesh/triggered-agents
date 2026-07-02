@@ -23,6 +23,13 @@ WATCHDOG_SECONDS. Orca's agent status is known to wedge on 'working' after a sil
 bare busy check would freeze the agent forever — the watchdog makes "skip when busy" safe.
 Dispatch only sends the skill and returns; the head reaches `advance` (same lock) minutes later,
 so there's no deadlock.
+
+Every fresh spawn (create, watchdog-restart) goes through `_ensure_claude_ready` first
+(`claude_env.ensure_trust`/`ensure_theme`): a head that lands on the folder-trust dialog or the
+onboarding theme picker hangs on stdin nobody sends, and never renames its tab away from the
+shell default — invisible to the `Claude`-in-title match above, so it's neither reused nor
+reaped and just sits there as a silent orphan (found live in the curator workspace: a terminal
+stuck at "choose the text style" that `_agent_terminals` couldn't see).
 """
 from __future__ import annotations
 
@@ -35,11 +42,12 @@ from pathlib import Path
 
 import tomllib
 
-from . import orca_rpc
+from . import claude_env, orca_rpc
 from .state import AgentState
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 ORCA = os.environ.get("ORCA_BIN") or shutil.which("orca") or str(Path.home() / ".local/bin/orca")
+CLAUDE_JSON = Path(os.environ.get("TA_CLAUDE_JSON", str(Path.home() / ".claude.json")))
 WATCHDOG_SECONDS = int(os.environ.get("TA_WATCHDOG_SECONDS", "1200"))  # busy + this quiet = stuck
 IDLE_PROBE_MS = 2500        # tui-idle satisfied within this = idle; timeout = busy
 ORCA_TIMEOUT_S = 20         # never let a hung orca call wedge dispatch while it holds the lock
@@ -66,6 +74,22 @@ def _launch_cmd(agent: str) -> tuple[str, str]:
     spec = tomllib.loads((_REPO_ROOT / "triggered_agents" / "agents" / agent / "automation.toml").read_text())
     skill = spec["skill"]
     return skill, f"claude --dangerously-skip-permissions {skill}"
+
+
+def _ensure_claude_ready(ws: str) -> None:
+    """Pre-answer folder trust + the onboarding theme picker before a fresh `claude` spawns.
+
+    Without this a head can land on an interactive prompt, wait forever for input nobody sends,
+    and never rename its terminal tab away from the shell default — invisible to
+    `_agent_terminals`'s title match, so it's reused by nothing and reaped by nothing: an orphan
+    every run creates that never dies (seen live in the curator workspace). Best-effort: a config
+    hiccup here shouldn't block the tick, just risks the same hang it's meant to prevent.
+    """
+    try:
+        claude_env.ensure_trust(CLAUDE_JSON, ws)
+        claude_env.ensure_theme(CLAUDE_JSON)
+    except claude_env.ClaudeConfigError as e:
+        print(f"dispatch: claude config prep failed ({e})")
 
 
 def _agent_terminals(ws: str) -> list[dict]:
@@ -125,6 +149,7 @@ def run(agent: str) -> int:
             print(f"dispatch[{agent}]: reaped {reaped} ghost tab(s)")
         terms = _agent_terminals(ws)
         if not terms:
+            _ensure_claude_ready(ws)
             _orca(["terminal", "create", "--worktree", f"path:{ws}", "--command", launch])
             state.log_run("dispatch", action="created")
             print(f"dispatch[{agent}]: no terminal — created fresh -> {skill}")
@@ -140,6 +165,7 @@ def run(agent: str) -> int:
             # busy but silent too long -> stuck: sweep and restart (makes a ghost, but rare)
             _orca(["terminal", "stop", "--worktree", f"path:{ws}"])
             time.sleep(1.0)
+            _ensure_claude_ready(ws)
             _orca(["terminal", "create", "--worktree", f"path:{ws}", "--command", launch])
             state.log_run("dispatch", action="watchdog-restart")
             print(f"dispatch[{agent}]: busy but stuck ({int(quiet)}s silent) — watchdog restart -> {skill}")
