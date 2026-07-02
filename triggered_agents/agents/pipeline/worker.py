@@ -23,6 +23,7 @@ from ...runtime import redact
 
 ORCA = os.environ.get("ORCA_BIN") or shutil.which("orca") or str(Path.home() / ".local/bin/orca")
 PROJECTS_DIR = Path(os.environ.get("TA_PROJECTS_DIR", str(Path.home() / "projects")))
+CLAUDE_JSON = Path(os.environ.get("TA_CLAUDE_JSON", str(Path.home() / ".claude.json")))
 CONTROL_PANEL = Path(os.environ.get("TA_CONTROL_PANEL", str(Path.home() / "control-panel")))
 PROVISION = CONTROL_PANEL / "pipeline" / "provision.py"
 ORCA_TIMEOUT_S = 120       # worktree create runs repo git; give it room, but never hang forever
@@ -134,8 +135,29 @@ def _launch_command(model: str | None, worker_id: str) -> str:
     return f'BOARD_ROLE=worker claude --dangerously-skip-permissions{model_flag} {prompt!r}'
 
 
+def ensure_trust(workspace: str) -> None:
+    """Проставить folder trust Claude Code для свежего worktree. Без этого голова виснет на
+    интерактивном вопросе «доверяешь ли папке» (та же логика — deploy/provision.py у агентов)."""
+    import json
+    import tempfile
+
+    try:
+        d = json.loads(CLAUDE_JSON.read_text(encoding="utf-8")) if CLAUDE_JSON.is_file() else {}
+    except (OSError, json.JSONDecodeError) as e:
+        raise WorkspaceError(f"cannot set folder trust, {CLAUDE_JSON} unreadable: {e}") from e
+    entry = d.setdefault("projects", {}).setdefault(str(workspace), {})
+    if entry.get("hasTrustDialogAccepted") is True:
+        return
+    entry["hasTrustDialogAccepted"] = True
+    fd, tmp = tempfile.mkstemp(dir=str(CLAUDE_JSON.parent), prefix=".claude.json.")
+    with os.fdopen(fd, "w") as f:
+        json.dump(d, f, indent=2, ensure_ascii=False)
+    os.replace(tmp, CLAUDE_JSON)
+
+
 def launch_worker(workspace: str, model: str | None, worker_id: str) -> str:
     """Spawn the worker head in the workspace; return the terminal handle."""
+    ensure_trust(workspace)
     data = _orca_json(["terminal", "create", "--worktree", f"path:{workspace}",
                        "--title", f"Claude worker {worker_id}",
                        "--command", _launch_command(model, worker_id)])

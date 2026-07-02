@@ -343,5 +343,44 @@ class DispatcherTest(unittest.TestCase):
         self.assertNotIn("from ..board", src)
 
 
+class EnsureTrustTest(unittest.TestCase):
+    """Folder trust: без него голова виснет на интерактивном вопросе Claude Code
+    (первый живой прогон, personal_site-198)."""
+
+    def setUp(self):
+        from triggered_agents.agents.pipeline import worker
+        self.worker = worker
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.claude_json = Path(self.tmp.name) / ".claude.json"
+        self._patch = mock.patch.object(worker, "CLAUDE_JSON", self.claude_json)
+        self._patch.start()
+        self.addCleanup(self._patch.stop)
+
+    def _trusted(self, ws):
+        import json
+        d = json.loads(self.claude_json.read_text())
+        return d.get("projects", {}).get(ws, {}).get("hasTrustDialogAccepted")
+
+    def test_sets_trust_for_fresh_workspace(self):
+        self.worker.ensure_trust("/ws/x")
+        self.assertTrue(self._trusted("/ws/x"))
+
+    def test_keeps_existing_config_and_is_idempotent(self):
+        self.claude_json.write_text('{"projects": {"/old": {"hasTrustDialogAccepted": true}}, "theme": "dark"}')
+        self.worker.ensure_trust("/ws/x")
+        self.worker.ensure_trust("/ws/x")
+        import json
+        d = json.loads(self.claude_json.read_text())
+        self.assertTrue(self._trusted("/ws/x"))
+        self.assertTrue(self._trusted("/old"))
+        self.assertEqual(d["theme"], "dark")
+
+    def test_garbage_config_raises_workspace_error(self):
+        self.claude_json.write_text("{not json")
+        with self.assertRaises(self.worker.WorkspaceError):
+            self.worker.ensure_trust("/ws/x")
+
+
 if __name__ == "__main__":
     unittest.main()
