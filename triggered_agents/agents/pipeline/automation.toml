@@ -13,7 +13,7 @@ precheck = "python3 -m triggered_agents pipeline precheck"
 [systemd]
 # The real scheduler on this headless box. Unit name is derived as ta-pipeline. The dispatcher
 # tick is cheap after precheck, so a tight cadence (every 3 min) keeps latency low.
-calendar = "*:0/3"
+calendar = "*:0/3:00 *:1/3:30"
 randomized_delay_sec = 20
 # Kanboard-креды для precheck и тика: агенты с LLM-головой сорсят .env сами, детерминированному
 # диспетчеру их отдаёт юнит.

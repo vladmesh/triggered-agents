@@ -203,11 +203,14 @@ Environment=HOME=/home/dev
 
 
 def _timer_unit(agent: str, calendar: str, delay: int) -> str:
+    # `calendar` may hold several whitespace-separated specs (systemd cannot express
+    # sub-minute periods like "every 90s" in one OnCalendar line).
+    on_calendar = "\n".join(f"OnCalendar={c}" for c in calendar.split())
     return f"""[Unit]
 Description=triggered-agents: {agent} {calendar} sweep
 
 [Timer]
-OnCalendar={calendar}
+{on_calendar}
 Persistent=true
 RandomizedDelaySec={delay}
 
