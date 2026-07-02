@@ -17,6 +17,8 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+from . import naming
+
 THERMO_SKILL = Path(os.environ.get(
     "TA_THERMO_SKILL",
     str(Path.home() / ".claude/skills/thermo-nuclear-code-quality-review/SKILL.md")))
@@ -37,6 +39,7 @@ def build_task(card: dict, ref: str, pr: str, spec: str, base_branch: str) -> st
     """REVIEW.md for the reviewer head: what to review, the three lenses, the blocking semantics,
     and how to emit the verdict + Идеи cards through board-CLI. `spec` is the card description."""
     project = card.get("project", "?")
+    review_branch = naming.reviewer_branch(ref)
     lines = [
         f"# Ревью задачи {ref} ({project}) — слой 3 валидации",
         "",
@@ -49,12 +52,14 @@ def build_task(card: dict, ref: str, pr: str, spec: str, base_branch: str) -> st
         "",
         f"PR карточки: {pr}",
         f"База проекта: `{base_branch}`.",
-        "Сначала подтяни состояние PR целиком (тебе доступен весь репо и полный PR, не только дифф):",
+        f"Воркспейс уже стоит на состоянии PR — своя ветка `{review_branch}` заведена от головы PR "
+        "при подъёме, чекаутить/переключать ветку не нужно. Тебе доступен весь репо и полный PR, "
+        "не только дифф:",
         "```",
-        f"gh pr checkout {pr}   # либо: git fetch origin <ветка PR> && git checkout --detach FETCH_HEAD",
-        f"gh pr diff {pr}       # дифф PR",
+        f"gh pr diff {pr}       # дифф PR, если нужен именно дифф, а не полный код",
         "```",
-        "Дальше читай нужные файлы репо на состоянии PR, а не только строки диффа.",
+        f"Читай нужные файлы репо на состоянии PR, а не только строки диффа. Своя ветка "
+        f"`{review_branch}` — только твоя рабочая копия, её (как и любую ветку) не пушить.",
         "",
         "## Спека карточки (по ней проверяешь criterion за criterion)",
         "",

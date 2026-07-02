@@ -108,8 +108,13 @@ def _stub_rename_terminal(handle, title):
     return True     # no live Orca terminal behind the stub handle
 
 
+def _stub_set_branch(workspace, branch):
+    pass    # the real git-hygiene rename is exercised in the unit tests, not this e2e
+
+
 def install_stubs(provision=_stub_provision_ok, activity=lambda ws: None):
     worker.create_workspace = _stub_create_workspace
+    worker.set_branch = _stub_set_branch
     worker.provision = provision
     worker.launch_worker = _stub_launch
     worker.activity = activity

@@ -7,6 +7,7 @@ stage sequence up -> health -> e2e, and the always-teardown finally.
 from __future__ import annotations
 
 import os
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -59,6 +60,75 @@ class RunHelperTest(unittest.TestCase):
         code, out = stand._run(["/no/such/binary-xyz", "up"])
         self.assertNotEqual(code, 0)
         self.assertIn("could not run", out)
+
+
+class CheckoutBranchTest(unittest.TestCase):
+    """_checkout_branch against real git repos: the persistent stand worktree must always land on
+    its own named `stand/<project>` branch, never a detached HEAD (git-hygiene AC), and the same
+    holds when reusing a tree left detached by a run from before this convention."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.repo = Path(self.tmp.name) / "repo"
+        self.repo.mkdir()
+        for cmd in (
+            ["git", "init", "-q", "-b", "main"],
+            ["git", "config", "user.email", "t@t"],
+            ["git", "config", "user.name", "t"],
+        ):
+            subprocess.run(cmd, cwd=self.repo, check=True)
+        (self.repo / "f.txt").write_text("v1")
+        subprocess.run(["git", "add", "f.txt"], cwd=self.repo, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "v1"], cwd=self.repo, check=True)
+        subprocess.run(["git", "checkout", "-q", "-b", "pipeline/x"], cwd=self.repo, check=True)
+        (self.repo / "f.txt").write_text("v2")
+        subprocess.run(["git", "commit", "-q", "-am", "v2"], cwd=self.repo, check=True)
+        subprocess.run(["git", "checkout", "-q", "main"], cwd=self.repo, check=True)
+        # _checkout_branch always fetches "origin" — point it at the repo itself so a plain local
+        # git setup (no real remote) can still exercise the real fetch/reset sequence.
+        subprocess.run(["git", "remote", "add", "origin", str(self.repo)], cwd=self.repo, check=True)
+        self.stand_dir = Path(self.tmp.name) / "stand"
+
+    def _status_branch(self, tree):
+        out = subprocess.run(["git", "-C", str(tree), "branch", "--show-current"],
+                             capture_output=True, text=True, check=True)
+        return out.stdout.strip()
+
+    def test_fresh_tree_lands_on_stand_branch_not_detached(self):
+        stand._checkout_branch(self.repo, self.stand_dir, "pipeline/x", "stand/proj")
+        self.assertEqual(self._status_branch(self.stand_dir), "stand/proj")
+        self.assertEqual((self.stand_dir / "f.txt").read_text(), "v2")
+
+    def test_rerun_resets_onto_latest_without_detaching(self):
+        stand._checkout_branch(self.repo, self.stand_dir, "pipeline/x", "stand/proj")
+        subprocess.run(["git", "checkout", "-q", "pipeline/x"], cwd=self.repo, check=True)
+        (self.repo / "f.txt").write_text("v3")
+        subprocess.run(["git", "commit", "-q", "-am", "v3"], cwd=self.repo, check=True)
+        subprocess.run(["git", "checkout", "-q", "main"], cwd=self.repo, check=True)
+        stand._checkout_branch(self.repo, self.stand_dir, "pipeline/x", "stand/proj")
+        self.assertEqual(self._status_branch(self.stand_dir), "stand/proj")
+        self.assertEqual((self.stand_dir / "f.txt").read_text(), "v3")
+
+    def test_legacy_detached_tree_is_folded_onto_stand_branch(self):
+        # A tree from before the stand/<project> convention: created detached at HEAD.
+        subprocess.run(["git", "worktree", "add", "--force", "--detach", str(self.stand_dir), "HEAD"],
+                       cwd=self.repo, check=True)
+        self.assertEqual(self._status_branch(self.stand_dir), "")   # detached, sanity-check
+        stand._checkout_branch(self.repo, self.stand_dir, "pipeline/x", "stand/proj")
+        self.assertEqual(self._status_branch(self.stand_dir), "stand/proj")
+
+    def test_no_command_ever_pushes(self):
+        calls = []
+        real_run = subprocess.run
+
+        def spy(cmd, *a, **k):
+            calls.append(cmd)
+            return real_run(cmd, *a, **k)
+
+        with mock.patch("subprocess.run", spy):
+            stand._checkout_branch(self.repo, self.stand_dir, "pipeline/x", "stand/proj")
+        self.assertFalse(any("push" in c for c in calls))
 
 
 class RunTest(unittest.TestCase):

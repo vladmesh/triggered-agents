@@ -545,7 +545,8 @@ def _spawn_reviewer(ref: str, pr: str, card: dict, rec: dict, records: dict) -> 
     try:
         base = worker.read_base_branch(project)
         review_md = reviewer.build_task(card, ref, pr, spec, base)
-        ws, handle = worker.spawn_reviewer(project, _review_id(card), base, review_md, review_title)
+        ws, handle = worker.spawn_reviewer(project, _review_id(card), base, review_md, review_title,
+                                           naming.worker_branch(ref), naming.reviewer_branch(ref))
     except worker.WorkspaceError as e:
         # spawn_reviewer already tore down any half-created worktree. Retry a few ticks (transient
         # orca), then escalate to Blocked — a persistent failure must not retry forever with no
@@ -733,12 +734,14 @@ def _task_md(card: dict, view: dict) -> str:
     was added (plus the new always-on protocol lines below). A card returning from Blocked or a
     dead head carries its history, so the header also warns that a branch/PR may already exist."""
     ref = card["reference"]
+    branch = naming.worker_branch(ref)
     comments = view.get("comments") or []
     lines = [
         f"# Задача {ref} ({card.get('project', '?')})",
         "",
-        f"Роль на доске — worker. Done для тебя: код закоммичен на ветке "
-        f"`pipeline/{ref}`, локальные тесты зелёные, ветка запушена, PR открыт "
+        f"Роль на доске — worker. Воркспейс уже стоит на ветке `{branch}` (её завели при подъёме "
+        f"воркспейса) — ветку создавать или переименовывать не нужно, коммить прямо в неё. Done "
+        f"для тебя: код закоммичен туда, локальные тесты зелёные, ветка запушена, PR открыт "
         f"через `gh` (base — базовая ветка проекта). В коммитах и PR никаких упоминаний AI "
         f"и Co-Authored-By, стиль — как в git log репо.",
         "",
@@ -752,14 +755,14 @@ def _task_md(card: dict, view: dict) -> str:
     if comments:
         lines += [
             f"У карточки ниже есть история — она уже была в работе раньше (возврат из Blocked, "
-            f"умершая голова или похожий случай). Ветка `pipeline/{ref}` может уже существовать на "
+            f"умершая голова или похожий случай). Ветка `{branch}` может уже существовать на "
             f"origin, PR может быть уже открыт: начни с `git fetch`, продолжай существующие "
             f"ветку/PR, не пересоздавай их.",
             "",
         ]
     lines += [
         f"Всегда (независимо от истории): force-push запрещён; пушь только в репозиторий своего "
-        f"проекта и только в свою ветку `pipeline/{ref}`.",
+        f"проекта и только в свою ветку `{branch}`.",
         "",
     ]
     lines += _task_md_metadata(card)
@@ -792,6 +795,7 @@ def _bring_up(card: dict, worker_id: str, records: dict) -> None:
     try:
         base = worker.read_base_branch(project)
         ws = worker.create_workspace(project, worker_id, base)
+        worker.set_branch(ws, naming.worker_branch(ref))
         ok, log = worker.provision(ws)
         if not ok:
             _block(ref, "smoke", "setup/smoke упал, воркер не стартует:\n```\n" + _tail(log) + "\n```",

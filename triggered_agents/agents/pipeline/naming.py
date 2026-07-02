@@ -71,3 +71,21 @@ def worker_title(card_id: str, card_title: str) -> str:
 
 def reviewer_title(card_id: str, card_title: str) -> str:
     return f"review {card_id}: {card_title}"
+
+
+# --- git ref names (git hygiene: one ref per actor, see design-task-pipeline.md) ---------------
+# Single source of truth for every actor's branch name, keyed off the card `reference` (not the
+# workspace id above) so worker.py and dispatcher.py never hardcode the `pipeline/`/`review/`
+# prefix in more than one place.
+
+
+def worker_branch(reference: str) -> str:
+    return f"pipeline/{reference}"
+
+
+def reviewer_branch(reference: str) -> str:
+    return f"review/{reference}"
+
+
+def stand_branch(project: str) -> str:
+    return f"stand/{project}"
