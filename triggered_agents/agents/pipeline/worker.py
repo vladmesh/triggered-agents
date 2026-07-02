@@ -20,6 +20,7 @@ import tomllib
 from pathlib import Path
 
 from ...runtime import claude_env, redact
+from ...runtime.state import AgentState
 from . import stand
 
 ORCA = os.environ.get("ORCA_BIN") or shutil.which("orca") or str(Path.home() / ".local/bin/orca")
@@ -28,6 +29,11 @@ PROJECTS_DIR = Path(os.environ.get("TA_PROJECTS_DIR", str(Path.home() / "project
 CLAUDE_JSON = Path(os.environ.get("TA_CLAUDE_JSON", str(Path.home() / ".claude.json")))
 CONTROL_PANEL = Path(os.environ.get("TA_CONTROL_PANEL", str(Path.home() / "control-panel")))
 PROVISION = CONTROL_PANEL / "pipeline" / "provision.py"
+# Every workspace teardown lives under here — the guard in teardown() refuses anything outside it,
+# and the same STATE (state/pipeline/) is where dispatcher.py logs, so a sudo-fallback trip shows
+# up in the one runs.jsonl the pipeline already watches.
+WORKSPACES_ROOT = Path(os.environ.get("TA_WORKSPACES_ROOT") or Path.home() / "orca" / "workspaces").resolve()
+STATE = AgentState("pipeline")
 ORCA_TIMEOUT_S = 120       # worktree create runs repo git; give it room, but never hang forever
 PROVISION_TIMEOUT_S = int(os.environ.get("TA_PROVISION_TIMEOUT_S", "900"))
 GH_TIMEOUT_S = 60          # a gh call may hit the network; bounded so a tick never hangs on it
@@ -379,14 +385,52 @@ def run_stand(project: str, branch: str, cfg: dict) -> dict | None:
         return None
 
 
+def _guard_workspace_path(workspace: str) -> Path:
+    """Refuse a path outside WORKSPACES_ROOT before teardown runs any rm — including the root
+    itself, whose removal would take every other project's workspace with it. teardown ends in
+    rm -rf/sudo rm -rf, so a wrong path here is a real deletion, not just a board mistake."""
+    path = Path(workspace).resolve()
+    if path == WORKSPACES_ROOT or WORKSPACES_ROOT not in path.parents:
+        raise WorkspaceError(f"teardown refuses a path outside {WORKSPACES_ROOT}: {workspace}")
+    return path
+
+
+def stop_terminals(workspace: str) -> None:
+    """Best-effort: close every terminal open in `workspace` before its worktree goes away, so the
+    head is not left an orphan with a deleted cwd. Failure here is not fatal — teardown still
+    proceeds to remove the worktree."""
+    try:
+        subprocess.run([ORCA, "terminal", "stop", "--worktree", f"path:{workspace}"],
+                       capture_output=True, text=True, timeout=ORCA_TIMEOUT_S)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
+def _rm_step(args: list[str]) -> subprocess.CompletedProcess:
+    """Run one teardown removal step bounded by ORCA_TIMEOUT_S — the same discipline `_orca_json`
+    and `stop_terminals` already apply to every other orca/host touch, so a stuck orca daemon or a
+    wedged rm (e.g. a stale NFS handle) can never hang a dispatcher tick forever. A timeout counts
+    as a failed step (non-zero return), not an exception, so the existing fallback chain still
+    runs the next step instead of the tick crashing on it."""
+    try:
+        return subprocess.run(args, capture_output=True, text=True, timeout=ORCA_TIMEOUT_S)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return subprocess.CompletedProcess(args, 1, "", str(e))
+
+
 def teardown(workspace: str) -> None:
-    """Best-effort remove the Orca worktree. A dev-stage backend without USER leaves root-owned
-    __pycache__ in the tree, so a plain remove can fail on permissions — fall back to sudo rm."""
-    r = subprocess.run([ORCA, "worktree", "rm", "--worktree", f"path:{workspace}", "--force"],
-                       capture_output=True, text=True)
-    if r.returncode == 0 and not Path(workspace).exists():
+    """Stop the workspace's terminals, then best-effort remove the Orca worktree. A dev-stage
+    backend without USER leaves root-owned __pycache__ in the tree, so a plain remove can fail on
+    permissions — fall back to rm -rf, then sudo rm -rf (logged: after the personal_site PR#24
+    non-root fix this should stay silent, so a trip here is a signal the root-owned grief is
+    back)."""
+    path = _guard_workspace_path(workspace)
+    stop_terminals(workspace)
+    r = _rm_step([ORCA, "worktree", "rm", "--worktree", f"path:{workspace}", "--force"])
+    if r.returncode == 0 and not path.exists():
         return
-    if Path(workspace).exists():
-        p = subprocess.run(["rm", "-rf", workspace], capture_output=True, text=True)
-        if p.returncode != 0 and Path(workspace).exists():
-            subprocess.run(["sudo", "rm", "-rf", workspace], capture_output=True, text=True)
+    if path.exists():
+        p = _rm_step(["rm", "-rf", workspace])
+        if p.returncode != 0 and path.exists():
+            STATE.log_run("teardown-sudo-fallback", workspace=workspace)
+            _rm_step(["sudo", "rm", "-rf", workspace])
