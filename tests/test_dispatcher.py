@@ -352,6 +352,32 @@ class DispatcherTest(unittest.TestCase):
         self.assertNotIn("from ..board", src)
 
 
+class ProjectRootTest(unittest.TestCase):
+    """Резолв корня проекта: ~/projects/<name>, фоллбэк на ~/<name> (первый прогон на
+    triggered-agents: репо живёт в ~, bring-up падал repo_not_found)."""
+
+    def setUp(self):
+        from triggered_agents.agents.pipeline import worker
+        self.worker = worker
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.home = Path(self.tmp.name)
+        (self.home / "projects" / "site").mkdir(parents=True)
+        (self.home / "infra-repo").mkdir()
+        self._patch = mock.patch.object(worker, "PROJECTS_DIR", self.home / "projects")
+        self._patch.start()
+        self.addCleanup(self._patch.stop)
+
+    def test_prefers_projects_dir(self):
+        self.assertEqual(self.worker.project_root("site"), self.home / "projects" / "site")
+
+    def test_falls_back_to_home(self):
+        self.assertEqual(self.worker.project_root("infra-repo"), self.home / "infra-repo")
+
+    def test_missing_stays_in_projects_dir(self):
+        self.assertEqual(self.worker.project_root("nope"), self.home / "projects" / "nope")
+
+
 class EnsureTrustTest(unittest.TestCase):
     """Folder trust: без него голова виснет на интерактивном вопросе Claude Code
     (первый живой прогон, personal_site-198)."""
