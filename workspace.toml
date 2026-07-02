@@ -1,0 +1,27 @@
+# Workspace manifest for the task pipeline (control-panel/docs/design-task-pipeline.md,
+# «Окружение воркспейса»). Исполняется control-panel/pipeline/provision.py, который Orca
+# дёргает на каждый worktree через `orca.yaml scripts.setup`.
+
+[workspace]
+project = "triggered-agents"
+base_branch = "main"
+
+[secrets]
+# Файлы не копируем: Kanboard-креды для live-e2e воркер берёт сам из control-panel/.env
+# (`set -a; source ...`), как все агенты на этом хосте.
+copy = []
+
+[github]
+# Заглушка: общий gh-логин юзера dev. Least-privilege токены на роль — в бэклоге.
+token = "dev-shared"
+
+[skills]
+install = []
+
+[setup]
+commands = []
+
+[smoke]
+# Юниты — stdlib unittest, без сети и Orca; быстрые, поэтому и есть smoke.
+command = "python3 -m unittest discover -s tests"
+timeout_seconds = 120

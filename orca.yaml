@@ -1,0 +1,4 @@
+# Orca workspace hooks: выполняются при создании worktree из этого репо.
+# Распознаваемые ключи: scripts.setup, scripts.archive, issueCommand, defaultTabs.
+scripts:
+  setup: python3 "$HOME/control-panel/pipeline/provision.py"
