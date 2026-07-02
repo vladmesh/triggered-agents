@@ -66,6 +66,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_create.add_argument("--column", default="Идеи")
     p_create.add_argument("--blocked-by", dest="blocked_by")
     p_create.add_argument("--model", dest="model_name")
+    p_create.add_argument("--slug")
     p_create.add_argument("--description")
     p_create.add_argument("--description-file")
 
@@ -109,6 +110,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_idea.add_argument("--type", default="code", dest="task_type")
     p_idea.add_argument("--ref")
     p_idea.add_argument("--model", dest="model_name")
+    p_idea.add_argument("--slug")
     p_idea.add_argument("--description")
     p_idea.add_argument("--description-file")
 
@@ -154,7 +156,7 @@ def main(argv=None) -> int:
             return _emit(ops.create_card(
                 project=args.project, task_type=args.task_type, title=args.title,
                 description=desc, ref=args.ref, column=args.column,
-                blocked_by=args.blocked_by, model_name=args.model_name))
+                blocked_by=args.blocked_by, model_name=args.model_name, slug=args.slug))
         if args.cmd == "ready":
             if not _need_role(role, ROLES):
                 return 2
@@ -187,7 +189,7 @@ def main(argv=None) -> int:
             desc = _text_arg(args.description, args.description_file)
             return _emit(ops.reviewer_idea(
                 project=args.project, task_type=args.task_type, title=args.title,
-                description=desc, ref=args.ref, model_name=args.model_name))
+                description=desc, ref=args.ref, model_name=args.model_name, slug=args.slug))
         if args.cmd == "comment":
             if not _need_role(role, ROLES):
                 return 2

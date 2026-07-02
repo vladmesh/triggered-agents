@@ -41,7 +41,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from ...runtime.state import AgentState
-from . import model, ops, reviewer, worker
+from . import model, naming, ops, reviewer, worker
 
 STATE = AgentState("pipeline")
 CARDS_FILE = STATE.dir / "cards.json"
@@ -133,11 +133,19 @@ def _tail(text: str, lines: int = _LOG_TAIL_LINES) -> str:
     return "\n".join(text.strip().splitlines()[-lines:])
 
 
-def _worker_id(reference: str) -> str:
-    """Workspace/worker id for a claim. Timestamped so a re-claim after Blocked never collides
-    with the still-alive worktree of the previous attempt."""
-    safe = "".join(c if c.isalnum() or c in "-_" else "-" for c in reference)
-    return f"{safe}-{int(time.time())}"
+def _card_slug(card: dict) -> str:
+    """The card's explicit slug, or a transliterated fallback from its title — an old/manual
+    card created before the slug field existed still claims fine."""
+    slug = (card.get("slug") or "").strip()
+    return slug if slug else naming.fallback_slug(card.get("title") or card["reference"])
+
+
+def _worker_id(card: dict) -> str:
+    """Workspace/worker id for a claim: `<reference>-<slug>`, suffixed -2/-3/... if that
+    workspace dir is still alive from a previous attempt (e.g. left on Blocked)."""
+    base = naming.worker_workspace_base(card["reference"], _card_slug(card))
+    project = card.get("project") or ""
+    return naming.dedupe(base, lambda n: worker.workspace_exists(project, n))
 
 
 def precheck() -> int:
@@ -214,12 +222,16 @@ def _advance(records: dict) -> bool:
             changed = True
             continue
         if card["column"] == "Validate":
+            # Claude Code overwrites its own tab title once it starts working (confirmed live),
+            # so the worker's title is pinned back every tick, same as while In progress.
+            worker.rename_terminal(rec.get("handle", ""), rec.get("title", ""))
             continue                      # _validate owns Validate cards
         if card["column"] != model.IN_PROGRESS:
             # Left In progress by another path (human move, blocked-report already applied) — drop.
             records.pop(ref)
             changed = True
             continue
+        worker.rename_terminal(rec.get("handle", ""), rec.get("title", ""))
         verdict = _report_verdict(ref, int(rec.get("comment_baseline", 0)))
         if verdict == "done":
             ops.move_card("dispatcher", ref, "Validate")
@@ -460,11 +472,12 @@ def _validate_error(ref: str, exc: Exception) -> None:
 # so the card never sits in Validate forever with a dead head.
 
 
-def _review_id(reference: str) -> str:
-    """Workspace id for a reviewer head, kept distinct from the worker's so the two worktrees of
-    one card never collide."""
-    safe = "".join(c if c.isalnum() or c in "-_" else "-" for c in reference)
-    return f"review-{safe}-{int(time.time())}"
+def _review_id(card: dict) -> str:
+    """Workspace id for a reviewer head: `review-<reference>-<slug>`, kept distinct from the
+    worker's own workspace name and deduped the same way."""
+    base = naming.reviewer_workspace_base(card["reference"], _card_slug(card))
+    project = card.get("project") or ""
+    return naming.dedupe(base, lambda n: worker.workspace_exists(project, n))
 
 
 def _clear_review(rec: dict) -> None:
@@ -473,6 +486,7 @@ def _clear_review(rec: dict) -> None:
     ws = rec.pop("review_ws", "")
     rec.pop("review_baseline", None)
     rec.pop("review_handle", None)
+    rec.pop("review_title", None)
     rec.pop("review_activity", None)
     rec.pop("review_spawn_fails", None)
     if ws:
@@ -517,10 +531,11 @@ def _spawn_reviewer(ref: str, pr: str, card: dict, rec: dict, records: dict) -> 
     save can't lose the baseline and spawn a second reviewer on the next tick."""
     project = card.get("project") or ""
     spec = ops.show_card(ref).get("description", "")
+    review_title = naming.reviewer_title(ref, card.get("title") or ref)
     try:
         base = worker.read_base_branch(project)
         review_md = reviewer.build_task(card, ref, pr, spec, base)
-        ws, handle = worker.spawn_reviewer(project, _review_id(ref), base, review_md)
+        ws, handle = worker.spawn_reviewer(project, _review_id(card), base, review_md, review_title)
     except worker.WorkspaceError as e:
         # spawn_reviewer already tore down any half-created worktree. Retry a few ticks (transient
         # orca), then escalate to Blocked — a persistent failure must not retry forever with no
@@ -549,6 +564,7 @@ def _spawn_reviewer(ref: str, pr: str, card: dict, rec: dict, records: dict) -> 
     rec.pop("review_spawn_fails", None)
     rec["review_ws"] = ws
     rec["review_handle"] = handle
+    rec["review_title"] = review_title
     rec["review_activity"] = time.time()
     rec["review_baseline"] = len(ops.show_card(ref)["comments"])
     _save_cards(records)
@@ -561,6 +577,7 @@ def _review_watchdog(ref: str, rec: dict, records: dict) -> bool:
     Block the card до vladmesh — a dead reviewer must never leave the card stuck in Validate."""
     ws = rec.get("review_ws")
     changed = False
+    worker.rename_terminal(rec.get("review_handle", ""), rec.get("review_title", ""))
     last = worker.activity(ws) if ws else None
     if last and last > rec.get("review_activity", 0):
         rec["review_activity"] = last
@@ -673,7 +690,8 @@ def _bring_up(card: dict, worker_id: str, records: dict) -> None:
             return
         view = ops.show_card(ref)
         worker.write_task(ws, _task_md(card, view.get("description", "")))
-        handle = worker.launch_worker(ws, card.get("model") or None, worker_id)
+        title = naming.worker_title(ref, card.get("title") or ref)
+        handle = worker.launch_worker(ws, card.get("model") or None, worker_id, title)
     except Exception as e:
         stage = "workspace-create" if ws is None else "launch"
         _block(ref, stage, f"bring-up упал ({stage}): {e}" + (f"\nВоркспейс {ws} оставлен." if ws else ""),
@@ -684,6 +702,7 @@ def _bring_up(card: dict, worker_id: str, records: dict) -> None:
         "workspace": ws,
         "worker": worker_id,
         "handle": handle,
+        "title": title,
         "claimed_at": now,
         "last_activity": now,
         "comment_baseline": len(view["comments"]),
@@ -701,7 +720,7 @@ def _claim_next(records: dict) -> None:
     ready.sort(key=lambda c: (c["position"], c["id"]))
     for card in ready:
         ref = card["reference"]
-        worker_id = _worker_id(ref)
+        worker_id = _worker_id(card)
         try:
             ops.claim_card(ref, worker_id, cap=WORKER_CAP)
         except model.GuardError as e:

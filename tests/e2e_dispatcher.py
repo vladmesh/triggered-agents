@@ -91,7 +91,7 @@ def _stub_provision_fail(workspace):
     return False, "[provision] FAIL: smoke command failed (exit 1)\n"
 
 
-def _stub_launch(workspace, model_name, worker_id):
+def _stub_launch(workspace, model_name, worker_id, title):
     return f"stub-handle-{worker_id}"
 
 
@@ -100,12 +100,22 @@ def _stub_notify(handle, text):
     return True
 
 
+def _stub_workspace_exists(project, name):
+    return False    # naming collisions are exercised in the unit tests, not this e2e
+
+
+def _stub_rename_terminal(handle, title):
+    return True     # no live Orca terminal behind the stub handle
+
+
 def install_stubs(provision=_stub_provision_ok, activity=lambda ws: None):
     worker.create_workspace = _stub_create_workspace
     worker.provision = provision
     worker.launch_worker = _stub_launch
     worker.activity = activity
     worker.notify = _stub_notify        # no live head to nudge; poll_pr stays real (hits gh)
+    worker.workspace_exists = _stub_workspace_exists
+    worker.rename_terminal = _stub_rename_terminal
 
 
 def main() -> int:
