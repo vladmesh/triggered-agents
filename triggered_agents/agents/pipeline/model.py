@@ -30,11 +30,14 @@ TASK_TYPES = ("code", "research", "debug")
 #   blocked_by reference of a predecessor card that must be Done before claim
 #   model      recommended model for the worker
 #   claim      worker/workspace id, set by the claim command
+#   slug       short [a-z0-9-]{1,30} tag naming the card's worker/reviewer workspace; a card
+#              without one (old/manual) falls back to a transliterated slug of its title
 META_TASK_TYPE = "task_type"
 META_PROJECT = "project"
 META_BLOCKED_BY = "blocked_by"
 META_MODEL = "model"
 META_CLAIM = "claim"
+META_SLUG = "slug"
 
 IN_PROGRESS = "In progress"
 

@@ -46,6 +46,8 @@ class FakeWorker:
         self.stand_runs = []             # (project, branch) each run_stand was asked about
         self.reviewer_spawns = []        # (project, worker_id, base) each spawn_reviewer was asked
         self.reviewer_raises = None      # set to raise from spawn_reviewer (orca failure)
+        self.existing_workspaces = set()  # (project, name) pairs treated as already on disk
+        self.renamed = []                # (handle, title) every rename_terminal call
         self._n = 0
 
     def read_base_branch(self, project):
@@ -64,9 +66,16 @@ class FakeWorker:
         self.tasks_written.append((workspace, content))
         return workspace + "/TASK.md"
 
-    def launch_worker(self, workspace, model_name, worker_id):
-        self.launched.append({"ws": workspace, "model": model_name, "worker": worker_id})
+    def launch_worker(self, workspace, model_name, worker_id, title):
+        self.launched.append({"ws": workspace, "model": model_name, "worker": worker_id, "title": title})
         return f"handle-{worker_id}"
+
+    def workspace_exists(self, project, name):
+        return (project, name) in self.existing_workspaces
+
+    def rename_terminal(self, handle, title):
+        self.renamed.append((handle, title))
+        return bool(handle)
 
     def activity(self, workspace):
         return self.activity_ts
@@ -89,10 +98,10 @@ class FakeWorker:
         self.stand_runs.append((project, branch))
         return self.stand_result
 
-    def spawn_reviewer(self, project, worker_id, base_branch, review_md):
+    def spawn_reviewer(self, project, worker_id, base_branch, review_md, title):
         if self.reviewer_raises:
             raise self.reviewer_raises
-        self.reviewer_spawns.append((project, worker_id, base_branch))
+        self.reviewer_spawns.append((project, worker_id, base_branch, title))
         return f"/rev/{worker_id}", f"rev-handle-{worker_id}"
 
     def teardown(self, workspace):
@@ -112,7 +121,8 @@ class _DispatcherBase(unittest.TestCase):
         self.worker = FakeWorker()
         for name in ("read_base_branch", "create_workspace", "provision", "write_task",
                      "launch_worker", "activity", "poll_pr", "notify", "teardown",
-                     "read_stand_config", "pr_branch", "run_stand", "spawn_reviewer"):
+                     "read_stand_config", "pr_branch", "run_stand", "spawn_reviewer",
+                     "workspace_exists", "rename_terminal"):
             wp = mock.patch(f"triggered_agents.agents.pipeline.worker.{name}",
                             getattr(self.worker, name))
             wp.start()
@@ -410,6 +420,79 @@ class DispatcherTest(_DispatcherBase):
         src = Path(dispatcher.__file__).read_text()
         self.assertNotIn("kanboard", src)
         self.assertNotIn("from ..board", src)
+
+
+class WorkspaceNamingTest(_DispatcherBase):
+    """Slug -> workspace name, fallback for cards without one, collision suffix, human-readable
+    tab titles, and pinning the title back every tick (Claude Code overwrites it on its own)."""
+
+    def test_claim_uses_card_slug_in_workspace_name(self):
+        ref = self._ready_card("A", meta={model.META_SLUG: "teardown-slug"})
+        dispatcher.tick()
+        self.assertEqual(dispatcher._load_cards()[ref]["workspace"], f"/ws/{ref}-teardown-slug")
+        self.assertEqual(dispatcher._load_cards()[ref]["worker"], f"{ref}-teardown-slug")
+
+    def test_claim_without_slug_falls_back_to_title_transliteration(self):
+        from triggered_agents.agents.pipeline import naming
+        ref = self._ready_card("Тестовый Заголовок")
+        dispatcher.tick()
+        expect = naming.fallback_slug("Тестовый Заголовок")
+        self.assertEqual(dispatcher._load_cards()[ref]["worker"], f"{ref}-{expect}")
+
+    def test_claim_name_collision_gets_dash_2_suffix(self):
+        ref = self._ready_card("A", meta={model.META_SLUG: "dup-slug"})
+        self.worker.existing_workspaces.add(("personal_site", f"{ref}-dup-slug"))
+        dispatcher.tick()
+        self.assertEqual(dispatcher._load_cards()[ref]["worker"], f"{ref}-dup-slug-2")
+
+    def test_claim_name_collision_keeps_incrementing(self):
+        ref = self._ready_card("A", meta={model.META_SLUG: "dup-slug"})
+        for suffix in ("", "-2", "-3"):
+            self.worker.existing_workspaces.add(("personal_site", f"{ref}-dup-slug{suffix}"))
+        dispatcher.tick()
+        self.assertEqual(dispatcher._load_cards()[ref]["worker"], f"{ref}-dup-slug-4")
+
+    def test_launch_title_is_human_readable_worker_prefix(self):
+        ref = self._ready_card("Fix the thing", meta={model.META_SLUG: "fix-thing"})
+        dispatcher.tick()
+        self.assertEqual(self.worker.launched[0]["title"], f"worker {ref}: Fix the thing")
+
+    def test_worker_title_pinned_every_tick_while_in_progress(self):
+        ref = self._claim_one("A", meta={model.META_SLUG: "pin-me"})
+        handle = f"handle-{ref}-pin-me"
+        dispatcher.tick()   # advance tick, no report yet -> stays In progress
+        self.assertIn((handle, f"worker {ref}: A"), self.worker.renamed)
+
+    def test_worker_title_pinned_while_in_validate(self):
+        ref = self._claim_one("A", meta={model.META_SLUG: "pin-me"})
+        ops.report(ref, "done", "shipped")
+        dispatcher.tick()
+        self.assertEqual(self._column(ref), "Validate")
+        handle = f"handle-{ref}-pin-me"
+        title = f"worker {ref}: A"
+        self.assertIn((handle, title), self.worker.renamed)
+        before = len([c for c in self.worker.renamed if c == (handle, title)])
+        dispatcher.tick()   # gh unavailable, card stays in Validate -> must pin again
+        after = len([c for c in self.worker.renamed if c == (handle, title)])
+        self.assertGreater(after, before)
+
+    def test_reviewer_title_and_pinning(self):
+        from triggered_agents.agents.pipeline import naming
+        ref = self._claim_one("A", meta={model.META_SLUG: "rev-slug"})
+        ops.report(ref, "done", "готово\nPR: https://github.com/vladmesh/personal_site/pull/9")
+        self.worker.pr_status = None
+        dispatcher.tick()
+        self.worker.pr_status = {"merged": False, "state": "OPEN", "rollup": "SUCCESS",
+                                 "failed_job": None, "failed_log": None}
+        dispatcher.tick()   # CI green -> spawns the reviewer
+        self.assertEqual(len(self.worker.reviewer_spawns), 1)
+        expect_title = naming.reviewer_title(ref, "A")
+        _, worker_id, _, spawned_title = self.worker.reviewer_spawns[0]
+        self.assertEqual(spawned_title, expect_title)
+        self.assertTrue(worker_id.startswith(f"review-{ref}-rev-slug"))
+        handle = f"rev-handle-{worker_id}"
+        dispatcher.tick()   # no verdict yet -> watchdog path must pin the title again
+        self.assertIn((handle, expect_title), self.worker.renamed)
 
 
 class ValidateTest(_DispatcherBase):
@@ -1022,9 +1105,10 @@ class WorkerHostCallsTest(unittest.TestCase):
         self.assertIn("--activate", args)
 
     def test_launch_worker_ensures_trust_and_theme_before_terminal_create(self):
-        self.worker.launch_worker("/ws/fresh", None, "worker-1")
+        self.worker.launch_worker("/ws/fresh", None, "worker-1", "worker A-1: title")
         self.assertEqual(self.ensured, ["ensure_trust", "ensure_theme"])
         self.assertEqual(self.calls[0][0], "terminal")
+        self.assertIn("worker A-1: title", self.calls[0])
 
     def test_spawn_reviewer_tears_down_worktree_on_launch_failure(self):
         # The worktree is created first; if the head fails to launch after that, the worktree must
@@ -1041,7 +1125,7 @@ class WorkerHostCallsTest(unittest.TestCase):
              mock.patch.object(self.worker, "_write_excluded", lambda *a: "/ws/rev/REVIEW.md"), \
              mock.patch.object(self.worker, "teardown", lambda ws: torn.append(ws)):
             with self.assertRaises(self.worker.WorkspaceError):
-                self.worker.spawn_reviewer("proj", "rev-1", "main", "REVIEW body")
+                self.worker.spawn_reviewer("proj", "rev-1", "main", "REVIEW body", "review A-1: title")
         self.assertEqual(torn, ["/ws/rev"])
 
 

@@ -20,7 +20,7 @@ import os
 
 from ...runtime.state import AgentState
 from ..board.kanboard import KanboardError, call
-from . import model, worker
+from . import model, naming, worker
 
 STATE = AgentState("pipeline")
 
@@ -122,12 +122,19 @@ def _is_done(task: dict, pid: int) -> bool:
 
 def create_card(project: str, task_type: str, title: str, description: str = "",
                 ref: str | None = None, column: str = "Идеи",
-                blocked_by: str | None = None, model_name: str | None = None) -> dict:
-    """PO-only: create a spec card in Идеи or Ready, keyed by reference, with metadata."""
+                blocked_by: str | None = None, model_name: str | None = None,
+                slug: str | None = None) -> dict:
+    """PO-only: create a spec card in Идеи or Ready, keyed by reference, with metadata.
+
+    `slug` names the card's future worker/reviewer workspace (`<reference>-<slug>`); when
+    omitted, claim falls back to a transliterated slug of the title (naming.fallback_slug) so an
+    old/manual card without one still claims fine."""
     if task_type not in model.TASK_TYPES:
         raise model.GuardError(f"unknown task_type {task_type!r} (types: {', '.join(model.TASK_TYPES)})")
     if column not in ("Идеи", "Ready"):
         raise model.GuardError(f"cards are created only in 'Идеи' or 'Ready', not {column!r}")
+    if slug is not None and not naming.SLUG_RE.match(slug):
+        raise model.GuardError(f"slug {slug!r} must match [a-z0-9-]{{1,30}}")
     pid = board_id()
     col_id = _column_id(pid, column)
     sw_id = _ensure_swimlane(pid, project)
@@ -142,6 +149,8 @@ def create_card(project: str, task_type: str, title: str, description: str = "",
         values[model.META_BLOCKED_BY] = blocked_by
     if model_name:
         values[model.META_MODEL] = model_name
+    if slug:
+        values[model.META_SLUG] = slug
     call("saveTaskMetadata", task_id=task_id, values=values)
     return {"action": "created", "id": task_id, "reference": ref, "column": column}
 
@@ -272,13 +281,14 @@ def verdict(reference: str, kind: str, body: str = "") -> dict:
 
 
 def reviewer_idea(project: str, title: str, description: str = "", task_type: str = "code",
-                  ref: str | None = None, model_name: str | None = None) -> dict:
+                  ref: str | None = None, model_name: str | None = None,
+                  slug: str | None = None) -> dict:
     """Reviewer-only: file an out-of-scope finding as an Идеи card (the reviewer's single
     code-creation exception). Title and description are scrubbed for the same reason as a verdict."""
     return create_card(project=project, task_type=task_type,
                        title=worker.scrub_secrets(title),
                        description=worker.scrub_secrets(description),
-                       ref=ref, column="Идеи", model_name=model_name)
+                       ref=ref, column="Идеи", model_name=model_name, slug=slug)
 
 
 def feedback(reference: str, body: str) -> dict:
@@ -304,6 +314,7 @@ def _card_view(pid: int, task: dict, cols: dict, lanes: dict) -> dict:
         "blocked_by": meta.get(model.META_BLOCKED_BY, ""),
         "model": meta.get(model.META_MODEL, ""),
         "claim": meta.get(model.META_CLAIM, ""),
+        "slug": meta.get(model.META_SLUG, ""),
     }
 
 

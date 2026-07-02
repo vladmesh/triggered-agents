@@ -160,6 +160,28 @@ def _git_exclude(workspace: str, name: str) -> None:
             f.write(("" if not existing or existing[-1] == "" else "\n") + name + "\n")
 
 
+def workspace_exists(project: str, name: str) -> bool:
+    """Whether `<WORKSPACES_ROOT>/<project>/<name>` already exists on disk — the collision check
+    for a workspace name (naming.dedupe): a re-claim while the previous attempt's worktree is
+    still alive (e.g. left on Blocked) must not collide with it."""
+    return (WORKSPACES_ROOT / project / name).is_dir()
+
+
+def rename_terminal(handle: str, title: str) -> bool:
+    """Best-effort: (re)apply a human-readable title to `handle`'s tab. Claude Code's own
+    session dynamically rewrites its tab title once it starts working (spinner + an inferred
+    blurb of the current step — confirmed live, see PR description), so a rename at spawn alone
+    does not stick; callers reapply this every tick to pin the pipeline's title back."""
+    if not handle:
+        return False
+    try:
+        p = subprocess.run([ORCA, "terminal", "rename", "--terminal", handle, "--title", title],
+                           capture_output=True, text=True, timeout=ORCA_TIMEOUT_S)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return p.returncode == 0
+
+
 def _launch_command(model: str | None, worker_id: str) -> str:
     model_flag = f" --model {model}" if model else ""
     prompt = (
@@ -189,12 +211,14 @@ def ensure_theme() -> None:
         raise WorkspaceError(str(e)) from e
 
 
-def launch_worker(workspace: str, model: str | None, worker_id: str) -> str:
-    """Spawn the worker head in the workspace; return the terminal handle."""
+def launch_worker(workspace: str, model: str | None, worker_id: str, title: str) -> str:
+    """Spawn the worker head in the workspace; return the terminal handle. `title` seeds the
+    tab's display name; the caller (dispatcher) pins it back every tick via rename_terminal since
+    Claude Code overwrites it once the head starts working."""
     ensure_trust(workspace)
     ensure_theme()
     data = _orca_json(["terminal", "create", "--worktree", f"path:{workspace}",
-                       "--title", f"Claude worker {worker_id}",
+                       "--title", title,
                        "--command", _launch_command(model, worker_id)])
     term = data.get("terminal", data)
     return term.get("handle") or term.get("id") or ""
@@ -211,18 +235,19 @@ def _reviewer_command(worker_id: str) -> str:
     return f'BOARD_ROLE=reviewer claude --dangerously-skip-permissions{model_flag} {prompt!r}'
 
 
-def spawn_reviewer(project: str, worker_id: str, base_branch: str, review_md: str) -> tuple[str, str]:
+def spawn_reviewer(project: str, worker_id: str, base_branch: str, review_md: str,
+                   title: str) -> tuple[str, str]:
     """Bring up the layer-3 reviewer head: a fresh worktree off base_branch (the head checks out
     the PR itself per REVIEW.md), the REVIEW.md prompt, then the head. No provisioning — the
     reviewer only reads code and drives gh/board-CLI, so it needs no app deps. Returns
-    (workspace, terminal handle)."""
+    (workspace, terminal handle). `title` seeds the tab's display name (see launch_worker)."""
     ws = create_workspace(project, worker_id, base_branch)
     try:
         _write_excluded(ws, "REVIEW.md", review_md)
         ensure_trust(ws)
         ensure_theme()
         data = _orca_json(["terminal", "create", "--worktree", f"path:{ws}",
-                           "--title", f"Claude reviewer {worker_id}",
+                           "--title", title,
                            "--command", _reviewer_command(worker_id)])
     except Exception as e:
         teardown(ws)   # the worktree already exists; don't leave an orphan on a failed launch

@@ -224,6 +224,23 @@ class TestCreate(PatchedBoardTest):
         self.assertEqual(out["reference"], "my-ref")
         self.assertEqual(board.method_calls("updateTask"), [])
 
+    def test_slug_is_stored_in_metadata(self):
+        board = self.make_board()
+        out = ops.create_card("personal_site", "code", "T", slug="teardown-done-workspaces")
+        self.assertEqual(board.metadata[out["id"]][model.META_SLUG], "teardown-done-workspaces")
+
+    def test_missing_slug_leaves_metadata_unset(self):
+        board = self.make_board()
+        out = ops.create_card("personal_site", "code", "T")
+        self.assertNotIn(model.META_SLUG, board.metadata[out["id"]])
+
+    def test_bad_slug_raises_and_creates_nothing(self):
+        board = self.make_board()
+        for bad in ("Has-Caps", "with_underscore", "a" * 31, "", "имя"):
+            with self.assertRaises(model.GuardError):
+                ops.create_card("personal_site", "code", "T", slug=bad)
+        self.assertEqual(board.tasks, {})
+
 
 class TestClaim(PatchedBoardTest):
     def test_happy_path_saves_then_moves(self):
@@ -429,6 +446,42 @@ class TestReviewerIdea(PatchedBoardTest):
         blob = created[0]["title"] + created[0].get("description", "")
         self.assertNotIn("supersecretvalue123", blob)
         self.assertNotIn("anothersecretvalue999", blob)
+
+    def test_slug_passed_through_to_metadata(self):
+        board = self.make_board()
+        out = ops.reviewer_idea("personal_site", "T", slug="found-a-bug")
+        self.assertEqual(board.metadata[out["id"]][model.META_SLUG], "found-a-bug")
+
+
+class TestCliSlug(PatchedBoardTest):
+    """--slug reaches ops through the cli seam (create/idea), same exit-code contract as
+    task_type/column: 0 on a valid slug, 3 (GuardError) on a bad one."""
+
+    def setUp(self):
+        from triggered_agents.agents.pipeline import cli
+        self.cli = cli
+
+    def test_create_with_valid_slug_ok(self):
+        board = self.make_board()
+        rc = self.cli.main(["--role", "po", "create", "--project", "personal_site",
+                            "--type", "code", "--title", "T", "--slug", "teardown-slug"])
+        self.assertEqual(rc, 0)
+        (task_id, meta), = [(tid, m) for tid, m in board.metadata.items()]
+        self.assertEqual(meta[model.META_SLUG], "teardown-slug")
+
+    def test_create_with_bad_slug_exits_3(self):
+        self.make_board()
+        rc = self.cli.main(["--role", "po", "create", "--project", "personal_site",
+                            "--type", "code", "--title", "T", "--slug", "Not Valid"])
+        self.assertEqual(rc, 3)
+
+    def test_idea_with_valid_slug_ok(self):
+        board = self.make_board()
+        rc = self.cli.main(["--role", "reviewer", "idea", "--project", "personal_site",
+                            "--title", "T", "--slug", "found-issue"])
+        self.assertEqual(rc, 0)
+        (task_id, meta), = [(tid, m) for tid, m in board.metadata.items()]
+        self.assertEqual(meta[model.META_SLUG], "found-issue")
 
 
 class TestReviewerRole(unittest.TestCase):
