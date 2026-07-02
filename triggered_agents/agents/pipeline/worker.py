@@ -62,7 +62,13 @@ def _orca_json(args: list[str]) -> dict:
 
 
 def project_root(project: str) -> Path:
-    return PROJECTS_DIR / project
+    """Корень репо проекта: ~/projects/<name>, иначе ~/<name> (там живут control-panel,
+    triggered-agents и прочая инфраструктура секретаря)."""
+    p = PROJECTS_DIR / project
+    if p.is_dir():
+        return p
+    home = PROJECTS_DIR.parent / project
+    return home if home.is_dir() else p
 
 
 def read_base_branch(project: str) -> str:
