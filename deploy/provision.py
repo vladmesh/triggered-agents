@@ -238,7 +238,8 @@ def ensure_systemd(agent: str, spec: dict, workspace: Path) -> None:
     delay = int(sysd.get("randomized_delay_sec", 0))
     unit = f"ta-{agent}"
     _sudo_write(SYSTEMD_DIR / f"{unit}.service",
-                _service_unit(agent, calendar, workspace, spec.get("precheck", "")))
+                _service_unit(agent, calendar, workspace, spec.get("precheck", ""),
+                              sysd.get("env_file", "")))
     _sudo_write(SYSTEMD_DIR / f"{unit}.timer", _timer_unit(agent, calendar, delay))
     remove_legacy_unit(sysd.get("legacy_unit", ""))
     run(["sudo", "systemctl", "daemon-reload"])
