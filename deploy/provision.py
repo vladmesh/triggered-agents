@@ -137,8 +137,13 @@ def _automation_id_by_name(name: str) -> str | None:
     return None
 
 
-def ensure_automation(spec: dict, workspace: Path) -> str:
+def ensure_automation(spec: dict, workspace: Path) -> str | None:
     name = spec["name"]
+    if spec.get("dispatcher") or not spec.get("skill"):
+        # Deterministic agent (the pipeline dispatcher): the systemd timer drives its tick
+        # directly, there is no claude head, so no Orca automation to register.
+        log(f"automation skipped (deterministic dispatcher): {name}")
+        return None
     common = [
         "--prompt", spec["skill"],
         "--provider", spec["provider"],

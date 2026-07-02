@@ -322,6 +322,18 @@ class TestClaim(PatchedBoardTest):
         with self.assertRaises(model.GuardError):
             ops.claim_card(ref, "w1", cap=1)
 
+    def test_refuses_at_cap_counting_validate(self):
+        # A Validate card still owns its worker session, so it occupies a cap slot.
+        board = self.make_board()
+        board.add_task("A", "Validate", meta={model.META_TASK_TYPE: "research",
+                                              model.META_PROJECT: "other",
+                                              model.META_CLAIM: "w0"})
+        ref = board.add_task("B", "Ready", meta={model.META_TASK_TYPE: "research",
+                                                 model.META_PROJECT: "personal_site"})
+        with self.assertRaises(model.GuardError) as ctx:
+            ops.claim_card(ref, "w1", cap=1)
+        self.assertIn("cap reached", str(ctx.exception))
+
     def test_blocked_to_ready_clears_claim_and_reclaim_succeeds(self):
         board = self.make_board()
         ref = board.add_task("A", "In progress", meta={model.META_TASK_TYPE: "code",

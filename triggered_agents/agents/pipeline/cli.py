@@ -55,6 +55,8 @@ def _build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="cmd")
 
     sub.add_parser("setup")
+    sub.add_parser("tick")       # dispatcher: one deterministic tick (claim/advance)
+    sub.add_parser("precheck")   # dispatcher: exit 0 if there is work, non-zero to skip
 
     p_create = sub.add_parser("create")
     p_create.add_argument("--project", required=True)
@@ -122,6 +124,9 @@ def main(argv=None) -> int:
     try:
         if args.cmd == "setup":
             return _emit(ops.ensure_structure())
+        if args.cmd in ("tick", "precheck"):
+            from . import dispatcher
+            return dispatcher.tick() if args.cmd == "tick" else dispatcher.precheck()
         if args.cmd == "list":
             return _emit(ops.list_cards(column=args.column, project=args.project))
         if args.cmd == "show":
