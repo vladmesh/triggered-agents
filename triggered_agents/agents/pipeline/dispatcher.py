@@ -41,6 +41,7 @@ import re
 import sys
 import time
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 
 from ...runtime.state import AgentState
@@ -682,27 +683,94 @@ def _review_red(ref: str, pr: str, rec: dict, records: dict) -> bool:
     return True
 
 
-def _task_md(card: dict, spec: str) -> str:
-    """The one-time TASK.md handed to the worker head: header pointing at the board plus the spec."""
+def _format_comment_ts(ts) -> str:
+    """A comment's `date_creation` (unix seconds, from Kanboard) as a readable UTC stamp. Any
+    unparsable value (a fake/test board, a future API change) falls back to the raw value rather
+    than blowing up TASK.md rendering."""
+    try:
+        return datetime.fromtimestamp(int(ts), tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    except (TypeError, ValueError):
+        return str(ts) if ts else "?"
+
+
+def _task_md_metadata(card: dict) -> list[str]:
+    """Metadata block: type, model, slug (always resolved — a card may rely on the fallback),
+    blocked_by only when the card actually has a predecessor."""
     lines = [
-        f"# Задача {card['reference']} ({card.get('project', '?')})",
+        "## Метаданные",
+        "",
+        f"- тип: {card.get('task_type') or '?'}",
+        f"- модель: {card.get('model') or '(не задана — дефолт)'}",
+        f"- слаг: {_card_slug(card)}",
+    ]
+    if card.get("blocked_by"):
+        lines.append(f"- blocked_by: {card['blocked_by']}")
+    lines.append("")
+    return lines
+
+
+def _task_md_history(comments: list[dict]) -> list[str]:
+    """«История» section: every comment on the card, chronological (board API already returns
+    them in creation order), each with its date and the comment text — which already carries its
+    own `[marker]` line (report/verdict/dispatcher note), so the marker rides along verbatim
+    rather than being re-derived here. Empty when the card has no comments, so a fresh card's
+    TASK.md carries no section at all."""
+    if not comments:
+        return []
+    lines = ["## История", ""]
+    for c in comments:
+        lines.append(f"### {_format_comment_ts(c.get('ts'))}")
+        lines.append("")
+        lines.append((c.get("text") or "").strip())
+        lines.append("")
+    return lines
+
+
+def _task_md(card: dict, view: dict) -> str:
+    """The one-time TASK.md handed to the worker head: protocol header, card metadata, the spec,
+    and — when the card has prior comments — its full history. A card claimed for the first time
+    has no comments, so it gets exactly the header+metadata+spec that existed before this section
+    was added (plus the new always-on protocol lines below). A card returning from Blocked or a
+    dead head carries its history, so the header also warns that a branch/PR may already exist."""
+    ref = card["reference"]
+    comments = view.get("comments") or []
+    lines = [
+        f"# Задача {ref} ({card.get('project', '?')})",
         "",
         f"Роль на доске — worker. Done для тебя: код закоммичен на ветке "
-        f"`pipeline/{card['reference']}`, локальные тесты зелёные, ветка запушена, PR открыт "
+        f"`pipeline/{ref}`, локальные тесты зелёные, ветка запушена, PR открыт "
         f"через `gh` (base — базовая ветка проекта). В коммитах и PR никаких упоминаний AI "
         f"и Co-Authored-By, стиль — как в git log репо.",
         "",
         f"Отчёт по каждому acceptance criterion (сделано/нет и как проверял, плюс ссылка на PR) — "
         f"через board-CLI: `python3 -m triggered_agents pipeline --role worker report "
-        f"--ref {card['reference']} --kind done|blocked --body-file <файл>`. Несогласие со "
+        f"--ref {ref} --kind done|blocked --body-file <файл>`. Несогласие со "
         f"спекой — `--kind blocked` с обоснованием. Карточку сам не двигаешь. TASK.md в репо "
         f"не коммить.",
         "",
+    ]
+    if comments:
+        lines += [
+            f"У карточки ниже есть история — она уже была в работе раньше (возврат из Blocked, "
+            f"умершая голова или похожий случай). Ветка `pipeline/{ref}` может уже существовать на "
+            f"origin, PR может быть уже открыт: начни с `git fetch`, продолжай существующие "
+            f"ветку/PR, не пересоздавай их.",
+            "",
+        ]
+    lines += [
+        f"Всегда (независимо от истории): force-push запрещён; пушь только в репозиторий своего "
+        f"проекта и только в свою ветку `pipeline/{ref}`.",
+        "",
+    ]
+    lines += _task_md_metadata(card)
+    lines += [
         "## Спека",
         "",
-        spec or "(описание карточки пустое)",
+        view.get("description") or "(описание карточки пустое)",
+        "",
     ]
-    return "\n".join(lines)
+    lines += _task_md_history(comments)
+    return "\n".join(lines).rstrip("\n") + "\n"
 
 
 def _block(ref: str, reason: str, body: str, **log_fields) -> None:
@@ -730,7 +798,7 @@ def _bring_up(card: dict, worker_id: str, records: dict) -> None:
                    workspace=ws)
             return
         view = ops.show_card(ref)
-        worker.write_task(ws, _task_md(card, view.get("description", "")))
+        worker.write_task(ws, _task_md(card, view))
         title = naming.worker_title(ref, card.get("title") or ref)
         handle = worker.launch_worker(ws, card.get("model") or None, worker_id, title)
     except Exception as e:

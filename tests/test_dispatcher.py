@@ -428,6 +428,67 @@ class DispatcherTest(_DispatcherBase):
         self.assertNotIn("from ..board", src)
 
 
+class TaskMdHistoryTest(_DispatcherBase):
+    """TASK.md carries the whole card, not just header+spec (triggered-agents-222): metadata,
+    the always-on force-push/own-branch protocol lines, and — only when the card already has
+    comments — a chronological «История» section plus the git-fetch/don't-recreate warning."""
+
+    def _seed_comment(self, ref, text, ts):
+        tid = next(t["id"] for t in self.board.tasks.values() if t["reference"] == ref)
+        self.board.comments.setdefault(tid, []).append(
+            {"id": len(self.board.comments.get(tid, [])) + 1, "date_creation": ts,
+             "user_id": 0, "comment": text})
+
+    def test_fresh_card_has_no_history_section(self):
+        self._ready_card("A")
+        dispatcher.tick()
+        (_, content), = self.worker.tasks_written
+        self.assertNotIn("История", content)
+        self.assertNotIn("git fetch", content)
+
+    def test_always_on_protocol_lines_present_regardless_of_history(self):
+        ref = self._ready_card("A")
+        dispatcher.tick()
+        (_, content), = self.worker.tasks_written
+        self.assertIn("force-push запрещён", content)
+        self.assertIn(f"pipeline/{ref}", content)
+
+    def test_metadata_section_has_type_model_slug_blocked_by(self):
+        pred = self._ready_card("Pred")
+        pred_tid = next(t["id"] for t in self.board.tasks.values() if t["reference"] == pred)
+        self.board.tasks[pred_tid]["is_active"] = 0  # counts as Done for the blocked_by guard
+        self._ready_card("B", model_name="opus",
+                         meta={model.META_SLUG: "my-slug", model.META_BLOCKED_BY: pred})
+        dispatcher.tick()
+        (_, content), = self.worker.tasks_written
+        self.assertIn("тип: code", content)
+        self.assertIn("модель: opus", content)
+        self.assertIn("слаг: my-slug", content)
+        self.assertIn(f"blocked_by: {pred}", content)
+
+    def test_history_present_triggers_fetch_dont_recreate_warning(self):
+        ref = self._ready_card("A")
+        self._seed_comment(ref, f"[{model.MARKER_REPORT_BLOCKED}]\nold blocker", 100)
+        dispatcher.tick()
+        (_, content), = self.worker.tasks_written
+        self.assertIn("git fetch", content)
+        self.assertIn("не пересоздавай", content)
+        self.assertIn("История", content)
+
+    def test_history_is_chronological_with_markers_and_dates(self):
+        ref = self._ready_card("A")
+        self._seed_comment(ref, f"[{model.MARKER_REPORT_BLOCKED}]\nfirst blocker", 100)
+        self._seed_comment(ref, f"[{model.MARKER_REVIEW_RED}]\nsecond finding", 200)
+        dispatcher.tick()
+        (_, content), = self.worker.tasks_written
+        first_pos = content.index("first blocker")
+        second_pos = content.index("second finding")
+        self.assertLess(first_pos, second_pos)
+        self.assertIn(f"[{model.MARKER_REPORT_BLOCKED}]", content)
+        self.assertIn(f"[{model.MARKER_REVIEW_RED}]", content)
+        self.assertIn("1970-01-01", content)  # rendered date, not the raw unix int
+
+
 class WorkspaceNamingTest(_DispatcherBase):
     """Slug -> workspace name, fallback for cards without one, collision suffix, human-readable
     tab titles, and pinning the title back every tick (Claude Code overwrites it on its own)."""
