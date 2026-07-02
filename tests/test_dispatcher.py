@@ -336,6 +336,15 @@ class DispatcherTest(unittest.TestCase):
         self.assertNotIn("supersecretvalue123", posted)
         self.assertIn("smoke", posted)
 
+    # TASK.md несёт протокол done целиком (первый прогон: воркер сделал работу, но без PR) ----
+    def test_task_md_carries_pr_protocol(self):
+        ref = self._ready_card("A")
+        dispatcher.tick()
+        (_, content), = self.worker.tasks_written
+        self.assertIn(f"pipeline/{ref}", content)
+        self.assertIn("PR открыт", content)
+        self.assertIn("ссылка на PR", content)
+
     # criterion 2: no direct Kanboard API from the dispatcher ----------------
     def test_dispatcher_does_not_touch_kanboard_directly(self):
         src = Path(dispatcher.__file__).read_text()

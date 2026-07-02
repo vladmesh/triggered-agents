@@ -214,10 +214,16 @@ def _task_md(card: dict, spec: str) -> str:
     lines = [
         f"# Задача {card['reference']} ({card.get('project', '?')})",
         "",
-        f"Роль на доске — worker. Отчёт по каждому acceptance criterion — через board-CLI:",
-        f"`python3 -m triggered_agents pipeline --role worker report --ref {card['reference']} "
-        f"--kind done|blocked --body-file <файл>`. Несогласие со спекой — `--kind blocked` "
-        f"с обоснованием. Карточку сам не двигаешь. TASK.md в репо не коммить.",
+        f"Роль на доске — worker. Done для тебя: код закоммичен на ветке "
+        f"`pipeline/{card['reference']}`, локальные тесты зелёные, ветка запушена, PR открыт "
+        f"через `gh` (base — базовая ветка проекта). В коммитах и PR никаких упоминаний AI "
+        f"и Co-Authored-By, стиль — как в git log репо.",
+        "",
+        f"Отчёт по каждому acceptance criterion (сделано/нет и как проверял, плюс ссылка на PR) — "
+        f"через board-CLI: `python3 -m triggered_agents pipeline --role worker report "
+        f"--ref {card['reference']} --kind done|blocked --body-file <файл>`. Несогласие со "
+        f"спекой — `--kind blocked` с обоснованием. Карточку сам не двигаешь. TASK.md в репо "
+        f"не коммить.",
         "",
         "## Спека",
         "",
