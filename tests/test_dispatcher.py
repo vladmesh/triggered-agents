@@ -812,6 +812,18 @@ class ValidateReviewTest(_DispatcherBase):
         self.assertEqual(len(self._rev_ws_torndown()), 1)
         self.assertTrue(any(r["event"] == "review" and r.get("result") == "green" for r in self._runs()))
 
+    def test_green_verdict_logs_terminal_green_exactly_once(self):
+        # Regression (review #1 on triggered-agents-221): a no-stand card idling in Validate on a
+        # settled green verdict must log the terminal "review green" event once, not on every tick
+        # it sits there waiting for a human merge.
+        ref = self._spawned()
+        ops.verdict(ref, "green", "ок")
+        for _ in range(3):
+            dispatcher.tick()
+        self.assertEqual(self._column(ref), "Validate")
+        greens = [r for r in self._runs() if r["event"] == "review" and r.get("result") == "green"]
+        self.assertEqual(len(greens), 1)
+
     def test_green_verdict_then_merge_to_done(self):
         ref = self._spawned()
         ops.verdict(ref, "green", "ок")
