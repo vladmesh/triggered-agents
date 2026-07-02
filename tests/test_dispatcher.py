@@ -494,49 +494,62 @@ class WorkspaceNamingTest(_DispatcherBase):
     tab titles, and pinning the title back every tick (Claude Code overwrites it on its own)."""
 
     def test_claim_uses_card_slug_in_workspace_name(self):
+        from triggered_agents.agents.pipeline import naming
         ref = self._ready_card("A", meta={model.META_SLUG: "teardown-slug"})
+        cid = naming.card_id(ref)
         dispatcher.tick()
-        self.assertEqual(dispatcher._load_cards()[ref]["workspace"], f"/ws/{ref}-teardown-slug")
-        self.assertEqual(dispatcher._load_cards()[ref]["worker"], f"{ref}-teardown-slug")
+        self.assertEqual(dispatcher._load_cards()[ref]["workspace"], f"/ws/{cid}-teardown-slug")
+        self.assertEqual(dispatcher._load_cards()[ref]["worker"], f"{cid}-teardown-slug")
 
     def test_claim_without_slug_falls_back_to_title_transliteration(self):
         from triggered_agents.agents.pipeline import naming
         ref = self._ready_card("Тестовый Заголовок")
+        cid = naming.card_id(ref)
         dispatcher.tick()
         expect = naming.fallback_slug("Тестовый Заголовок")
-        self.assertEqual(dispatcher._load_cards()[ref]["worker"], f"{ref}-{expect}")
+        self.assertEqual(dispatcher._load_cards()[ref]["worker"], f"{cid}-{expect}")
 
     def test_claim_name_collision_gets_dash_2_suffix(self):
+        from triggered_agents.agents.pipeline import naming
         ref = self._ready_card("A", meta={model.META_SLUG: "dup-slug"})
-        self.worker.existing_workspaces.add(("personal_site", f"{ref}-dup-slug"))
+        cid = naming.card_id(ref)
+        self.worker.existing_workspaces.add(("personal_site", f"{cid}-dup-slug"))
         dispatcher.tick()
-        self.assertEqual(dispatcher._load_cards()[ref]["worker"], f"{ref}-dup-slug-2")
+        self.assertEqual(dispatcher._load_cards()[ref]["worker"], f"{cid}-dup-slug-2")
 
     def test_claim_name_collision_keeps_incrementing(self):
+        from triggered_agents.agents.pipeline import naming
         ref = self._ready_card("A", meta={model.META_SLUG: "dup-slug"})
+        cid = naming.card_id(ref)
         for suffix in ("", "-2", "-3"):
-            self.worker.existing_workspaces.add(("personal_site", f"{ref}-dup-slug{suffix}"))
+            self.worker.existing_workspaces.add(("personal_site", f"{cid}-dup-slug{suffix}"))
         dispatcher.tick()
-        self.assertEqual(dispatcher._load_cards()[ref]["worker"], f"{ref}-dup-slug-4")
+        self.assertEqual(dispatcher._load_cards()[ref]["worker"], f"{cid}-dup-slug-4")
 
     def test_launch_title_is_human_readable_worker_prefix(self):
+        from triggered_agents.agents.pipeline import naming
         ref = self._ready_card("Fix the thing", meta={model.META_SLUG: "fix-thing"})
+        cid = naming.card_id(ref)
         dispatcher.tick()
-        self.assertEqual(self.worker.launched[0]["title"], f"worker {ref}: Fix the thing")
+        self.assertEqual(self.worker.launched[0]["title"], f"worker {cid}: Fix the thing")
 
     def test_worker_title_pinned_every_tick_while_in_progress(self):
+        from triggered_agents.agents.pipeline import naming
         ref = self._claim_one("A", meta={model.META_SLUG: "pin-me"})
-        handle = f"handle-{ref}-pin-me"
+        cid = naming.card_id(ref)
+        handle = f"handle-{cid}-pin-me"
         dispatcher.tick()   # advance tick, no report yet -> stays In progress
-        self.assertIn((handle, f"worker {ref}: A"), self.worker.renamed)
+        self.assertIn((handle, f"worker {cid}: A"), self.worker.renamed)
 
     def test_worker_title_pinned_while_in_validate(self):
+        from triggered_agents.agents.pipeline import naming
         ref = self._claim_one("A", meta={model.META_SLUG: "pin-me"})
+        cid = naming.card_id(ref)
         ops.report(ref, "done", "shipped")
         dispatcher.tick()
         self.assertEqual(self._column(ref), "Validate")
-        handle = f"handle-{ref}-pin-me"
-        title = f"worker {ref}: A"
+        handle = f"handle-{cid}-pin-me"
+        title = f"worker {cid}: A"
         self.assertIn((handle, title), self.worker.renamed)
         before = len([c for c in self.worker.renamed if c == (handle, title)])
         dispatcher.tick()   # gh unavailable, card stays in Validate -> must pin again
@@ -546,6 +559,7 @@ class WorkspaceNamingTest(_DispatcherBase):
     def test_reviewer_title_and_pinning(self):
         from triggered_agents.agents.pipeline import naming
         ref = self._claim_one("A", meta={model.META_SLUG: "rev-slug"})
+        cid = naming.card_id(ref)
         ops.report(ref, "done", "готово\nPR: https://github.com/vladmesh/personal_site/pull/9")
         self.worker.pr_status = None
         dispatcher.tick()
@@ -553,10 +567,10 @@ class WorkspaceNamingTest(_DispatcherBase):
                                  "failed_job": None, "failed_log": None}
         dispatcher.tick()   # CI green -> spawns the reviewer
         self.assertEqual(len(self.worker.reviewer_spawns), 1)
-        expect_title = naming.reviewer_title(ref, "A")
+        expect_title = naming.reviewer_title(cid, "A")
         _, worker_id, _, spawned_title = self.worker.reviewer_spawns[0]
         self.assertEqual(spawned_title, expect_title)
-        self.assertTrue(worker_id.startswith(f"review-{ref}-rev-slug"))
+        self.assertTrue(worker_id.startswith(f"review-{cid}-rev-slug"))
         handle = f"rev-handle-{worker_id}"
         dispatcher.tick()   # no verdict yet -> watchdog path must pin the title again
         self.assertIn((handle, expect_title), self.worker.renamed)

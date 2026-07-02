@@ -57,20 +57,31 @@ class FallbackSlugTest(unittest.TestCase):
             self.assertRegex(naming.fallback_slug(title), naming.SLUG_RE)
 
 
+class CardIdTest(unittest.TestCase):
+    def test_extracts_numeric_tail_of_reference(self):
+        self.assertEqual(naming.card_id("triggered-agents-218"), "218")
+
+    def test_project_name_with_dashes(self):
+        self.assertEqual(naming.card_id("personal-site-42"), "42")
+
+    def test_single_segment_reference_returns_itself(self):
+        self.assertEqual(naming.card_id("218"), "218")
+
+
 class WorkspaceNameBuildTest(unittest.TestCase):
-    def test_worker_base_is_reference_dash_slug(self):
-        self.assertEqual(naming.worker_workspace_base("triggered-agents-218", "rename-slug"),
-                         "triggered-agents-218-rename-slug")
+    def test_worker_base_is_id_dash_slug(self):
+        self.assertEqual(naming.worker_workspace_base("218", "rename-slug"),
+                         "218-rename-slug")
 
     def test_reviewer_base_is_prefixed(self):
-        self.assertEqual(naming.reviewer_workspace_base("triggered-agents-218", "rename-slug"),
-                         "review-triggered-agents-218-rename-slug")
+        self.assertEqual(naming.reviewer_workspace_base("218", "rename-slug"),
+                         "review-218-rename-slug")
 
     def test_titles_are_human_readable(self):
-        self.assertEqual(naming.worker_title("triggered-agents-218", "Слаги воркспейсов"),
-                         "worker triggered-agents-218: Слаги воркспейсов")
-        self.assertEqual(naming.reviewer_title("triggered-agents-218", "Слаги воркспейсов"),
-                         "review triggered-agents-218: Слаги воркспейсов")
+        self.assertEqual(naming.worker_title("218", "Слаги воркспейсов"),
+                         "worker 218: Слаги воркспейсов")
+        self.assertEqual(naming.reviewer_title("218", "Слаги воркспейсов"),
+                         "review 218: Слаги воркспейсов")
 
 
 class DedupeTest(unittest.TestCase):

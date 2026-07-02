@@ -1,9 +1,14 @@
 """Slug/workspace-name helpers for the task pipeline — pure functions, no I/O, no Orca.
 
 A card's slug (validated at create time against SLUG_RE) names its worker/reviewer workspace so
-GUI tabs and worktree dirs read `<reference>-<slug>` instead of a bare timestamp. A card created
-before the slug field existed, or by hand, carries none — fallback_slug transliterates its title
-into one instead, so the pipeline never refuses to claim a card for lack of a slug.
+GUI tabs and worktree dirs read `<id>-<slug>` instead of a bare timestamp. A card created before
+the slug field existed, or by hand, carries none — fallback_slug transliterates its title into one
+instead, so the pipeline never refuses to claim a card for lack of a slug.
+
+Workspaces already live under the project's own directory in Orca (`~/orca/workspaces/<project>/`),
+so repeating the project name in the workspace itself would just echo something the path already
+says. `card_id` strips the reference (`<project>-<id>`, the board-CLI identity, left untouched)
+down to the numeric tail the workspace/title functions below key off.
 
 Collision (a re-claim while the previous attempt's workspace is still alive, e.g. left on
 Blocked) is resolved by `dedupe`, which takes an `exists` predicate rather than touching disk
@@ -34,12 +39,19 @@ def fallback_slug(title: str) -> str:
     return slug or "task"
 
 
-def worker_workspace_base(reference: str, slug: str) -> str:
-    return f"{reference}-{slug}"
+def card_id(reference: str) -> str:
+    """The numeric tail of a `<project>-<id>` reference, e.g. `"218"` from
+    `"triggered-agents-218"`. The reference itself is left untouched everywhere else (board-CLI,
+    comments, claim metadata) — this is only for naming workspaces/tabs."""
+    return reference.rsplit("-", 1)[-1]
 
 
-def reviewer_workspace_base(reference: str, slug: str) -> str:
-    return f"review-{reference}-{slug}"
+def worker_workspace_base(card_id: str, slug: str) -> str:
+    return f"{card_id}-{slug}"
+
+
+def reviewer_workspace_base(card_id: str, slug: str) -> str:
+    return f"review-{card_id}-{slug}"
 
 
 def dedupe(base: str, exists) -> str:
@@ -53,9 +65,9 @@ def dedupe(base: str, exists) -> str:
     return f"{base}-{i}"
 
 
-def worker_title(reference: str, card_title: str) -> str:
-    return f"worker {reference}: {card_title}"
+def worker_title(card_id: str, card_title: str) -> str:
+    return f"worker {card_id}: {card_title}"
 
 
-def reviewer_title(reference: str, card_title: str) -> str:
-    return f"review {reference}: {card_title}"
+def reviewer_title(card_id: str, card_title: str) -> str:
+    return f"review {card_id}: {card_title}"

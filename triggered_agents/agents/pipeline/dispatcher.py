@@ -145,9 +145,9 @@ def _card_slug(card: dict) -> str:
 
 
 def _worker_id(card: dict) -> str:
-    """Workspace/worker id for a claim: `<reference>-<slug>`, suffixed -2/-3/... if that
-    workspace dir is still alive from a previous attempt (e.g. left on Blocked)."""
-    base = naming.worker_workspace_base(card["reference"], _card_slug(card))
+    """Workspace/worker id for a claim: `<id>-<slug>`, suffixed -2/-3/... if that workspace dir
+    is still alive from a previous attempt (e.g. left on Blocked)."""
+    base = naming.worker_workspace_base(naming.card_id(card["reference"]), _card_slug(card))
     project = card.get("project") or ""
     return naming.dedupe(base, lambda n: worker.workspace_exists(project, n))
 
@@ -479,9 +479,9 @@ def _validate_error(ref: str, exc: Exception) -> None:
 
 
 def _review_id(card: dict) -> str:
-    """Workspace id for a reviewer head: `review-<reference>-<slug>`, kept distinct from the
-    worker's own workspace name and deduped the same way."""
-    base = naming.reviewer_workspace_base(card["reference"], _card_slug(card))
+    """Workspace id for a reviewer head: `review-<id>-<slug>`, kept distinct from the worker's
+    own workspace name and deduped the same way."""
+    base = naming.reviewer_workspace_base(naming.card_id(card["reference"]), _card_slug(card))
     project = card.get("project") or ""
     return naming.dedupe(base, lambda n: worker.workspace_exists(project, n))
 
@@ -541,7 +541,7 @@ def _spawn_reviewer(ref: str, pr: str, card: dict, rec: dict, records: dict) -> 
     save can't lose the baseline and spawn a second reviewer on the next tick."""
     project = card.get("project") or ""
     spec = ops.show_card(ref).get("description", "")
-    review_title = naming.reviewer_title(ref, card.get("title") or ref)
+    review_title = naming.reviewer_title(naming.card_id(ref), card.get("title") or ref)
     try:
         base = worker.read_base_branch(project)
         review_md = reviewer.build_task(card, ref, pr, spec, base)
@@ -799,7 +799,7 @@ def _bring_up(card: dict, worker_id: str, records: dict) -> None:
             return
         view = ops.show_card(ref)
         worker.write_task(ws, _task_md(card, view))
-        title = naming.worker_title(ref, card.get("title") or ref)
+        title = naming.worker_title(naming.card_id(ref), card.get("title") or ref)
         handle = worker.launch_worker(ws, card.get("model") or None, worker_id, title)
     except Exception as e:
         stage = "workspace-create" if ws is None else "launch"
