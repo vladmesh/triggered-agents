@@ -168,7 +168,8 @@ def ensure_automation(spec: dict, workspace: Path) -> str | None:
     return aid
 
 
-def _service_unit(agent: str, calendar: str, workspace: Path, precheck: str) -> str:
+def _service_unit(agent: str, calendar: str, workspace: Path, precheck: str,
+                  env_file: str = "") -> str:
     # Dispatch is our singleton terminal driver, NOT `orca automations run`: the latter dispatches
     # with trigger=manual and spawns a new head every tick (Orca's reuse only kicks in for
     # scheduled runs, which don't tick headless), so heads pile up. The driver converges the
@@ -184,6 +185,7 @@ def _service_unit(agent: str, calendar: str, workspace: Path, precheck: str) -> 
                 f'else echo "[ta-{agent}] precheck: no change, run skipped"; fi')
     else:
         gate = f"exec {dispatch}"
+    env_line = f"EnvironmentFile={env_file}\n" if env_file else ""
     return f"""[Unit]
 Description=triggered-agents: {agent} {calendar} tick (precheck gate + singleton terminal dispatch)
 Documentation=file:///home/dev/control-panel/docs/ARCHITECTURE.md
@@ -196,7 +198,7 @@ User=dev
 Group=dev
 WorkingDirectory={workspace}
 Environment=HOME=/home/dev
-ExecStart=/bin/bash -lc '{gate}'
+{env_line}ExecStart=/bin/bash -lc '{gate}'
 """
 
 
