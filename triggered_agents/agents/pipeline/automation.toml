@@ -15,3 +15,6 @@ precheck = "python3 -m triggered_agents pipeline precheck"
 # tick is cheap after precheck, so a tight cadence (every 3 min) keeps latency low.
 calendar = "*:0/3"
 randomized_delay_sec = 20
+# Kanboard-креды для precheck и тика: агенты с LLM-головой сорсят .env сами, детерминированному
+# диспетчеру их отдаёт юнит.
+env_file = "/home/dev/control-panel/.env"
