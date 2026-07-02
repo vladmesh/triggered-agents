@@ -242,6 +242,100 @@ class DispatcherTest(unittest.TestCase):
         dispatcher.tick()
         self.assertEqual(self._column(ref), model.IN_PROGRESS)
 
+    # bring-up failure after claim (review #1) --------------------------------
+    def test_launch_worker_fail_blocks_not_hangs(self):
+        ref = self._ready_card("A")
+        with mock.patch("triggered_agents.agents.pipeline.worker.launch_worker",
+                        side_effect=RuntimeError("orca terminal create failed")):
+            dispatcher.tick()  # must not raise
+        self.assertEqual(self._column(ref), "Blocked")
+        self.assertNotIn(ref, dispatcher._load_cards())
+        posted = " ".join(c["comment"] for cl in self.board.comments.values() for c in cl)
+        self.assertIn("bring-up", posted)
+
+    def test_show_card_fail_after_claim_blocks(self):
+        ref = self._ready_card("A")
+        with mock.patch("triggered_agents.agents.pipeline.ops.show_card",
+                        side_effect=RuntimeError("board hiccup")):
+            dispatcher.tick()
+        self.assertEqual(self._column(ref), "Blocked")
+
+    def test_reconcile_adopts_claimed_card_without_record(self):
+        # Simulate a kill between claim and _save_cards: claim on the board, no record on disk.
+        ref = self._ready_card("A")
+        ops.claim_card(ref, "w-crash")
+        self.assertEqual(dispatcher._load_cards(), {})
+        dispatcher.tick()
+        records = dispatcher._load_cards()
+        self.assertIn(ref, records)
+        self.assertEqual(records[ref]["worker"], "w-crash")
+        self.assertTrue(any(r["event"] == "reconcile" for r in self._runs()))
+        # From here the normal machinery applies: a report moves it to Validate.
+        ops.report(ref, "done", "shipped after crash")
+        dispatcher.tick()
+        self.assertEqual(self._column(ref), "Validate")
+
+    def test_reconciled_card_hits_watchdog_on_silence(self):
+        ref = self._ready_card("A")
+        ops.claim_card(ref, "w-crash")
+        dispatcher.tick()  # adopt
+        dispatcher.WATCHDOG_SECONDS = -1
+        dispatcher.tick()
+        self.assertEqual(self._column(ref), "Blocked")
+        self.assertEqual(self.worker.torn_down, [])
+
+    def test_bringup_saves_records_before_tick_ends(self):
+        # _save_cards runs inside _bring_up: a crash right after the head is up must still
+        # find the record on disk. Simulate by crashing the tick right after _claim_next.
+        ref = self._ready_card("A")
+        orig = dispatcher._claim_next
+
+        def claim_then_die(records):
+            orig(records)
+            raise KeyboardInterrupt("kill right after bring-up")
+
+        with mock.patch.object(dispatcher, "_claim_next", claim_then_die):
+            with self.assertRaises(KeyboardInterrupt):
+                dispatcher.tick()
+        self.assertIn(ref, dispatcher._load_cards())
+
+    # stale tick lock (review #2) ---------------------------------------------
+    def test_stale_lock_is_reclaimed(self):
+        import subprocess
+        p = subprocess.Popen(["true"])
+        p.wait()
+        lockfile = dispatcher.STATE.dir / "dispatch.lock"
+        lockfile.write_text(str(p.pid))
+        ref = self._ready_card("A")
+        dispatcher.tick()  # must not SystemExit
+        self.assertEqual(self._column(ref), model.IN_PROGRESS)
+        self.assertFalse(lockfile.exists())
+        self.assertTrue(any(r["event"] == "lock-reclaimed" for r in self._runs()))
+
+    def test_garbled_lock_is_reclaimed(self):
+        lockfile = dispatcher.STATE.dir / "dispatch.lock"
+        lockfile.write_text("not-a-pid")
+        dispatcher.tick()
+        self.assertFalse(lockfile.exists())
+
+    def test_live_lock_still_refuses(self):
+        lockfile = dispatcher.STATE.dir / "dispatch.lock"
+        lockfile.write_text(str(os.getpid()))
+        with self.assertRaises(SystemExit):
+            dispatcher.tick()
+        lockfile.unlink()
+
+    # secret scrubbing before board comments (review #3) ----------------------
+    def test_smoke_fail_comment_is_scrubbed(self):
+        ref = self._ready_card("A")
+        self.worker.provision_ok = False
+        self.worker.provision_log = ("[provision] env: KANBOARD_API_TOKEN=supersecretvalue123\n"
+                                     "[provision] FAIL: smoke command failed (exit 1)")
+        dispatcher.tick()
+        posted = " ".join(c["comment"] for cl in self.board.comments.values() for c in cl)
+        self.assertNotIn("supersecretvalue123", posted)
+        self.assertIn("smoke", posted)
+
     # criterion 2: no direct Kanboard API from the dispatcher ----------------
     def test_dispatcher_does_not_touch_kanboard_directly(self):
         src = Path(dispatcher.__file__).read_text()

@@ -6,6 +6,8 @@ goes through ops.py (the board-CLI layer) — never Kanboard directly — so the
 atomic claim hold. Every host touch (worktree, head, activity) goes through worker.py.
 
 Per-tick order:
+  0. reconcile — adopt In-progress cards with a claim but no local record (a tick killed
+                between claim and save), so no claimed card is ever invisible to the watchdog.
   1. advance  — for each In-progress card we track: [report:done] -> Validate,
                 [report:blocked] -> Blocked, else watchdog (silent past the threshold -> Blocked,
                 workspace left alive for a human/provision-agent).
@@ -36,17 +38,44 @@ WORKER_CAP = int(os.environ.get("TA_WORKER_CAP", "3"))
 _LOG_TAIL_LINES = 40
 
 
+def _lock_stale(lockfile: Path) -> bool:
+    """True when the lock's pid is no longer alive (SIGKILL/reboot mid-tick: finally never ran,
+    the file stayed). An unreadable/garbled lock also counts as stale — it proves nothing."""
+    try:
+        pid = int(lockfile.read_text(encoding="utf-8", errors="replace").strip())
+    except (OSError, ValueError):
+        return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        pass  # alive under another uid — a live holder
+    return False
+
+
 @contextmanager
 def _tick_lock():
     """One dispatcher tick at a time. Separate file from ops' claim lock (dir/lock), so a tick
-    can call ops.claim_card — which takes that lock — without deadlocking on itself."""
+    can call ops.claim_card — which takes that lock — without deadlocking on itself. A lock left
+    by a killed tick is reclaimed by pid liveness, not honored forever."""
     STATE.ensure_dir()
     lockfile = STATE.dir / "dispatch.lock"
-    try:
-        fd = os.open(lockfile, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-    except FileExistsError:
-        holder = lockfile.read_text(encoding="utf-8", errors="replace").strip() if lockfile.is_file() else "?"
-        raise SystemExit(f"pipeline: another dispatcher tick holds the lock ({lockfile}, pid {holder})")
+    fd = None
+    for attempt in (1, 2):  # second attempt only after unlinking a stale lock
+        try:
+            fd = os.open(lockfile, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            break
+        except FileExistsError:
+            if attempt == 2 or not _lock_stale(lockfile):
+                holder = lockfile.read_text(encoding="utf-8", errors="replace").strip() if lockfile.is_file() else "?"
+                raise SystemExit(f"pipeline: another dispatcher tick holds the lock ({lockfile}, pid {holder})")
+            STATE.log_run("lock-reclaimed", stale_holder=lockfile.read_text(encoding="utf-8", errors="replace").strip()
+                          if lockfile.is_file() else "?")
+            try:
+                lockfile.unlink()
+            except FileNotFoundError:
+                pass
     try:
         os.write(fd, str(os.getpid()).encode())
         os.close(fd)
@@ -113,6 +142,31 @@ def _report_verdict(reference: str, baseline: int) -> str | None:
     return verdict
 
 
+def _reconcile(records: dict) -> bool:
+    """Adopt In-progress cards that carry a claim but have no record — the tick died between
+    claim and _save_cards, or the card re-entered In progress by a rework move. Without this the
+    card would hang forever: invisible to _advance and the watchdog, while precheck keeps
+    reporting work. Adopted with an unknown workspace and a fresh comment baseline, so a report
+    posted from here on advances it normally and pure silence ends in the watchdog -> Blocked."""
+    changed = False
+    for c in ops.list_cards(column=model.IN_PROGRESS):
+        ref = c["reference"]
+        if not c["claim"] or ref in records:
+            continue
+        now = time.time()
+        records[ref] = {
+            "workspace": "",   # the claim survived the crash, the bookkeeping did not
+            "worker": c["claim"],
+            "handle": "",
+            "claimed_at": now,
+            "last_activity": now,
+            "comment_baseline": len(ops.show_card(ref)["comments"]),
+        }
+        STATE.log_run("reconcile", reference=ref, worker=c["claim"])
+        changed = True
+    return changed
+
+
 def _advance(records: dict) -> bool:
     """Move each tracked In-progress card by its worker's report or the watchdog. Returns whether
     `records` changed."""
@@ -137,15 +191,17 @@ def _advance(records: dict) -> bool:
             records.pop(ref)
             changed = True
         else:
-            last = worker.activity(rec["workspace"])
+            last = worker.activity(rec["workspace"]) if rec.get("workspace") else None
             if last:
                 rec["last_activity"] = last
                 changed = True
             silent = time.time() - rec.get("last_activity", rec.get("claimed_at", time.time()))
             if silent > WATCHDOG_SECONDS:
+                ws_note = (f"воркспейс {rec['workspace']} оставлен для разбора"
+                           if rec.get("workspace") else "воркспейс неизвестен (подобрана после сбоя)")
                 ops.add_comment("dispatcher", ref,
                                 f"watchdog: воркер молчит {int(silent)}s (порог {WATCHDOG_SECONDS}s). "
-                                f"Карточка в Blocked, воркспейс {rec['workspace']} оставлен для разбора.")
+                                f"Карточка в Blocked, {ws_note}.")
                 ops.move_card("dispatcher", ref, "Blocked")
                 STATE.log_run("advance", reference=ref, to="Blocked", reason="watchdog", silent=int(silent))
                 records.pop(ref)
@@ -170,31 +226,38 @@ def _task_md(card: dict, spec: str) -> str:
     return "\n".join(lines)
 
 
+def _block(ref: str, reason: str, body: str, **log_fields) -> None:
+    """Comment (scrubbed: provision logs / orca errors may echo env) + move to Blocked."""
+    ops.add_comment("dispatcher", ref, worker.scrub_secrets(body))
+    ops.move_card("dispatcher", ref, "Blocked")
+    STATE.log_run("bringup", reference=ref, to="Blocked", reason=reason, **log_fields)
+
+
 def _bring_up(card: dict, worker_id: str, records: dict) -> None:
-    """After a successful claim: worktree, setup+smoke, then the worker head — or Blocked on a
-    smoke/setup failure, with the log and without a head."""
+    """After a successful claim: worktree, setup+smoke, then the worker head — or Blocked on any
+    failure. The claim already persists on the board, so nothing here may escape as a traceback:
+    an unhandled error would leave the card In progress but invisible to _advance/watchdog.
+    Records are saved as soon as the head is up, shrinking the crash window claim->save (the
+    remainder is covered by _reconcile)."""
     ref = card["reference"]
     project = card.get("project") or ""
+    ws = None
     try:
         base = worker.read_base_branch(project)
         ws = worker.create_workspace(project, worker_id, base)
+        ok, log = worker.provision(ws)
+        if not ok:
+            _block(ref, "smoke", "setup/smoke упал, воркер не стартует:\n```\n" + _tail(log) + "\n```",
+                   workspace=ws)
+            return
+        view = ops.show_card(ref)
+        worker.write_task(ws, _task_md(card, view.get("description", "")))
+        handle = worker.launch_worker(ws, card.get("model") or None, worker_id)
     except Exception as e:
-        ops.add_comment("dispatcher", ref, f"provision: не удалось поднять воркспейс: {e}")
-        ops.move_card("dispatcher", ref, "Blocked")
-        STATE.log_run("bringup", reference=ref, to="Blocked", reason="workspace-create", error=str(e))
+        stage = "workspace-create" if ws is None else "launch"
+        _block(ref, stage, f"bring-up упал ({stage}): {e}" + (f"\nВоркспейс {ws} оставлен." if ws else ""),
+               error=worker.scrub_secrets(str(e)))
         return
-
-    ok, log = worker.provision(ws)
-    if not ok:
-        ops.add_comment("dispatcher", ref,
-                        "setup/smoke упал, воркер не стартует:\n```\n" + _tail(log) + "\n```")
-        ops.move_card("dispatcher", ref, "Blocked")
-        STATE.log_run("bringup", reference=ref, to="Blocked", reason="smoke", workspace=ws)
-        return
-
-    view = ops.show_card(ref)
-    worker.write_task(ws, _task_md(card, view.get("description", "")))
-    handle = worker.launch_worker(ws, card.get("model") or None, worker_id)
     now = time.time()
     records[ref] = {
         "workspace": ws,
@@ -204,6 +267,7 @@ def _bring_up(card: dict, worker_id: str, records: dict) -> None:
         "last_activity": now,
         "comment_baseline": len(view["comments"]),
     }
+    _save_cards(records)
     STATE.log_run("bringup", reference=ref, to="In progress", workspace=ws,
                   model=card.get("model") or "default")
 
@@ -232,7 +296,8 @@ def _claim_next(records: dict) -> None:
 def tick() -> int:
     with _tick_lock():
         records = _load_cards()
-        changed = _advance(records)
+        changed = _reconcile(records)
+        changed = _advance(records) or changed
         before = json.dumps(records, sort_keys=True)
         _claim_next(records)
         if changed or json.dumps(records, sort_keys=True) != before:

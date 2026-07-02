@@ -179,7 +179,8 @@ def claim_card(reference: str, worker: str, cap: int = 3) -> dict:
     Guards (each its own message): the card is Ready; it is unclaimed; its blocked_by
     predecessor, if any, is Done; if it is a code card, no other active code card for the
     same project sits in In progress or Validate (a Validate card still owns its worker
-    session for rework, so it counts); and fewer than `cap` cards are In progress.
+    session for rework, so it counts); and fewer than `cap` cards sit in In progress or
+    Validate (both hold a live worker session).
 
     The whole thing runs under AgentState("pipeline").lock(): Kanboard offers no
     compare-and-swap, so with a single dispatcher the host-local lock is what closes the
@@ -221,9 +222,11 @@ def claim_card(reference: str, worker: str, cap: int = 3) -> dict:
                         f"({project}) is already in {col!r}"
                     )
 
-        wip = sum(1 for t in actives if _column_title(pid, int(t["column_id"])) == model.IN_PROGRESS)
+        # Validate counts toward the cap too: a card there still owns its worker session.
+        wip = sum(1 for t in actives
+                  if _column_title(pid, int(t["column_id"])) in (model.IN_PROGRESS, "Validate"))
         if wip >= cap:
-            raise model.GuardError(f"cap reached: {wip} card(s) already In progress (cap {cap})")
+            raise model.GuardError(f"cap reached: {wip} card(s) in In progress/Validate (cap {cap})")
 
         call("saveTaskMetadata", task_id=tid, values={model.META_CLAIM: worker})
         _move_position(pid, tid, _column_id(pid, model.IN_PROGRESS), int(task["swimlane_id"]))

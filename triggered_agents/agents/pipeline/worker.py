@@ -13,10 +13,13 @@ and can move the card to Blocked before a head is spawned. Orca still owns workt
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import tomllib
 from pathlib import Path
+
+from ...runtime import redact
 
 ORCA = os.environ.get("ORCA_BIN") or shutil.which("orca") or str(Path.home() / ".local/bin/orca")
 PROJECTS_DIR = Path(os.environ.get("TA_PROJECTS_DIR", str(Path.home() / "projects")))
@@ -28,6 +31,23 @@ PROVISION_TIMEOUT_S = int(os.environ.get("TA_PROVISION_TIMEOUT_S", "900"))
 
 class WorkspaceError(RuntimeError):
     """A host-side workspace step failed (orca, git, provision transport)."""
+
+
+# Board comments are the card's public journal, so provision logs / error texts get scrubbed
+# before posting. runtime.redact catches known .env values and token shapes; on top of that:
+# KEY=value assignments whose name smells like a secret, and long base64/hex-ish blobs
+# (no `/`, so filesystem paths survive).
+_ASSIGN_RE = re.compile(r"(?i)\b([A-Z0-9_]*(?:TOKEN|KEY|SECRET|PASSWORD|PASSWD)[A-Z0-9_]*)\s*=\s*\S+")
+_BLOB_RE = re.compile(r"\b[A-Za-z0-9+=_-]{40,}\b")
+
+
+def scrub_secrets(text: str) -> str:
+    """Mask secret-looking material in `text` before it reaches a board comment."""
+    if not text:
+        return text
+    text = redact.redact(text)
+    text = _ASSIGN_RE.sub(rf"\1={redact.REDACTED}", text)
+    return _BLOB_RE.sub(f"{redact.REDACTED}:blob", text)
 
 
 def _orca_json(args: list[str]) -> dict:
