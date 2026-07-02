@@ -151,6 +151,12 @@ class DispatcherTest(_DispatcherBase):
                                   model.META_CLAIM: "w0"})
         self.assertEqual(dispatcher.precheck(), 0)
 
+    # первый боевой Validate: карточка ждала поллинга, а precheck скипал тик
+    def test_precheck_dispatch_when_validating(self):
+        self.board.add_task("A", "Validate", swimlane="personal_site",
+                            meta={model.META_TASK_TYPE: "code", model.META_PROJECT: "personal_site"})
+        self.assertEqual(dispatcher.precheck(), 0)
+
     # claim + bring-up ------------------------------------------------------
     def test_tick_claims_and_launches(self):
         ref = self._ready_card("A", model_name="opus")

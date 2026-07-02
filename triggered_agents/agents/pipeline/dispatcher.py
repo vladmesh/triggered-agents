@@ -125,16 +125,19 @@ def _worker_id(reference: str) -> str:
 
 
 def precheck() -> int:
-    """Exit 0 when there is work (a Ready card to claim or an In-progress card to advance),
-    non-zero otherwise. Cheap: one board list, before any worktree/head is touched."""
+    """Exit 0 when there is work: a Ready card to claim, an In-progress card to advance, or a
+    Validate card whose PR needs polling. Cheap: one board list, before any worktree/head is
+    touched."""
     cards = ops.list_cards()
     ready = [c for c in cards if c["column"] == "Ready"]
     inflight = [c for c in cards if c["column"] == model.IN_PROGRESS and c["claim"]]
-    if ready or inflight:
-        STATE.log_run("precheck", result="dispatch", ready=len(ready), inflight=len(inflight))
+    validating = [c for c in cards if c["column"] == "Validate"]
+    if ready or inflight or validating:
+        STATE.log_run("precheck", result="dispatch", ready=len(ready), inflight=len(inflight),
+                      validating=len(validating))
         return 0
     STATE.log_run("precheck", result="skip")
-    print("pipeline: nothing Ready and nothing in flight — SKIP", file=sys.stderr)
+    print("pipeline: nothing Ready, in flight or validating — SKIP", file=sys.stderr)
     return 1
 
 
