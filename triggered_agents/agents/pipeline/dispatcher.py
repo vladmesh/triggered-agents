@@ -18,10 +18,13 @@ Per-tick order:
                 projects with a [stand] manifest section (deploy the PR branch to the stand + e2e,
                 green only after a green run, one auto-retry then Blocked). Once the mechanical
                 layers are green -> layer 3: spawn an independent reviewer head (not the worker,
-                no code access), read its verdict (green -> waits for merge; red -> back to
-                In progress with a nudge, capped returns then Blocked). PR merged (by a human) ->
-                worker workspace torn down (terminals stopped, worktree removed), Done, record
-                dropped. gh unavailable or no PR link -> card untouched, a warn line.
+                no code access), read its verdict (red -> back to In progress with a nudge, capped
+                returns then Blocked; green on a project without a [stand] section -> waits for a
+                human merge; green on a stand project -> the dispatcher squash-merges the PR itself
+                through gh, once — a merge failure is a final Blocked with the reason, never a
+                retry loop). PR merged (by a human or the dispatcher's own automerge) -> worker
+                workspace torn down (terminals stopped, worktree removed), Done, record dropped.
+                gh unavailable or no PR link -> card untouched, a warn line.
   3. claim    — top Ready card by position; claim through ops (its guards run), create the Orca
                 worktree off base_branch, run setup+smoke; smoke fail -> Blocked with the log and
                 no head; success -> drop TASK.md and launch the worker head. One claim per tick.
@@ -439,7 +442,9 @@ def _validate_card(card: dict, records: dict) -> bool:
             # Next tick, with stand-green noted, this falls through to the review gate.
             return _stand_gate(ref, pr, card, stand_cfg, records, view)
         # Lower layers green (CI for no-stand, stand for stand projects) -> layer 3 review.
-        return _review_gate(ref, pr, card, records, view)
+        # stand_cfg was already resolved above — pass its presence down instead of re-reading the
+        # manifest a second time in the green-review path.
+        return _review_gate(ref, pr, card, records, view, stand_cfg is not None)
     STATE.log_run("validate", reference=ref, result=f"ci-{status['rollup'].lower()}", pr=pr)
     return False
 
@@ -489,6 +494,8 @@ def _clear_review(rec: dict) -> None:
     rec.pop("review_title", None)
     rec.pop("review_activity", None)
     rec.pop("review_spawn_fails", None)
+    rec.pop("automerge_done", None)
+    rec.pop("review_green_logged", None)
     if ws:
         worker.teardown(ws)
 
@@ -506,8 +513,10 @@ def _review_verdict(view: dict, baseline: int) -> str | None:
     return verdict
 
 
-def _review_gate(ref: str, pr: str, card: dict, records: dict, view: dict) -> bool:
-    """Drive layer 3 for a card whose lower layers are green. Returns whether `records` changed."""
+def _review_gate(ref: str, pr: str, card: dict, records: dict, view: dict, is_stand: bool) -> bool:
+    """Drive layer 3 for a card whose lower layers are green. Returns whether `records` changed.
+    `is_stand` is the caller's already-resolved stand_cfg presence — passed through rather than
+    re-read here, since `_review_green` needs it too."""
     rec = records.get(ref)
     if rec is None:
         # An untracked Validate card (manual move / adopted without a record): a reviewer head needs
@@ -520,7 +529,7 @@ def _review_gate(ref: str, pr: str, card: dict, records: dict, view: dict) -> bo
     if verdict is None:
         return _review_watchdog(ref, rec, records)
     if verdict == "green":
-        return _review_green(ref, rec)
+        return _review_green(ref, pr, is_stand, rec, records)
     return _review_red(ref, pr, rec, records)
 
 
@@ -597,14 +606,46 @@ def _review_watchdog(ref: str, rec: dict, records: dict) -> bool:
     return True
 
 
-def _review_green(ref: str, rec: dict) -> bool:
-    """Green verdict: all layers clear, the card waits for a human merge. Tear the reviewer
-    worktree down once; after that every tick is a no-op until the merge lands."""
-    if not rec.get("review_ws"):
-        return False
-    worker.teardown(rec["review_ws"])
-    rec["review_ws"] = ""
-    STATE.log_run("review", reference=ref, result="green")
+def _review_green(ref: str, pr: str, is_stand: bool, rec: dict, records: dict) -> bool:
+    """Green verdict: all three layers clear. Tear the reviewer worktree down once. A project
+    without a [stand] section still waits for a human merge: log the terminal green exactly once
+    (`review_green_logged`), not on every tick the card idles here waiting — the same one-shot
+    contract this event had before automerge existed. A stand project's e2e run on a live stand is
+    enough assurance (vladmesh, 2026-07-02) that the dispatcher merges the PR itself (squash)
+    instead, once per green verdict: `automerge_done` makes a repeated tick that still sees the
+    same green verdict (gh merge-state lag before `poll_pr` reports merged) a no-op rather than a
+    second `gh pr merge` call. A failed attempt — conflict, stale branch, gh down — is a final
+    outcome here, not a retry: a comment with the reason and straight to Blocked so a human is
+    pulled in instead of the tick hammering `gh pr merge` forever."""
+    changed = False
+    if rec.get("review_ws"):
+        worker.teardown(rec["review_ws"])
+        rec["review_ws"] = ""
+        changed = True
+    if not is_stand:
+        if rec.get("review_green_logged"):
+            return changed
+        rec["review_green_logged"] = True
+        STATE.log_run("review", reference=ref, result="green")
+        return True
+    if rec.get("automerge_done"):
+        return changed
+    rec["automerge_done"] = True
+    result = worker.merge_pr(pr)
+    if result["ok"]:
+        ops.add_comment("dispatcher", ref,
+                        f"Все слои валидации зелёные (CI, стенд, ревью) — автомерж {pr}.",
+                        marker=model.MARKER_AUTOMERGE)
+        STATE.log_run("review", reference=ref, result="green-automerge", pr=pr)
+        return True
+    scrubbed = worker.scrub_secrets(result.get("error") or "(без деталей)")
+    ops.add_comment("dispatcher", ref,
+                    f"Автомерж {pr} не удался: {scrubbed}. Карточка в Blocked, нужна ручная "
+                    f"проверка и мерж руками.")
+    ops.move_card("dispatcher", ref, "Blocked")
+    records.pop(ref, None)
+    STATE.log_run("review", reference=ref, to="Blocked", reason="automerge-fail", pr=pr,
+                  error=scrubbed)
     return True
 
 

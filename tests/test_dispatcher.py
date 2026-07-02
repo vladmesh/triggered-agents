@@ -39,6 +39,8 @@ class FakeWorker:
         self.torn_down = []
         self.pr_status = None            # dict returned by poll_pr, or None for gh-unavailable
         self.polled = []                 # PR urls poll_pr was asked about
+        self.merge_result = {"ok": True, "error": None}  # dict returned by merge_pr
+        self.merged = []                 # PR urls merge_pr was asked to merge
         self.notified = []               # (handle, text) nudges sent to worker terminals
         self.stand_config = None         # dict from read_stand_config, or None for no-stand project
         self.stand_branch = "pipeline/x"  # branch pr_branch returns (None -> gh can't answer)
@@ -84,6 +86,10 @@ class FakeWorker:
         self.polled.append(pr_url)
         return self.pr_status
 
+    def merge_pr(self, pr_url):
+        self.merged.append(pr_url)
+        return self.merge_result
+
     def notify(self, handle, text):
         self.notified.append((handle, text))
         return bool(handle)
@@ -122,7 +128,7 @@ class _DispatcherBase(unittest.TestCase):
         for name in ("read_base_branch", "create_workspace", "provision", "write_task",
                      "launch_worker", "activity", "poll_pr", "notify", "teardown",
                      "read_stand_config", "pr_branch", "run_stand", "spawn_reviewer",
-                     "workspace_exists", "rename_terminal"):
+                     "workspace_exists", "rename_terminal", "merge_pr"):
             wp = mock.patch(f"triggered_agents.agents.pipeline.worker.{name}",
                             getattr(self.worker, name))
             wp.start()
@@ -806,6 +812,18 @@ class ValidateReviewTest(_DispatcherBase):
         self.assertEqual(len(self._rev_ws_torndown()), 1)
         self.assertTrue(any(r["event"] == "review" and r.get("result") == "green" for r in self._runs()))
 
+    def test_green_verdict_logs_terminal_green_exactly_once(self):
+        # Regression (review #1 on triggered-agents-221): a no-stand card idling in Validate on a
+        # settled green verdict must log the terminal "review green" event once, not on every tick
+        # it sits there waiting for a human merge.
+        ref = self._spawned()
+        ops.verdict(ref, "green", "ок")
+        for _ in range(3):
+            dispatcher.tick()
+        self.assertEqual(self._column(ref), "Validate")
+        greens = [r for r in self._runs() if r["event"] == "review" and r.get("result") == "green"]
+        self.assertEqual(len(greens), 1)
+
     def test_green_verdict_then_merge_to_done(self):
         ref = self._spawned()
         ops.verdict(ref, "green", "ок")
@@ -963,6 +981,98 @@ class ValidateReviewTest(_DispatcherBase):
         self.assertEqual(self.worker.reviewer_spawns, [])
         self.assertTrue(any(r["event"] == "review" and r.get("result") == "untracked"
                             for r in self._runs()))
+
+
+class AutomergeTest(_DispatcherBase):
+    """triggered-agents-221: for a project with a [stand] section, a green review verdict on top
+    of already-green CI and stand triggers the dispatcher's own squash merge (worker.merge_pr)
+    instead of waiting for a human — vladmesh's 2026-07-02 call that the live-stand e2e gate is
+    enough assurance. Projects without a stand keep the old human-merge behaviour."""
+
+    PR = "https://github.com/vladmesh/personal_site/pull/101"
+    STAND = {"namespace": "personal_site_stand", "compose": ["infra/docker-compose.stand.yml"],
+             "e2e_command": "bash infra/e2e/run.sh"}
+
+    def _markers(self, ref):
+        tid = next(t["id"] for t in self.board.tasks.values() if t["reference"] == ref)
+        return " ".join(c["comment"] for c in self.board.comments.get(tid, []))
+
+    def _ci_green(self):
+        self.worker.pr_status = {"merged": False, "state": "OPEN", "rollup": "SUCCESS",
+                                 "failed_job": None, "failed_log": None}
+
+    def _to_review_green(self, pr=PR):
+        """Stand project all the way through: done -> Validate, CI green -> stand run -> stand
+        green, reviewer spawned, green verdict posted — not yet consumed by a tick."""
+        self.worker.stand_config = self.STAND
+        self.worker.stand_branch = "pipeline/A"
+        ref = self._claim_one()
+        ops.report(ref, "done", f"готово\nPR: {pr}")
+        self.worker.pr_status = None
+        dispatcher.tick()
+        self.assertEqual(self._column(ref), "Validate")
+        self._ci_green()
+        self.worker.stand_result = {"ok": True, "stage": "e2e", "log": "ok"}
+        dispatcher.tick()                     # stand run -> stand-green
+        dispatcher.tick()                     # stand green noted -> spawn reviewer
+        self.assertEqual(len(self.worker.reviewer_spawns), 1)
+        ops.verdict(ref, "green", "все критерии реально выполнены")
+        return ref
+
+    def test_stand_project_green_review_triggers_squash_merge(self):
+        ref = self._to_review_green()
+        dispatcher.tick()
+        self.assertEqual(self.worker.merged, [self.PR])
+        journal = self._markers(ref)
+        self.assertIn(f"[{model.MARKER_AUTOMERGE}]", journal)
+        self.assertIn(self.PR, journal)
+        self.assertEqual(self._column(ref), "Validate")   # still waits on gh to report merged
+        self.assertTrue(any(r["event"] == "review" and r.get("result") == "green-automerge"
+                            for r in self._runs()))
+
+    def test_automerge_then_gh_reports_merged_moves_to_done(self):
+        ref = self._to_review_green()
+        dispatcher.tick()                                  # merges via gh
+        self.worker.pr_status = {"merged": True, "state": "MERGED", "rollup": "SUCCESS",
+                                 "failed_job": None, "failed_log": None}
+        dispatcher.tick()
+        self.assertEqual(self._column(ref), "Done")
+
+    def test_automerge_is_attempted_once_across_ticks(self):
+        # gh may not reflect the merge immediately: a later tick still sees the green verdict and
+        # poll_pr still reports merged=False, but must not call gh pr merge a second time.
+        ref = self._to_review_green()
+        dispatcher.tick()
+        self.assertEqual(self.worker.merged, [self.PR])
+        dispatcher.tick()
+        self.assertEqual(self.worker.merged, [self.PR])
+
+    def test_merge_failure_blocks_with_reason_and_does_not_retry(self):
+        ref = self._to_review_green()
+        self.worker.merge_result = {"ok": False, "error": "PR is not mergeable: conflicting files"}
+        dispatcher.tick()
+        self.assertEqual(self._column(ref), "Blocked")
+        self.assertNotIn(ref, dispatcher._load_cards())
+        journal = self._markers(ref)
+        self.assertIn("conflicting files", journal)
+        self.assertEqual(self.worker.merged, [self.PR])
+        self.assertTrue(any(r["event"] == "review" and r.get("reason") == "automerge-fail"
+                            for r in self._runs()))
+        dispatcher.tick()                                  # Blocked, off the board -> no retry
+        self.assertEqual(self.worker.merged, [self.PR])
+
+    def test_no_stand_project_green_review_waits_for_human(self):
+        ref = self._claim_one()
+        ops.report(ref, "done", f"готово\nPR: {self.PR}")
+        self.worker.pr_status = None
+        dispatcher.tick()
+        self._ci_green()
+        dispatcher.tick()                                  # no stand -> spawns the reviewer directly
+        self.assertEqual(len(self.worker.reviewer_spawns), 1)
+        ops.verdict(ref, "green", "ок")
+        dispatcher.tick()
+        self.assertEqual(self.worker.merged, [])
+        self.assertEqual(self._column(ref), "Validate")
 
 
 class OrcaJsonTimeoutTest(unittest.TestCase):

@@ -84,6 +84,10 @@ MARKER_STAND_RED = "validate:stand-red"
 # with a nudge, up to a cap of returns (then Blocked до vladmesh).
 MARKER_REVIEW_GREEN = "review:green"
 MARKER_REVIEW_RED = "review:red"
+# Posted once when a stand-project card's green review triggers the dispatcher's own squash merge
+# (all three gates — CI, stand-green, review:green — cleared, per vladmesh's 2026-07-02 decision
+# that a live-stand e2e run is enough assurance to drop the human from the merge for those projects).
+MARKER_AUTOMERGE = "validate:automerge"
 # The dispatcher's own note when a red verdict sends a card back for rework. Deliberately NOT a
 # review:* marker: the invariant "only the reviewer posts a verdict" must not hinge on baseline
 # arithmetic — if this carried [review:red] and any baseline shift re-read it, the card would loop.
