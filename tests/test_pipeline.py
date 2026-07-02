@@ -170,6 +170,12 @@ class TestMatrix(unittest.TestCase):
         with self.assertRaises(model.GuardError):
             model.check_move("worker", "Validate", "Done")
 
+    def test_reviewer_moves_nothing(self):
+        with self.assertRaises(model.GuardError):
+            model.check_move("reviewer", "Validate", "Done")
+        with self.assertRaises(model.GuardError):
+            model.check_move("reviewer", "In progress", "Validate")
+
     def test_po_cannot_touch_in_progress_side(self):
         with self.assertRaises(model.GuardError):
             model.check_move("po", "In progress", "Validate")
@@ -371,6 +377,77 @@ class TestReport(PatchedBoardTest):
         self.assertEqual(len(posted), 1)
         self.assertEqual(posted[0]["user_id"], 0)
         self.assertTrue(posted[0]["content"].startswith(f"[{model.MARKER_REPORT_DONE}]"))
+
+
+class TestVerdict(PatchedBoardTest):
+    def test_red_without_body_raises(self):
+        board = self.make_board()
+        ref = board.add_task("A", "Validate")
+        with self.assertRaises(model.GuardError):
+            ops.verdict(ref, "red", "")
+
+    def test_bad_kind_raises(self):
+        board = self.make_board()
+        ref = board.add_task("A", "Validate")
+        with self.assertRaises(model.GuardError):
+            ops.verdict(ref, "maybe", "body")
+
+    def test_green_posts_marker_comment(self):
+        board = self.make_board()
+        ref = board.add_task("A", "Validate")
+        ops.verdict(ref, "green", "все criteria реально выполнены")
+        posted = board.method_calls("createComment")
+        self.assertEqual(len(posted), 1)
+        self.assertTrue(posted[0]["content"].startswith(f"[{model.MARKER_REVIEW_GREEN}]"))
+
+    def test_red_posts_marker_comment(self):
+        board = self.make_board()
+        ref = board.add_task("A", "Validate")
+        ops.verdict(ref, "red", "блокер: foo.py")
+        posted = board.method_calls("createComment")
+        self.assertTrue(posted[0]["content"].startswith(f"[{model.MARKER_REVIEW_RED}]"))
+
+
+class TestReviewerRole(unittest.TestCase):
+    """Role guards for the layer-3 reviewer at the CLI seam: it may post a verdict and file Идеи
+    cards, but never move a card, claim, report, or create a Ready card."""
+
+    def setUp(self):
+        from triggered_agents.agents.pipeline import cli
+        self.cli = cli
+        self.calls = []
+        for name in ("verdict", "create_card", "move_card", "claim_card", "report"):
+            p = mock.patch(f"triggered_agents.agents.pipeline.ops.{name}",
+                           lambda *a, n=name, **k: self.calls.append((n, a, k)) or {"ok": n})
+            p.start()
+            self.addCleanup(p.stop)
+
+    def _run(self, argv):
+        return self.cli.main(argv)
+
+    def test_reviewer_verdict_allowed(self):
+        rc = self._run(["--role", "reviewer", "verdict", "--ref", "R", "--kind", "red",
+                        "--body", "блокер"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.calls[0][0], "verdict")
+
+    def test_reviewer_idea_forces_ideas_column(self):
+        rc = self._run(["--role", "reviewer", "idea", "--project", "p", "--title", "t",
+                        "--description", "d"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.calls[0][0], "create_card")
+        self.assertEqual(self.calls[0][2]["column"], "Идеи")
+
+    def test_worker_cannot_verdict(self):
+        rc = self._run(["--role", "worker", "verdict", "--ref", "R", "--kind", "green"])
+        self.assertEqual(rc, 2)
+        self.assertEqual(self.calls, [])
+
+    def test_reviewer_cannot_claim_or_report(self):
+        # claim is dispatcher-only, report worker-only — both rejected before any ops call.
+        self.assertEqual(self._run(["--role", "reviewer", "claim", "--ref", "R", "--worker", "w"]), 2)
+        self.assertEqual(self._run(["--role", "reviewer", "report", "--ref", "R", "--kind", "done"]), 2)
+        self.assertEqual(self.calls, [])
 
 
 if __name__ == "__main__":

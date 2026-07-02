@@ -255,6 +255,21 @@ def report(reference: str, kind: str, body: str = "") -> dict:
     return out
 
 
+def verdict(reference: str, kind: str, body: str = "") -> dict:
+    """Reviewer-only: post the layer-3 verdict as `[review:green]`/`[review:red]`. A red verdict
+    needs a body (the blocker findings) — the dispatcher returns the card on red, so an empty red
+    would send a card back with nothing to fix."""
+    if kind not in ("green", "red"):
+        raise model.GuardError(f"verdict kind must be 'green' or 'red', not {kind!r}")
+    if kind == "red" and not body.strip():
+        raise model.GuardError("a red verdict requires a non-empty body (the blocker findings)")
+    marker = model.MARKER_REVIEW_GREEN if kind == "green" else model.MARKER_REVIEW_RED
+    out = add_comment("reviewer", reference, body, marker=marker)
+    out["action"] = "verdict"
+    out["kind"] = kind
+    return out
+
+
 def feedback(reference: str, body: str) -> dict:
     """Worker-only: post a `[feedback]` comment on the spec/process; requires a non-empty body."""
     if not body.strip():

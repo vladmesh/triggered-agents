@@ -32,6 +32,9 @@ ORCA_TIMEOUT_S = 120       # worktree create runs repo git; give it room, but ne
 PROVISION_TIMEOUT_S = int(os.environ.get("TA_PROVISION_TIMEOUT_S", "900"))
 GH_TIMEOUT_S = 60          # a gh call may hit the network; bounded so a tick never hangs on it
 _GH_LOG_TAIL_LINES = 40
+# Model for the layer-3 reviewer head. A plain config knob (not a per-card choice): the reviewer is
+# independent of the worker, so the card's `model` field is not reused here. Empty -> claude default.
+REVIEWER_MODEL = os.environ.get("TA_REVIEWER_MODEL", "opus")
 
 
 class WorkspaceError(RuntimeError):
@@ -118,12 +121,17 @@ def provision(workspace: str) -> tuple[bool, str]:
     return p.returncode == 0, (p.stdout or "") + (p.stderr or "")
 
 
-def write_task(workspace: str, content: str) -> str:
-    """Write the one-time spec to <ws>/TASK.md and exclude it from git so it never gets committed."""
-    path = Path(workspace) / "TASK.md"
+def _write_excluded(workspace: str, name: str, content: str) -> str:
+    """Write <ws>/<name> and exclude it from git so a one-time head artifact never gets committed."""
+    path = Path(workspace) / name
     path.write_text(content, encoding="utf-8")
-    _git_exclude(workspace, "TASK.md")
+    _git_exclude(workspace, name)
     return str(path)
+
+
+def write_task(workspace: str, content: str) -> str:
+    """Write the one-time spec to <ws>/TASK.md, excluded from git."""
+    return _write_excluded(workspace, "TASK.md", content)
 
 
 def _git_exclude(workspace: str, name: str) -> None:
@@ -178,6 +186,33 @@ def launch_worker(workspace: str, model: str | None, worker_id: str) -> str:
                        "--command", _launch_command(model, worker_id)])
     term = data.get("terminal", data)
     return term.get("handle") or term.get("id") or ""
+
+
+def _reviewer_command(worker_id: str) -> str:
+    model_flag = f" --model {REVIEWER_MODEL}" if REVIEWER_MODEL else ""
+    prompt = (
+        "Ты — независимая голова-ревьюер task-пайплайна (слой 3 валидации). Твоя работа целиком в "
+        "REVIEW.md в корне воркспейса — прочти его первым и следуй ему. Роль на доске — reviewer "
+        "(BOARD_ROLE уже выставлен): прав на код нет, не коммить и не пушь; артефакты — один "
+        "вердикт-коммент и, при необходимости, карточки-идеи через board-CLI."
+    )
+    return f'BOARD_ROLE=reviewer claude --dangerously-skip-permissions{model_flag} {prompt!r}'
+
+
+def spawn_reviewer(project: str, worker_id: str, base_branch: str, review_md: str) -> tuple[str, str]:
+    """Bring up the layer-3 reviewer head: a fresh worktree off base_branch (the head checks out
+    the PR itself per REVIEW.md), the REVIEW.md prompt, then the head. No provisioning — the
+    reviewer only reads code and drives gh/board-CLI, so it needs no app deps. Returns
+    (workspace, terminal handle)."""
+    ws = create_workspace(project, worker_id, base_branch)
+    _write_excluded(ws, "REVIEW.md", review_md)
+    ensure_trust(ws)
+    ensure_theme()
+    data = _orca_json(["terminal", "create", "--worktree", f"path:{ws}",
+                       "--title", f"Claude reviewer {worker_id}",
+                       "--command", _reviewer_command(worker_id)])
+    term = data.get("terminal", data)
+    return ws, (term.get("handle") or term.get("id") or "")
 
 
 def activity(workspace: str) -> float | None:

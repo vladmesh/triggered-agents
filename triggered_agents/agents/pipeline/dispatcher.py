@@ -16,9 +16,11 @@ Per-tick order:
                 touch; a tick with no Validate card never calls it). CI red -> back to In progress
                 with a scrubbed comment and a nudge to the live worker; CI green -> layer 2 for
                 projects with a [stand] manifest section (deploy the PR branch to the stand + e2e,
-                green only after a green run, one auto-retry then Blocked), or a one-time verdict
-                comment for projects without a stand; PR merged (by a human) -> Done, record
-                dropped. gh unavailable or no PR link in the report -> card untouched, a warn line.
+                green only after a green run, one auto-retry then Blocked). Once the mechanical
+                layers are green -> layer 3: spawn an independent reviewer head (not the worker,
+                no code access), read its verdict (green -> waits for merge; red -> back to
+                In progress with a nudge, capped returns then Blocked). PR merged (by a human) ->
+                Done, record dropped. gh unavailable or no PR link -> card untouched, a warn line.
   3. claim    — top Ready card by position; claim through ops (its guards run), create the Orca
                 worktree off base_branch, run setup+smoke; smoke fail -> Blocked with the log and
                 no head; success -> drop TASK.md and launch the worker head. One claim per tick.
@@ -38,12 +40,15 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from ...runtime.state import AgentState
-from . import model, ops, worker
+from . import model, ops, reviewer, worker
 
 STATE = AgentState("pipeline")
 CARDS_FILE = STATE.dir / "cards.json"
 WATCHDOG_SECONDS = int(os.environ.get("TA_WATCHDOG_SECONDS", "1200"))
 WORKER_CAP = int(os.environ.get("TA_WORKER_CAP", "3"))
+# Layer-3 rework cap: a card may be returned by red reviewer verdicts at most this many times over
+# its life. The next red after that goes to Blocked до vladmesh with the full verdict on the card.
+REVIEW_RETURN_CAP = int(os.environ.get("TA_REVIEW_RETURN_CAP", "3"))
 _LOG_TAIL_LINES = 40
 # PR link the worker pastes into its report (the done protocol in TASK.md requires it). The last
 # one on the card wins, so a re-opened/re-pushed PR link supersedes an earlier one.
@@ -256,6 +261,14 @@ def _has_marker(view: dict, marker: str) -> bool:
     return any(f"[{marker}]" in c.get("text", "") for c in view["comments"])
 
 
+def _has_marker_since(view: dict, marker: str, baseline: int) -> bool:
+    """Like _has_marker but only over comments at/after `baseline` (the card's report baseline,
+    reset on every (re)entry to Validate). A lower-layer-green note from a PRIOR code state sits
+    before the baseline, so a reworked card re-runs that layer instead of skipping it on the stale
+    marker."""
+    return any(f"[{marker}]" in c.get("text", "") for c in view["comments"][baseline:])
+
+
 def _count_marker(view: dict, marker: str) -> int:
     return sum(1 for c in view["comments"] if f"[{marker}]" in c.get("text", ""))
 
@@ -354,6 +367,8 @@ def _validate_card(card: dict, records: dict) -> bool:
         return False
 
     if status["merged"]:
+        if rec is not None:
+            _clear_review(rec)              # drop any in-flight reviewer worktree
         ops.move_card("dispatcher", ref, "Done")
         records.pop(ref, None)              # session over; drop the workspace bookkeeping
         STATE.log_run("validate", reference=ref, to="Done", pr=pr)
@@ -368,7 +383,8 @@ def _validate_card(card: dict, records: dict) -> bool:
         if rec is not None:
             # Baseline past the red comment so the stale done report isn't re-read as a new one,
             # and restart the watchdog clock — the worker is only now handed work again. The stand
-            # fail-count resets too: rework is a fresh code state, its own retry budget.
+            # fail-count and any in-flight review reset too: rework is a fresh code state.
+            _clear_review(rec)
             rec["comment_baseline"] = len(ops.show_card(ref)["comments"])
             rec["last_activity"] = time.time()
             rec["stand_fails"] = 0
@@ -378,19 +394,24 @@ def _validate_card(card: dict, records: dict) -> bool:
         STATE.log_run("validate", reference=ref, to=model.IN_PROGRESS, reason="ci-red", job=job, pr=pr)
         return True
     if status["rollup"] == "SUCCESS":
+        # Marker checks are scoped to the card's report baseline (reset on every re-entry to
+        # Validate) so a rework re-runs each lower layer instead of skipping it on a stale note.
+        baseline = int(rec.get("comment_baseline", 0)) if rec is not None else 0
         stand_cfg = worker.read_stand_config(card.get("project") or "")
         if stand_cfg is None:
-            # No stand: layer 1 green is the pre-merge verdict (unchanged behaviour).
-            if not _has_marker(view, model.MARKER_VALIDATE_GREEN):
+            # No stand: CI is the only mechanical layer. Note it once per code state, then layer 3.
+            if not _has_marker_since(view, model.MARKER_VALIDATE_GREEN, baseline):
                 ops.add_comment("dispatcher", ref,
-                                f"CI зелёный по {pr}. Слой 1 пройден, ждёт ручного мержа vladmesh.",
+                                f"CI зелёный по {pr}. Слой 1 пройден, запускаю независимое ревью (слой 3).",
                                 marker=model.MARKER_VALIDATE_GREEN)
                 STATE.log_run("validate", reference=ref, result="ci-green", pr=pr)
-            return False
-        if not _has_marker(view, model.MARKER_STAND_GREEN):
-            # Stand project: layer 1 green is not enough — gate on a green stand run.
+                view = ops.show_card(ref)
+        elif not _has_marker_since(view, model.MARKER_STAND_GREEN, baseline):
+            # Stand project: layer 2 not passed for this code state yet — gate on the stand first.
+            # Next tick, with stand-green noted, this falls through to the review gate.
             return _stand_gate(ref, pr, card, stand_cfg, records, view)
-        return False
+        # Lower layers green (CI for no-stand, stand for stand projects) -> layer 3 review.
+        return _review_gate(ref, pr, card, records, view)
     STATE.log_run("validate", reference=ref, result=f"ci-{status['rollup'].lower()}", pr=pr)
     return False
 
@@ -411,6 +432,159 @@ def _validate_error(ref: str, exc: Exception) -> None:
                             marker=model.MARKER_VALIDATE_ERROR)
     except Exception:  # noqa: BLE001 — commenting is best-effort; never re-raise from here
         pass
+
+
+# --- Validate layer 3: independent LLM review -------------------------------------------------
+# After the mechanical layers are green, the dispatcher spawns a reviewer head (worker.spawn_reviewer)
+# — not the worker, no write access to the code — and drives the card by its verdict exactly the way
+# _advance drives an In-progress card by the worker's report: spawn once per code state, read the
+# verdict comment past a baseline, act. green -> the card waits for a human merge; red -> back to
+# In progress with a nudge, up to REVIEW_RETURN_CAP returns over the card's life, then Blocked до
+# vladmesh. A reviewer that goes silent without a verdict is caught by the same watchdog as a worker,
+# so the card never sits in Validate forever with a dead head.
+
+
+def _review_id(reference: str) -> str:
+    """Workspace id for a reviewer head, kept distinct from the worker's so the two worktrees of
+    one card never collide."""
+    safe = "".join(c if c.isalnum() or c in "-_" else "-" for c in reference)
+    return f"review-{safe}-{int(time.time())}"
+
+
+def _clear_review(rec: dict) -> None:
+    """Drop the reviewer bookkeeping and tear down its throwaway worktree. The lifetime return
+    count (review_returns) is deliberately kept — it caps returns across the whole card life."""
+    ws = rec.pop("review_ws", "")
+    rec.pop("review_baseline", None)
+    rec.pop("review_handle", None)
+    rec.pop("review_activity", None)
+    if ws:
+        worker.teardown(ws)
+
+
+def _review_verdict(view: dict, baseline: int) -> str | None:
+    """'green'/'red'/None from the reviewer's verdict comments past `baseline` (the count when the
+    head was launched, so a verdict from a prior code state is not re-read). Last verdict wins."""
+    verdict = None
+    for c in view["comments"][baseline:]:
+        text = c.get("text", "")
+        if f"[{model.MARKER_REVIEW_GREEN}]" in text:
+            verdict = "green"
+        elif f"[{model.MARKER_REVIEW_RED}]" in text:
+            verdict = "red"
+    return verdict
+
+
+def _review_gate(ref: str, pr: str, card: dict, records: dict, view: dict) -> bool:
+    """Drive layer 3 for a card whose lower layers are green. Returns whether `records` changed."""
+    rec = records.get(ref)
+    if rec is None:
+        # An untracked Validate card (manual move / adopted without a record): a reviewer head needs
+        # a record to be tracked, so skip rather than spawn one we can't watchdog or tear down.
+        STATE.log_run("review", reference=ref, result="untracked", level="warn", pr=pr)
+        return False
+    if "review_baseline" not in rec:
+        return _spawn_reviewer(ref, pr, card, rec)
+    verdict = _review_verdict(view, int(rec["review_baseline"]))
+    if verdict is None:
+        return _review_watchdog(ref, rec, records)
+    if verdict == "green":
+        return _review_green(ref, rec)
+    return _review_red(ref, pr, rec, records)
+
+
+def _spawn_reviewer(ref: str, pr: str, card: dict, rec: dict) -> bool:
+    """Bring up the reviewer head for the current code state. On an orca failure, nothing is posted
+    and the baseline stays unset, so the spawn is retried next tick (a transient, not a verdict)."""
+    project = card.get("project") or ""
+    spec = ops.show_card(ref).get("description", "")
+    try:
+        base = worker.read_base_branch(project)
+        review_md = reviewer.build_task(card, ref, pr, spec, base)
+        ws, handle = worker.spawn_reviewer(project, _review_id(ref), base, review_md)
+    except worker.WorkspaceError as e:
+        STATE.log_run("review", reference=ref, result="spawn-failed", level="warn",
+                      error=worker.scrub_secrets(str(e)), pr=pr)
+        return False
+    ops.add_comment("dispatcher", ref,
+                    f"Нижние слои валидации зелёные. Запущена независимая голова-ревьюер (слой 3) "
+                    f"по {pr}: вердикт по каждому criterion спеки и находки блокер/замечание "
+                    f"появятся в комментарии.")
+    now = time.time()
+    rec["review_ws"] = ws
+    rec["review_handle"] = handle
+    rec["review_activity"] = now
+    rec["review_baseline"] = len(ops.show_card(ref)["comments"])
+    STATE.log_run("review", reference=ref, result="spawned", workspace=ws, pr=pr)
+    return True
+
+
+def _review_watchdog(ref: str, rec: dict, records: dict) -> bool:
+    """No verdict yet: track the reviewer head's output and, if it goes silent past the threshold,
+    Block the card до vladmesh — a dead reviewer must never leave the card stuck in Validate."""
+    ws = rec.get("review_ws")
+    changed = False
+    last = worker.activity(ws) if ws else None
+    if last and last > rec.get("review_activity", 0):
+        rec["review_activity"] = last
+        changed = True
+    silent = time.time() - rec.get("review_activity", time.time())
+    if silent <= WATCHDOG_SECONDS:
+        return changed
+    ws_note = (f"воркспейс ревьюера {ws} оставлен для разбора" if ws
+               else "воркспейс ревьюера неизвестен")
+    ops.add_comment("dispatcher", ref,
+                    f"watchdog: голова-ревьюер (слой 3) молчит {int(silent)}s без вердикта "
+                    f"(порог {WATCHDOG_SECONDS}s) — завис или умер. Карточка в Blocked до vladmesh, "
+                    f"{ws_note}.")
+    ops.move_card("dispatcher", ref, "Blocked")
+    records.pop(ref, None)   # record gone; the reviewer worktree is left alive for a human
+    STATE.log_run("review", reference=ref, to="Blocked", reason="review-watchdog", silent=int(silent))
+    return True
+
+
+def _review_green(ref: str, rec: dict) -> bool:
+    """Green verdict: all layers clear, the card waits for a human merge. Tear the reviewer
+    worktree down once; after that every tick is a no-op until the merge lands."""
+    if not rec.get("review_ws"):
+        return False
+    worker.teardown(rec["review_ws"])
+    rec["review_ws"] = ""
+    STATE.log_run("review", reference=ref, result="green")
+    return True
+
+
+def _review_red(ref: str, pr: str, rec: dict, records: dict) -> bool:
+    """Red verdict (a blocker in some lens). Return the card for rework, or — once the lifetime cap
+    of returns is spent — Block it до vladmesh with the full verdict already on the card."""
+    prior = rec.get("review_returns", 0)
+    if prior >= REVIEW_RETURN_CAP:
+        _clear_review(rec)
+        ops.add_comment("dispatcher", ref,
+                        f"Красный вердикт ревьюера после {prior} доработок — кап возвратов "
+                        f"({REVIEW_RETURN_CAP}) исчерпан. Карточка в Blocked до vladmesh; полный "
+                        f"вердикт — в комментарии выше. PR: {pr}")
+        ops.move_card("dispatcher", ref, "Blocked")
+        records.pop(ref, None)
+        STATE.log_run("review", reference=ref, to="Blocked", reason="return-cap", returns=prior, pr=pr)
+        return True
+    ops.add_comment("dispatcher", ref,
+                    f"Красный вердикт независимого ревьюера (слой 3): есть блокеры. Карточка "
+                    f"возвращена в In progress на доработку (возврат {prior + 1} из "
+                    f"{REVIEW_RETURN_CAP}). Разбор — в вердикте выше. PR: {pr}",
+                    marker=model.MARKER_REVIEW_RED)
+    ops.move_card("dispatcher", ref, model.IN_PROGRESS)
+    _clear_review(rec)                                   # tear down reviewer ws, drop its baseline
+    rec["review_returns"] = prior + 1
+    rec["comment_baseline"] = len(ops.show_card(ref)["comments"])
+    rec["last_activity"] = time.time()
+    rec["stand_fails"] = 0
+    worker.notify(rec.get("handle", ""),
+                  f"Ревью по {pr} красное — есть блокеры (слой 3). Карточка вернулась в "
+                  f"In progress. Разбор в вердикте на карточке, почини и снова report done.")
+    STATE.log_run("review", reference=ref, to=model.IN_PROGRESS, reason="review-red",
+                  returns=prior + 1, pr=pr)
+    return True
 
 
 def _task_md(card: dict, spec: str) -> str:
