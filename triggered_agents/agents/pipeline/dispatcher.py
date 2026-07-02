@@ -10,8 +10,14 @@ Per-tick order:
                 between claim and save), so no claimed card is ever invisible to the watchdog.
   1. advance  — for each In-progress card we track: [report:done] -> Validate,
                 [report:blocked] -> Blocked, else watchdog (silent past the threshold -> Blocked,
-                workspace left alive for a human/provision-agent).
-  2. claim    — top Ready card by position; claim through ops (its guards run), create the Orca
+                workspace left alive for a human/provision-agent). A card moved to Validate keeps
+                its record: the worker session lives on for CI rework.
+  2. validate — for each Validate card, poll its PR through gh (worker.poll_pr, the only gh
+                touch; a tick with no Validate card never calls it). CI red -> back to In progress
+                with a scrubbed comment and a nudge to the live worker; CI green -> a one-time
+                verdict comment; PR merged (by a human) -> Done, record dropped. gh unavailable
+                or no PR link in the report -> card untouched, a warn line in runs.jsonl.
+  3. claim    — top Ready card by position; claim through ops (its guards run), create the Orca
                 worktree off base_branch, run setup+smoke; smoke fail -> Blocked with the log and
                 no head; success -> drop TASK.md and launch the worker head. One claim per tick.
 
@@ -23,6 +29,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import time
 from contextlib import contextmanager
@@ -36,6 +43,9 @@ CARDS_FILE = STATE.dir / "cards.json"
 WATCHDOG_SECONDS = int(os.environ.get("TA_WATCHDOG_SECONDS", "1200"))
 WORKER_CAP = int(os.environ.get("TA_WORKER_CAP", "3"))
 _LOG_TAIL_LINES = 40
+# PR link the worker pastes into its report (the done protocol in TASK.md requires it). The last
+# one on the card wins, so a re-opened/re-pushed PR link supersedes an earlier one.
+_PR_URL_RE = re.compile(r"https://github\.com/[\w.-]+/[\w.-]+/pull/\d+")
 
 
 def _lock_stale(lockfile: Path) -> bool:
@@ -169,21 +179,31 @@ def _reconcile(records: dict) -> bool:
 
 def _advance(records: dict) -> bool:
     """Move each tracked In-progress card by its worker's report or the watchdog. Returns whether
-    `records` changed."""
+    `records` changed. A card that reaches Validate keeps its record — the worker session lives on
+    for CI rework, and _validate needs the terminal handle to nudge it. Records for cards sitting
+    in Validate are left to _validate; records whose card has left both columns are dropped."""
     by_ref = {c["reference"]: c for c in ops.list_cards()}
     changed = False
     for ref, rec in list(records.items()):
         card = by_ref.get(ref)
-        if card is None or card["column"] != model.IN_PROGRESS:
-            # Card closed, or already left In progress by another path — stop tracking it.
+        if card is None:
+            records.pop(ref)
+            changed = True
+            continue
+        if card["column"] == "Validate":
+            continue                      # _validate owns Validate cards
+        if card["column"] != model.IN_PROGRESS:
+            # Left In progress by another path (human move, blocked-report already applied) — drop.
             records.pop(ref)
             changed = True
             continue
         verdict = _report_verdict(ref, int(rec.get("comment_baseline", 0)))
         if verdict == "done":
             ops.move_card("dispatcher", ref, "Validate")
+            # Keep the record; advance the baseline past this report so a CI-red return to
+            # In progress doesn't re-read the same done comment and bounce straight back.
+            rec["comment_baseline"] = len(ops.show_card(ref)["comments"])
             STATE.log_run("advance", reference=ref, to="Validate", reason="report:done")
-            records.pop(ref)
             changed = True
         elif verdict == "blocked":
             ops.move_card("dispatcher", ref, "Blocked")
@@ -206,6 +226,77 @@ def _advance(records: dict) -> bool:
                 STATE.log_run("advance", reference=ref, to="Blocked", reason="watchdog", silent=int(silent))
                 records.pop(ref)
                 changed = True
+    return changed
+
+
+def _pr_url(view: dict) -> str | None:
+    """PR link from a card's comments (the last one wins). `view` is an ops.show_card result."""
+    url = None
+    for c in view["comments"]:
+        m = _PR_URL_RE.search(c.get("text", ""))
+        if m:
+            url = m.group(0)
+    return url
+
+
+def _has_marker(view: dict, marker: str) -> bool:
+    return any(f"[{marker}]" in c.get("text", "") for c in view["comments"])
+
+
+def _validate(records: dict) -> bool:
+    """Drive each Validate card by its PR through gh (Validate layer 1, zero LLM). Merge stays a
+    human action; the dispatcher only reacts to what gh reports:
+      merged  -> Done, record dropped (the worker session is over);
+      CI red  -> back to In progress with a scrubbed comment + a nudge to the live worker;
+      CI green-> a one-time verdict comment (repeat green ticks don't re-post);
+      no PR link in the report / gh down -> card untouched, a warn line in runs.jsonl (a flaky
+      gh must not bounce a card or ping a human).
+    Only Validate cards are looked at, so a tick with none never calls gh."""
+    changed = False
+    for card in ops.list_cards(column="Validate"):
+        ref = card["reference"]
+        rec = records.get(ref)
+        view = ops.show_card(ref)
+        pr = _pr_url(view)
+        if not pr:
+            STATE.log_run("validate", reference=ref, result="no-pr-ref", level="warn")
+            continue
+        status = worker.poll_pr(pr)
+        if status is None:
+            STATE.log_run("validate", reference=ref, result="gh-unavailable", pr=pr, level="warn")
+            continue
+
+        if status["merged"]:
+            ops.move_card("dispatcher", ref, "Done")
+            records.pop(ref, None)          # session over; drop the workspace bookkeeping
+            STATE.log_run("validate", reference=ref, to="Done", pr=pr)
+            changed = True
+        elif status["rollup"] == "FAILURE":
+            job = status.get("failed_job") or "?"
+            tail = worker.scrub_secrets(status.get("failed_log") or "(лог недоступен)")
+            comment = (f"CI красный: джоба «{job}» упала. Хвост лога:\n```\n{tail}\n```\n"
+                       f"Карточка возвращена в In progress на доработку. PR: {pr}")
+            ops.add_comment("dispatcher", ref, comment, marker=model.MARKER_VALIDATE_RED)
+            ops.move_card("dispatcher", ref, model.IN_PROGRESS)
+            if rec is not None:
+                # Baseline past the red comment so the stale done report isn't re-read as a new one,
+                # and restart the watchdog clock — the worker is only now handed work again.
+                rec["comment_baseline"] = len(ops.show_card(ref)["comments"])
+                rec["last_activity"] = time.time()
+                worker.notify(rec.get("handle", ""),
+                              f"CI по {pr} красный — джоба «{job}» упала, карточка вернулась в "
+                              f"In progress. Разбор в комментарии карточки, почини и снова report done.")
+            STATE.log_run("validate", reference=ref, to=model.IN_PROGRESS, reason="ci-red",
+                          job=job, pr=pr)
+            changed = True
+        elif status["rollup"] == "SUCCESS":
+            if not _has_marker(view, model.MARKER_VALIDATE_GREEN):
+                ops.add_comment("dispatcher", ref,
+                                f"CI зелёный по {pr}. Слой 1 пройден, ждёт ручного мержа vladmesh.",
+                                marker=model.MARKER_VALIDATE_GREEN)
+                STATE.log_run("validate", reference=ref, result="ci-green", pr=pr)
+        else:
+            STATE.log_run("validate", reference=ref, result=f"ci-{status['rollup'].lower()}", pr=pr)
     return changed
 
 
@@ -304,6 +395,7 @@ def tick() -> int:
         records = _load_cards()
         changed = _reconcile(records)
         changed = _advance(records) or changed
+        changed = _validate(records) or changed
         before = json.dumps(records, sort_keys=True)
         _claim_next(records)
         if changed or json.dumps(records, sort_keys=True) != before:

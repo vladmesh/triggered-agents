@@ -59,6 +59,10 @@ TRANSITIONS: dict[str, set[tuple[str, str]]] = {
 MARKER_REPORT_DONE = "report:done"
 MARKER_REPORT_BLOCKED = "report:blocked"
 MARKER_FEEDBACK = "feedback"
+# Dispatcher verdicts on a Validate card's CI. ci-green is posted at most once per card (the
+# dispatcher checks for it before posting) so repeated green ticks don't spam the journal.
+MARKER_VALIDATE_GREEN = "validate:ci-green"
+MARKER_VALIDATE_RED = "validate:ci-red"
 
 
 class GuardError(RuntimeError):
