@@ -20,7 +20,7 @@ BOARD_NAME = os.environ.get("TA_PIPELINE_BOARD", "Pipeline")
 
 COLUMNS = ["Идеи", "Ready", "In progress", "Validate", "Blocked", "Done"]
 
-ROLES = ("po", "dispatcher", "worker")
+ROLES = ("po", "dispatcher", "worker", "reviewer")
 
 TASK_TYPES = ("code", "research", "debug")
 
@@ -50,26 +50,41 @@ TRANSITIONS: dict[str, set[tuple[str, str]]] = {
         ("Validate", "Done"),
     },
     "worker": set(),
+    # The layer-3 reviewer never moves cards (the dispatcher acts on its verdict, like it does on
+    # a worker report). Its only artifacts are the verdict comment and Идеи cards.
+    "reviewer": set(),
 }
 
 # Comment markers, single source of truth for ops (and, later, the dispatcher reading back):
 #   [report:done] / [report:blocked]  worker report
 #   [feedback]                        worker's feedback on the spec/process, harvested by retro
+#   [review:green] / [review:red]     the layer-3 reviewer's verdict
 #   [<role>]                          plain comment
 MARKER_REPORT_DONE = "report:done"
 MARKER_REPORT_BLOCKED = "report:blocked"
 MARKER_FEEDBACK = "feedback"
-# Dispatcher verdicts on a Validate card's CI (layer 1). ci-green is posted at most once per card
-# (the dispatcher checks for it before posting) so repeated green ticks don't spam the journal.
+# Dispatcher verdicts on a Validate card's CI (layer 1). ci-green marks "layer 1 passed, running
+# the review" — posted once per code state (the dispatcher checks the comments after the card's
+# current baseline before posting, so a rework that re-enters Validate gets a fresh note).
 MARKER_VALIDATE_GREEN = "validate:ci-green"
 MARKER_VALIDATE_RED = "validate:ci-red"
 # Dispatcher verdicts on the stand run (Validate layer 2: deploy the PR branch to the project's
-# persistent stand and run e2e). Only for projects with a [stand] manifest section. stand-green is
-# posted once and is the pre-merge verdict for such projects (it replaces ci-green as the
-# "waiting for merge" signal — green comes only after a green stand run). stand-red is posted per
-# failed run; two consecutive stand failures send the card to Blocked (one auto-retry).
+# persistent stand and run e2e). Only for projects with a [stand] manifest section. stand-green
+# marks "layer 2 passed", posted once per code state; layer 3 (the reviewer) runs after it.
+# stand-red is posted per failed run; two consecutive stand failures send the card to Blocked
+# (one auto-retry).
 MARKER_STAND_GREEN = "validate:stand-green"
 MARKER_STAND_RED = "validate:stand-red"
+# The layer-3 reviewer's verdict (Validate layer 3: an independent LLM head, not the worker, reads
+# the whole repo + PR and posts one verdict). green = all layers clear, the card waits for a human
+# merge. red = at least one blocker in any lens; the dispatcher returns the card to In progress
+# with a nudge, up to a cap of returns (then Blocked до vladmesh).
+MARKER_REVIEW_GREEN = "review:green"
+MARKER_REVIEW_RED = "review:red"
+# The dispatcher's own note when a red verdict sends a card back for rework. Deliberately NOT a
+# review:* marker: the invariant "only the reviewer posts a verdict" must not hinge on baseline
+# arithmetic — if this carried [review:red] and any baseline shift re-read it, the card would loop.
+MARKER_REVIEW_RETURN = "validate:review-return"
 # Posted once when validating a single card blows up unexpectedly (e.g. a base workspace.toml that
 # won't parse). The failure is localized to that card — the tick keeps going for the others.
 MARKER_VALIDATE_ERROR = "validate:error"

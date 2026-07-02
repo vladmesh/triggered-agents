@@ -97,6 +97,21 @@ def _build_parser() -> argparse.ArgumentParser:
     p_feedback.add_argument("--body")
     p_feedback.add_argument("--body-file")
 
+    p_verdict = sub.add_parser("verdict")     # reviewer: the layer-3 green/red verdict
+    p_verdict.add_argument("--ref", required=True)
+    p_verdict.add_argument("--kind", required=True, choices=("green", "red"))
+    p_verdict.add_argument("--body")
+    p_verdict.add_argument("--body-file")
+
+    p_idea = sub.add_parser("idea")           # reviewer: file a finding as an Идеи card
+    p_idea.add_argument("--project", required=True)
+    p_idea.add_argument("--title", required=True)
+    p_idea.add_argument("--type", default="code", dest="task_type")
+    p_idea.add_argument("--ref")
+    p_idea.add_argument("--model", dest="model_name")
+    p_idea.add_argument("--description")
+    p_idea.add_argument("--description-file")
+
     p_list = sub.add_parser("list")
     p_list.add_argument("--column")
     p_list.add_argument("--project")
@@ -160,6 +175,19 @@ def main(argv=None) -> int:
             if not _need_role(role, ("worker",)):
                 return 2
             return _emit(ops.feedback(args.ref, _text_arg(args.body, args.body_file)))
+        if args.cmd == "verdict":
+            if not _need_role(role, ("reviewer",)):
+                return 2
+            return _emit(ops.verdict(args.ref, args.kind, _text_arg(args.body, args.body_file)))
+        if args.cmd == "idea":
+            if not _need_role(role, ("reviewer",)):
+                return 2
+            # The reviewer's one code-creation exception: findings out of the card's scope go to
+            # Идеи (never Ready) so they enter the queue only via a human, not the reviewer.
+            desc = _text_arg(args.description, args.description_file)
+            return _emit(ops.reviewer_idea(
+                project=args.project, task_type=args.task_type, title=args.title,
+                description=desc, ref=args.ref, model_name=args.model_name))
         if args.cmd == "comment":
             if not _need_role(role, ROLES):
                 return 2
