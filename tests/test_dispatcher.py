@@ -37,6 +37,9 @@ class FakeWorker:
         self.launched = []
         self.tasks_written = []
         self.torn_down = []
+        self.pr_status = None            # dict returned by poll_pr, or None for gh-unavailable
+        self.polled = []                 # PR urls poll_pr was asked about
+        self.notified = []               # (handle, text) nudges sent to worker terminals
         self._n = 0
 
     def read_base_branch(self, project):
@@ -62,11 +65,21 @@ class FakeWorker:
     def activity(self, workspace):
         return self.activity_ts
 
+    def poll_pr(self, pr_url):
+        self.polled.append(pr_url)
+        return self.pr_status
+
+    def notify(self, handle, text):
+        self.notified.append((handle, text))
+        return bool(handle)
+
     def teardown(self, workspace):
         self.torn_down.append(workspace)
 
 
-class DispatcherTest(unittest.TestCase):
+class _DispatcherBase(unittest.TestCase):
+    """Board+host fakes and helpers shared by the dispatcher test cases."""
+
     def setUp(self):
         # Fresh board transport + host stub for every test; clean the shared pipeline state.
         self.board = FakeBoard()
@@ -76,7 +89,7 @@ class DispatcherTest(unittest.TestCase):
 
         self.worker = FakeWorker()
         for name in ("read_base_branch", "create_workspace", "provision", "write_task",
-                     "launch_worker", "activity", "teardown"):
+                     "launch_worker", "activity", "poll_pr", "notify", "teardown"):
             wp = mock.patch(f"triggered_agents.agents.pipeline.worker.{name}",
                             getattr(self.worker, name))
             wp.start()
@@ -115,6 +128,13 @@ class DispatcherTest(unittest.TestCase):
         import json
         return [json.loads(line) for line in path.read_text().splitlines()]
 
+    def _claim_one(self, title="A", **kw):
+        ref = self._ready_card(title, **kw)
+        dispatcher.tick()
+        return ref
+
+
+class DispatcherTest(_DispatcherBase):
     # precheck --------------------------------------------------------------
     def test_precheck_skip_when_empty(self):
         rc = dispatcher.precheck()
@@ -191,17 +211,13 @@ class DispatcherTest(unittest.TestCase):
         self.assertTrue(any(r["event"] == "claim-skip" for r in self._runs()))
 
     # advance ---------------------------------------------------------------
-    def _claim_one(self, title="A", **kw):
-        ref = self._ready_card(title, **kw)
-        dispatcher.tick()
-        return ref
-
     def test_advance_report_done_to_validate(self):
         ref = self._claim_one()
         ops.report(ref, "done", "shipped")
         dispatcher.tick()
         self.assertEqual(self._column(ref), "Validate")
-        self.assertNotIn(ref, dispatcher._load_cards())
+        # The record survives into Validate: the worker session lives on for CI rework.
+        self.assertIn(ref, dispatcher._load_cards())
 
     def test_advance_report_blocked_to_blocked(self):
         ref = self._claim_one()
@@ -350,6 +366,104 @@ class DispatcherTest(unittest.TestCase):
         src = Path(dispatcher.__file__).read_text()
         self.assertNotIn("kanboard", src)
         self.assertNotIn("from ..board", src)
+
+
+class ValidateTest(_DispatcherBase):
+    """Validate layer 1: the dispatcher polls each Validate card's PR through worker.poll_pr
+    (gh stubbed by FakeWorker) and drives merge/red/green without an LLM."""
+
+    PR = "https://github.com/vladmesh/personal_site/pull/25"
+
+    def _markers(self, ref):
+        tid = next(t["id"] for t in self.board.tasks.values() if t["reference"] == ref)
+        return " ".join(c["comment"] for c in self.board.comments.get(tid, []))
+
+    def _to_validate(self, pr=PR, report="готово"):
+        """Claim a card, have the worker report done (with a PR link), land it in Validate with
+        its record intact. poll_pr returns None for this landing tick so the card stays put."""
+        ref = self._claim_one()
+        ops.report(ref, "done", f"{report}\nPR: {pr}" if pr else report)
+        self.worker.pr_status = None
+        dispatcher.tick()
+        self.assertEqual(self._column(ref), "Validate")
+        return ref
+
+    def test_no_gh_call_without_validate_card(self):
+        # A card only In progress (never reported done) must not trigger any gh poll.
+        self._claim_one()
+        self.worker.pr_status = {"merged": False, "state": "OPEN", "rollup": "SUCCESS",
+                                 "failed_job": None, "failed_log": None}
+        dispatcher.tick()
+        self.assertEqual(self.worker.polled, [])
+
+    def test_merged_pr_moves_to_done(self):
+        ref = self._to_validate()
+        self.worker.pr_status = {"merged": True, "state": "MERGED", "rollup": "SUCCESS",
+                                 "failed_job": None, "failed_log": None}
+        dispatcher.tick()
+        self.assertEqual(self._column(ref), "Done")
+        self.assertNotIn(ref, dispatcher._load_cards())    # workspace record dropped
+        self.assertIn(self.PR, self.worker.polled)
+        self.assertTrue(any(r["event"] == "validate" and r.get("to") == "Done" for r in self._runs()))
+
+    def test_red_ci_returns_to_in_progress_notifies_and_scrubs(self):
+        ref = self._to_validate()
+        self.worker.pr_status = {
+            "merged": False, "state": "OPEN", "rollup": "FAILURE",
+            "failed_job": "Lint, Typecheck & Test",
+            "failed_log": "E   assert 1 == 2\nleaked KANBOARD_API_TOKEN=supersecretvalue123",
+        }
+        dispatcher.tick()
+        self.assertEqual(self._column(ref), model.IN_PROGRESS)
+        journal = self._markers(ref)
+        self.assertIn("Lint, Typecheck & Test", journal)
+        self.assertNotIn("supersecretvalue123", journal)          # scrubbed before posting
+        self.assertEqual(len(self.worker.notified), 1)            # live worker nudged
+        self.assertIn("Lint, Typecheck & Test", self.worker.notified[0][1])
+        self.assertTrue(any(r.get("reason") == "ci-red" for r in self._runs()))
+
+    def test_red_ci_then_rework_done_returns_to_validate(self):
+        # A stale done comment (below the new baseline) must not bounce the card straight back.
+        ref = self._to_validate()
+        self.worker.pr_status = {"merged": False, "state": "OPEN", "rollup": "FAILURE",
+                                 "failed_job": "CI", "failed_log": "boom"}
+        dispatcher.tick()
+        self.assertEqual(self._column(ref), model.IN_PROGRESS)
+        self.worker.pr_status = None
+        dispatcher.tick()                                        # no new report -> stays put
+        self.assertEqual(self._column(ref), model.IN_PROGRESS)
+        ops.report(ref, "done", "починил")                       # fresh report, PR link still on card
+        dispatcher.tick()
+        self.assertEqual(self._column(ref), "Validate")
+
+    def test_green_ci_comments_exactly_once(self):
+        ref = self._to_validate()
+        self.worker.pr_status = {"merged": False, "state": "OPEN", "rollup": "SUCCESS",
+                                 "failed_job": None, "failed_log": None}
+        dispatcher.tick()
+        dispatcher.tick()                                        # second green tick must not re-post
+        self.assertEqual(self._column(ref), "Validate")
+        self.assertEqual(self._markers(ref).count(f"[{model.MARKER_VALIDATE_GREEN}]"), 1)
+
+    def test_no_pr_link_warns_without_touching_card(self):
+        ref = self._claim_one()
+        ops.report(ref, "done", "готово, но ссылку на PR забыл")
+        self.worker.pr_status = {"merged": True, "state": "MERGED", "rollup": "SUCCESS",
+                                 "failed_job": None, "failed_log": None}
+        dispatcher.tick()                                        # lands in Validate, no PR -> warn
+        self.assertEqual(self._column(ref), "Validate")
+        self.assertEqual(self.worker.polled, [])                 # never reached gh
+        self.assertTrue(any(r["event"] == "validate" and r.get("result") == "no-pr-ref"
+                            and r.get("level") == "warn" for r in self._runs()))
+
+    def test_gh_unavailable_warns_without_touching_card(self):
+        ref = self._to_validate()
+        self.worker.pr_status = None                             # gh down / PR not found
+        dispatcher.tick()
+        self.assertEqual(self._column(ref), "Validate")
+        self.assertIn(ref, dispatcher._load_cards())
+        self.assertTrue(any(r["event"] == "validate" and r.get("result") == "gh-unavailable"
+                            and r.get("level") == "warn" for r in self._runs()))
 
 
 class ProjectRootTest(unittest.TestCase):

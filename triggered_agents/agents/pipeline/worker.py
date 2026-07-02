@@ -22,12 +22,15 @@ from pathlib import Path
 from ...runtime import redact
 
 ORCA = os.environ.get("ORCA_BIN") or shutil.which("orca") or str(Path.home() / ".local/bin/orca")
+GH = os.environ.get("GH_BIN") or shutil.which("gh") or "gh"
 PROJECTS_DIR = Path(os.environ.get("TA_PROJECTS_DIR", str(Path.home() / "projects")))
 CLAUDE_JSON = Path(os.environ.get("TA_CLAUDE_JSON", str(Path.home() / ".claude.json")))
 CONTROL_PANEL = Path(os.environ.get("TA_CONTROL_PANEL", str(Path.home() / "control-panel")))
 PROVISION = CONTROL_PANEL / "pipeline" / "provision.py"
 ORCA_TIMEOUT_S = 120       # worktree create runs repo git; give it room, but never hang forever
 PROVISION_TIMEOUT_S = int(os.environ.get("TA_PROVISION_TIMEOUT_S", "900"))
+GH_TIMEOUT_S = 60          # a gh call may hit the network; bounded so a tick never hangs on it
+_GH_LOG_TAIL_LINES = 40
 
 
 class WorkspaceError(RuntimeError):
@@ -179,6 +182,118 @@ def activity(workspace: str) -> float | None:
         return None
     last_ms = [t.get("lastOutputAt") for t in (data.get("terminals") or []) if t.get("lastOutputAt")]
     return max(last_ms) / 1000.0 if last_ms else None
+
+
+def notify(handle: str, text: str) -> bool:
+    """Nudge the live worker head: type `text` into its terminal (its Claude session) and Enter.
+    Best-effort — a missing handle or an orca error is swallowed. The board comment is the durable
+    record of a CI-red return; this is only a convenience so the worker sees it without a refresh."""
+    if not handle:
+        return False
+    try:
+        p = subprocess.run([ORCA, "terminal", "send", "--terminal", handle, "--text", text, "--enter"],
+                           capture_output=True, text=True, timeout=ORCA_TIMEOUT_S)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return p.returncode == 0
+
+
+# --- gh PR polling (Validate layer 1: mechanics, zero LLM) ------------------------------------
+# The dispatcher polls each Validate card's PR here. Every gh touch returns None on any trouble
+# (gh missing, non-zero exit, network/API error, unparsable output): None means "unknown, retry
+# next tick", never a verdict — a transient gh outage must not move a card or ping a human.
+
+_RUN_URL_RE = re.compile(r"github\.com/([\w.-]+/[\w.-]+)/actions/runs/(\d+)")
+_FAIL_CONCLUSIONS = {"FAILURE", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE"}
+
+
+def _gh_json(args: list[str]):
+    import json
+
+    try:
+        p = subprocess.run([GH, *args], capture_output=True, text=True, timeout=GH_TIMEOUT_S)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if p.returncode != 0:
+        return None
+    try:
+        return json.loads(p.stdout)
+    except (json.JSONDecodeError, ValueError):
+        return None
+
+
+def _check_result(item: dict) -> str:
+    """One rollup entry -> 'pass' | 'fail' | 'pending'. Handles both a GitHub-Actions CheckRun
+    (status/conclusion) and a legacy commit StatusContext (state)."""
+    if item.get("__typename") == "StatusContext" or ("state" in item and "status" not in item):
+        state = str(item.get("state", "")).upper()
+        if state in ("FAILURE", "ERROR"):
+            return "fail"
+        if state == "SUCCESS":
+            return "pass"
+        return "pending"
+    if str(item.get("status", "")).upper() != "COMPLETED":
+        return "pending"
+    return "fail" if str(item.get("conclusion", "")).upper() in _FAIL_CONCLUSIONS else "pass"
+
+
+def _rollup(items: list[dict]) -> tuple[str, dict | None]:
+    """Overall CI state from the rollup: 'FAILURE' (with the first failing entry), 'PENDING',
+    'SUCCESS', or 'NONE' when the PR has no checks at all."""
+    if not items:
+        return "NONE", None
+    first_fail = None
+    pending = False
+    for it in items:
+        r = _check_result(it)
+        if r == "fail" and first_fail is None:
+            first_fail = it
+        elif r == "pending":
+            pending = True
+    if first_fail is not None:
+        return "FAILURE", first_fail
+    return ("PENDING" if pending else "SUCCESS"), None
+
+
+def _failed_log(item: dict, lines: int = _GH_LOG_TAIL_LINES) -> str | None:
+    """Tail of the failed job's log via `gh run view --log-failed`, or None if not a Actions
+    run (e.g. an external StatusContext) or gh cannot fetch it. Raw — the dispatcher scrubs."""
+    m = _RUN_URL_RE.search(item.get("detailsUrl") or item.get("targetUrl") or "")
+    if not m:
+        return None
+    repo, run_id = m.group(1), m.group(2)
+    try:
+        p = subprocess.run([GH, "run", "view", run_id, "-R", repo, "--log-failed"],
+                           capture_output=True, text=True, timeout=GH_TIMEOUT_S)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if p.returncode != 0:
+        return None
+    tail = "\n".join((p.stdout or "").strip().splitlines()[-lines:])
+    return tail or None
+
+
+def poll_pr(pr_url: str) -> dict | None:
+    """Poll a PR's merge state and CI rollup via gh. Returns
+        {"merged": bool, "state": str, "rollup": "SUCCESS"|"FAILURE"|"PENDING"|"NONE",
+         "failed_job": str|None, "failed_log": str|None}
+    or None when gh cannot answer (missing, error, PR gone) — an unknown to retry, not a verdict.
+    The failed job's log is fetched only on FAILURE, so a green/pending poll is a single gh call."""
+    data = _gh_json(["pr", "view", pr_url, "--json", "state,mergedAt,statusCheckRollup"])
+    if not isinstance(data, dict):
+        return None
+    rollup, failed = _rollup(data.get("statusCheckRollup") or [])
+    out = {
+        "merged": bool(data.get("mergedAt")),
+        "state": data.get("state", ""),
+        "rollup": rollup,
+        "failed_job": None,
+        "failed_log": None,
+    }
+    if failed is not None:
+        out["failed_job"] = failed.get("name") or failed.get("context") or "?"
+        out["failed_log"] = _failed_log(failed)
+    return out
 
 
 def teardown(workspace: str) -> None:

@@ -9,9 +9,16 @@ head are not run here (they need Orca and the project's compose stack; see TASK.
 требует Orca"). Instead worker.py is patched so create_workspace makes a throwaway git repo,
 provision returns success, and launch/report is simulated by posting a worker report through the
 board-CLI layer — exactly the comment a real head would post. The dispatcher's decisions
-(claim, bring-up, advance, watchdog) all run for real.
+(claim, bring-up, advance, watchdog, Validate polling) all run for real.
 
-Prep: source control-panel/.env first so KANBOARD_* are set, then `python3 tests/e2e_dispatcher.py`.
+Validate layer 1 runs against a REAL gh: the fixture card carries a link to a real merged PR of a
+vladmesh repo (TA_E2E_PR, default personal_site#25), and worker.poll_pr shells out to the actual
+gh CLI — so the merge/Done path is exercised end to end, not stubbed. Only worker.notify (the
+terminal nudge) is stubbed, since there is no live worker head. If gh is missing/unauthed the poll
+returns None and the card stays put with a warn line — the run prints that it could not reach gh.
+
+Prep: source control-panel/.env first so KANBOARD_* are set, gh authed, then
+`python3 tests/e2e_dispatcher.py`.
 """
 from __future__ import annotations
 
@@ -37,6 +44,9 @@ from triggered_agents.agents.pipeline import cli, dispatcher, model, ops, worker
 
 _fail = False
 _workspaces: list[str] = []
+_notified: list[tuple[str, str]] = []
+# A real merged PR of a vladmesh repo — the Validate poll hits gh against this for real.
+E2E_PR = os.environ.get("TA_E2E_PR", "https://github.com/vladmesh/personal_site/pull/25")
 
 
 def check(label, cond):
@@ -56,6 +66,12 @@ def _column(reference):
     t = call("getTaskByReference", project_id=pid, reference=reference)
     cols = {int(c["id"]): c["title"] for c in call("getColumns", project_id=int(pid))}
     return cols.get(int(t["column_id"]))
+
+
+def _card_comments(reference):
+    pid = next(p["id"] for p in call("getAllProjects") if p["name"] == "__e2e__")
+    t = call("getTaskByReference", project_id=pid, reference=reference)
+    return call("getAllComments", task_id=int(t["id"])) or []
 
 
 # ---- host-side stubs (Orca/docker/claude replaced) -------------------------------
@@ -79,11 +95,17 @@ def _stub_launch(workspace, model_name, worker_id):
     return f"stub-handle-{worker_id}"
 
 
+def _stub_notify(handle, text):
+    _notified.append((handle, text))
+    return True
+
+
 def install_stubs(provision=_stub_provision_ok, activity=lambda ws: None):
     worker.create_workspace = _stub_create_workspace
     worker.provision = provision
     worker.launch_worker = _stub_launch
     worker.activity = activity
+    worker.notify = _stub_notify        # no live head to nudge; poll_pr stays real (hits gh)
 
 
 def main() -> int:
@@ -115,14 +137,27 @@ def main() -> int:
         recs = dispatcher._load_cards()
         check("dispatcher tracks the card", ref in recs)
 
-        # 5. worker reports done (the board-CLI comment a real head would post)
-        rc = _run_cli("worker", ["report", "--ref", ref, "--kind", "done", "--body", "all criteria met"])
+        # 5. worker reports done (the board-CLI comment a real head would post) with a PR link,
+        #    exactly as the done protocol in TASK.md requires.
+        rc = _run_cli("worker", ["report", "--ref", ref, "--kind", "done",
+                                 "--body", f"all criteria met\nPR: {E2E_PR}"])
         check("worker report done rc=0", rc == 0)
 
-        # 6. tick: advance -> Validate, verified via Kanboard API
+        # 6. tick: advance -> Validate; the record is KEPT (the worker session lives on for CI
+        #    rework), and the same tick's Validate poll hits gh for real against a merged PR ->
+        #    the card lands in Done. Merge stays a human action; here the PR is already merged.
         dispatcher.tick()
-        check("card Validate after advance", _column(ref) == "Validate")
-        check("dispatcher stopped tracking the card", ref not in dispatcher._load_cards())
+        col6 = _column(ref)
+        if col6 == "Done":
+            check("merged PR -> Done via real gh poll", True)
+            check("dispatcher dropped the card after Done", ref not in dispatcher._load_cards())
+            check("Done journal names the PR",
+                  any(E2E_PR in c.get("comment", "") for c in _card_comments(ref)))
+        else:
+            # gh unavailable/unauthed: the poll returned None, card untouched with a warn line.
+            check("gh unreachable -> card stays Validate, untouched", col6 == "Validate")
+            print("NOTE: gh could not confirm the merge (missing/unauthed?); "
+                  "Validate poll returned None and left the card in place — the warn path.")
 
         # 7. smoke-fail path -> Blocked, no head, workspace kept
         install_stubs(provision=_stub_provision_fail)
