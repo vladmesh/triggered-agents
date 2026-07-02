@@ -377,12 +377,16 @@ def _validate_card(card: dict, records: dict) -> bool:
         return False
 
     if status["merged"]:
+        ws = rec.get("workspace") if rec is not None else None
         if rec is not None:
             _clear_review(rec)              # drop any in-flight reviewer worktree
-            if rec.get("workspace"):
-                worker.teardown(rec["workspace"])  # stop its terminals, remove the worktree
+        # Move to Done (and drop the record) BEFORE the teardown call below: teardown is
+        # best-effort and bounded, but it's still host I/O, and the terminal transition must not
+        # wait on it — a wedged orca daemon must not be able to keep a merged card stuck off Done.
         ops.move_card("dispatcher", ref, "Done")
         records.pop(ref, None)              # session over; drop the workspace bookkeeping
+        if ws:
+            worker.teardown(ws)             # stop its terminals, remove the worktree
         STATE.log_run("validate", reference=ref, to="Done", pr=pr)
         return True
     if status["rollup"] == "FAILURE":

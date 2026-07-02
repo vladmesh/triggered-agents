@@ -1076,6 +1076,35 @@ class TeardownTest(unittest.TestCase):
             run.assert_not_called()          # guard fires before any orca/rm call
         self.assertTrue(outside.exists())    # nothing was touched
 
+    def test_refuses_the_root_itself(self):
+        # The root is not a workspace: removing it would take every project's workspace with it.
+        with mock.patch("subprocess.run") as run:
+            with self.assertRaises(self.worker.WorkspaceError):
+                self.worker.teardown(str(self.root))
+            run.assert_not_called()
+        self.assertTrue(self.root.exists())
+
+    def test_worktree_rm_timeout_falls_back_to_rm(self):
+        # A wedged orca daemon must not hang the tick forever — orca worktree rm is bounded the
+        # same way stop_terminals already is, and a timeout there falls through to rm -rf.
+        import subprocess
+        import shutil
+
+        ws = self._ws()
+
+        def fake_run(args, **kw):
+            self.calls.append(args)
+            if args[:2] == [self.worker.ORCA, "worktree"]:
+                raise subprocess.TimeoutExpired(cmd=args, timeout=kw.get("timeout"))
+            if args[:2] == ["rm", "-rf"]:
+                shutil.rmtree(ws, ignore_errors=True)
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        with mock.patch("subprocess.run", side_effect=fake_run):
+            self.worker.teardown(str(ws))
+        self.assertFalse(ws.exists())
+        self.assertTrue(any(a[:2] == ["rm", "-rf"] for a in self.calls))
+
     def test_stops_terminals_before_worktree_rm(self):
         import subprocess
         import shutil

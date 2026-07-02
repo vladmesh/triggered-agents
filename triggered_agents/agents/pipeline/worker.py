@@ -386,10 +386,11 @@ def run_stand(project: str, branch: str, cfg: dict) -> dict | None:
 
 
 def _guard_workspace_path(workspace: str) -> Path:
-    """Refuse a path outside WORKSPACES_ROOT before teardown runs any rm. teardown ends in
+    """Refuse a path outside WORKSPACES_ROOT before teardown runs any rm — including the root
+    itself, whose removal would take every other project's workspace with it. teardown ends in
     rm -rf/sudo rm -rf, so a wrong path here is a real deletion, not just a board mistake."""
     path = Path(workspace).resolve()
-    if path != WORKSPACES_ROOT and WORKSPACES_ROOT not in path.parents:
+    if path == WORKSPACES_ROOT or WORKSPACES_ROOT not in path.parents:
         raise WorkspaceError(f"teardown refuses a path outside {WORKSPACES_ROOT}: {workspace}")
     return path
 
@@ -405,6 +406,18 @@ def stop_terminals(workspace: str) -> None:
         pass
 
 
+def _rm_step(args: list[str]) -> subprocess.CompletedProcess:
+    """Run one teardown removal step bounded by ORCA_TIMEOUT_S — the same discipline `_orca_json`
+    and `stop_terminals` already apply to every other orca/host touch, so a stuck orca daemon or a
+    wedged rm (e.g. a stale NFS handle) can never hang a dispatcher tick forever. A timeout counts
+    as a failed step (non-zero return), not an exception, so the existing fallback chain still
+    runs the next step instead of the tick crashing on it."""
+    try:
+        return subprocess.run(args, capture_output=True, text=True, timeout=ORCA_TIMEOUT_S)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return subprocess.CompletedProcess(args, 1, "", str(e))
+
+
 def teardown(workspace: str) -> None:
     """Stop the workspace's terminals, then best-effort remove the Orca worktree. A dev-stage
     backend without USER leaves root-owned __pycache__ in the tree, so a plain remove can fail on
@@ -413,12 +426,11 @@ def teardown(workspace: str) -> None:
     back)."""
     path = _guard_workspace_path(workspace)
     stop_terminals(workspace)
-    r = subprocess.run([ORCA, "worktree", "rm", "--worktree", f"path:{workspace}", "--force"],
-                       capture_output=True, text=True)
+    r = _rm_step([ORCA, "worktree", "rm", "--worktree", f"path:{workspace}", "--force"])
     if r.returncode == 0 and not path.exists():
         return
     if path.exists():
-        p = subprocess.run(["rm", "-rf", workspace], capture_output=True, text=True)
+        p = _rm_step(["rm", "-rf", workspace])
         if p.returncode != 0 and path.exists():
             STATE.log_run("teardown-sudo-fallback", workspace=workspace)
-            subprocess.run(["sudo", "rm", "-rf", workspace], capture_output=True, text=True)
+            _rm_step(["sudo", "rm", "-rf", workspace])
