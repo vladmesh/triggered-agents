@@ -382,6 +382,23 @@ def poll_pr(pr_url: str) -> dict | None:
     return out
 
 
+def merge_pr(pr_url: str) -> dict:
+    """Squash-merge a PR via gh. Returns {"ok": bool, "error": str|None}.
+
+    Unlike poll_pr/pr_branch/run_stand, this is never a "retry next tick" call: the dispatcher
+    calls it at most once per green review (see dispatcher._review_green), and any failure here —
+    including gh being unavailable — is a final outcome the caller reports and Blocks on, not an
+    unknown to poll again."""
+    try:
+        p = subprocess.run([GH, "pr", "merge", pr_url, "--squash"],
+                           capture_output=True, text=True, timeout=GH_TIMEOUT_S)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return {"ok": False, "error": str(e)}
+    if p.returncode == 0:
+        return {"ok": True, "error": None}
+    return {"ok": False, "error": (p.stderr or p.stdout).strip() or f"gh exit {p.returncode}"}
+
+
 # --- Stand deploy + e2e (Validate layer 2) ----------------------------------------------------
 # The dispatcher decides on the board; the heavy host work (git checkout, compose, e2e) lives in
 # stand.py. These delegates keep the dispatcher talking to a single host boundary (worker.py) and
