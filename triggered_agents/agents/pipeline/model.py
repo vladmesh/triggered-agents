@@ -59,10 +59,20 @@ TRANSITIONS: dict[str, set[tuple[str, str]]] = {
 MARKER_REPORT_DONE = "report:done"
 MARKER_REPORT_BLOCKED = "report:blocked"
 MARKER_FEEDBACK = "feedback"
-# Dispatcher verdicts on a Validate card's CI. ci-green is posted at most once per card (the
-# dispatcher checks for it before posting) so repeated green ticks don't spam the journal.
+# Dispatcher verdicts on a Validate card's CI (layer 1). ci-green is posted at most once per card
+# (the dispatcher checks for it before posting) so repeated green ticks don't spam the journal.
 MARKER_VALIDATE_GREEN = "validate:ci-green"
 MARKER_VALIDATE_RED = "validate:ci-red"
+# Dispatcher verdicts on the stand run (Validate layer 2: deploy the PR branch to the project's
+# persistent stand and run e2e). Only for projects with a [stand] manifest section. stand-green is
+# posted once and is the pre-merge verdict for such projects (it replaces ci-green as the
+# "waiting for merge" signal — green comes only after a green stand run). stand-red is posted per
+# failed run; two consecutive stand failures send the card to Blocked (one auto-retry).
+MARKER_STAND_GREEN = "validate:stand-green"
+MARKER_STAND_RED = "validate:stand-red"
+# Posted once when validating a single card blows up unexpectedly (e.g. a base workspace.toml that
+# won't parse). The failure is localized to that card — the tick keeps going for the others.
+MARKER_VALIDATE_ERROR = "validate:error"
 
 
 class GuardError(RuntimeError):

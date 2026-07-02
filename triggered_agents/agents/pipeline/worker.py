@@ -20,6 +20,7 @@ import tomllib
 from pathlib import Path
 
 from ...runtime import claude_env, redact
+from . import stand
 
 ORCA = os.environ.get("ORCA_BIN") or shutil.which("orca") or str(Path.home() / ".local/bin/orca")
 GH = os.environ.get("GH_BIN") or shutil.which("gh") or "gh"
@@ -299,6 +300,34 @@ def poll_pr(pr_url: str) -> dict | None:
         out["failed_job"] = failed.get("name") or failed.get("context") or "?"
         out["failed_log"] = _failed_log(failed)
     return out
+
+
+# --- Stand deploy + e2e (Validate layer 2) ----------------------------------------------------
+# The dispatcher decides on the board; the heavy host work (git checkout, compose, e2e) lives in
+# stand.py. These delegates keep the dispatcher talking to a single host boundary (worker.py) and
+# stay stubbable in the dispatcher unit tests.
+
+
+def read_stand_config(project: str) -> dict | None:
+    """The project's `[stand]` manifest section, or None when it has no stand (layer 2 skipped)."""
+    return stand.read_config(project_root(project))
+
+
+def pr_branch(pr_url: str) -> str | None:
+    """The PR's head branch via gh, or None if gh cannot answer (same contract as poll_pr)."""
+    data = _gh_json(["pr", "view", pr_url, "--json", "headRefName"])
+    if not isinstance(data, dict):
+        return None
+    return data.get("headRefName") or None
+
+
+def run_stand(project: str, branch: str, cfg: dict) -> dict | None:
+    """Deploy `branch` to the project's stand and run e2e. Returns stand.run's result dict, or
+    None on an unexpected host error (treated as 'unknown, retry next tick', never a verdict)."""
+    try:
+        return stand.run(project, branch, cfg, project_root(project))
+    except Exception:  # noqa: BLE001 — a stand host crash is an unknown, not a red verdict
+        return None
 
 
 def teardown(workspace: str) -> None:
