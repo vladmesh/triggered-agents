@@ -240,6 +240,18 @@ class DispatcherTest(_DispatcherBase):
         # The record survives into Validate: the worker session lives on for CI rework.
         self.assertIn(ref, dispatcher._load_cards())
 
+    def test_advance_done_resets_stand_retry_budget(self):
+        # Re-entry into Validate is a fresh code state: the stand fail-count from a prior stint
+        # must not carry over and short-circuit the auto-retry.
+        ref = self._claim_one()
+        recs = dispatcher._load_cards()
+        recs[ref]["stand_fails"] = 5
+        dispatcher._save_cards(recs)
+        ops.report(ref, "done", "готово\nPR: https://github.com/vladmesh/personal_site/pull/1")
+        dispatcher.tick()
+        self.assertEqual(self._column(ref), "Validate")
+        self.assertEqual(dispatcher._load_cards()[ref]["stand_fails"], 0)
+
     def test_advance_report_blocked_to_blocked(self):
         ref = self._claim_one()
         ops.report(ref, "blocked", "criterion 3 недостижим")
@@ -355,11 +367,14 @@ class DispatcherTest(_DispatcherBase):
         dispatcher.tick()
         self.assertFalse(lockfile.exists())
 
-    def test_live_lock_still_refuses(self):
+    def test_live_lock_skips_with_exit_zero(self):
+        # A busy lock (a long stand run holding the tick while the timer fires again) is a skip,
+        # not a failure: it must exit 0 so systemd doesn't log a run of unit failures.
         lockfile = dispatcher.STATE.dir / "dispatch.lock"
         lockfile.write_text(str(os.getpid()))
-        with self.assertRaises(SystemExit):
+        with self.assertRaises(SystemExit) as cm:
             dispatcher.tick()
+        self.assertEqual(cm.exception.code, 0)
         lockfile.unlink()
 
     # secret scrubbing before board comments (review #3) ----------------------
@@ -612,6 +627,21 @@ class ValidateStandTest(_DispatcherBase):
         dispatcher.tick()
         self.assertEqual(self._column(ref), "Validate")           # first fail of the reworked PR
         self.assertEqual(dispatcher._load_cards()[ref]["stand_fails"], 1)
+
+    def test_broken_manifest_is_localized_not_tick_crash(self):
+        # An unparseable base workspace.toml must fail this one card (warn + one comment), not
+        # crash the whole tick and starve the other Validate cards / the claim step.
+        from triggered_agents.agents.pipeline import stand
+        ref = self._to_validate()
+        self._ci_green()
+        with mock.patch("triggered_agents.agents.pipeline.worker.read_stand_config",
+                        side_effect=stand.StandError("workspace.toml is not readable/valid TOML")):
+            dispatcher.tick()                 # must not raise
+            dispatcher.tick()                 # second failing tick must not re-post the comment
+        self.assertEqual(self._column(ref), "Validate")
+        self.assertEqual(self._markers(ref).count(f"[{model.MARKER_VALIDATE_ERROR}]"), 1)
+        self.assertTrue(any(r["event"] == "validate" and r.get("result") == "error"
+                            and r.get("level") == "warn" for r in self._runs()))
 
     def test_no_stand_project_keeps_layer1_green(self):
         # A project without a stand section must behave exactly as before: CI green -> ci-green.

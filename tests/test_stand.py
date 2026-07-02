@@ -44,6 +44,22 @@ class ReadConfigTest(unittest.TestCase):
         self.assertEqual(cfg["namespace"], "ns")
         self.assertEqual(cfg["compose"], ["a.yml"])
 
+    def test_broken_toml_raises_stand_error(self):
+        # A malformed manifest must be a typed, catchable error — not a bare TOMLDecodeError that
+        # would crash the dispatcher tick.
+        self._write("[stand]\nnamespace = 'ns'\ncompose = [oops\n")
+        with self.assertRaises(stand.StandError):
+            stand.read_config(self.root)
+
+
+class RunHelperTest(unittest.TestCase):
+    def test_missing_binary_is_red_not_raised(self):
+        # docker/git missing from PATH: _run must report a non-zero red result, never raise —
+        # an escaping OSError would bubble past run()'s `finally: down` and be swallowed upstream.
+        code, out = stand._run(["/no/such/binary-xyz", "up"])
+        self.assertNotEqual(code, 0)
+        self.assertIn("could not run", out)
+
 
 class RunTest(unittest.TestCase):
     CFG = {"namespace": "ns", "compose": ["infra/compose.stand.yml"], "env_file": "infra/.env.stand",

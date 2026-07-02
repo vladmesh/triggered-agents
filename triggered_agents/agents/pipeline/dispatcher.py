@@ -81,7 +81,12 @@ def _tick_lock():
         except FileExistsError:
             if attempt == 2 or not _lock_stale(lockfile):
                 holder = lockfile.read_text(encoding="utf-8", errors="replace").strip() if lockfile.is_file() else "?"
-                raise SystemExit(f"pipeline: another dispatcher tick holds the lock ({lockfile}, pid {holder})")
+                # A busy lock is a normal skip, not a failure: a long stand run holds the tick for
+                # minutes while the 3-min systemd timer keeps firing. Exit 0 so systemd doesn't log
+                # a run of unit failures for expected overlap.
+                print(f"pipeline: another dispatcher tick holds the lock ({lockfile}, pid {holder}) — SKIP",
+                      file=sys.stderr)
+                raise SystemExit(0)
             STATE.log_run("lock-reclaimed", stale_holder=lockfile.read_text(encoding="utf-8", errors="replace").strip()
                           if lockfile.is_file() else "?")
             try:
@@ -206,8 +211,11 @@ def _advance(records: dict) -> bool:
         if verdict == "done":
             ops.move_card("dispatcher", ref, "Validate")
             # Keep the record; advance the baseline past this report so a CI-red return to
-            # In progress doesn't re-read the same done comment and bounce straight back.
+            # In progress doesn't re-read the same done comment and bounce straight back. Reset the
+            # stand retry budget: every (re)entry into Validate is a fresh code state — rework or a
+            # new push after a red stand run gets its own auto-retry, per _stand_gate's contract.
             rec["comment_baseline"] = len(ops.show_card(ref)["comments"])
+            rec["stand_fails"] = 0
             STATE.log_run("advance", reference=ref, to="Validate", reason="report:done")
             changed = True
         elif verdict == "blocked":
@@ -317,61 +325,92 @@ def _validate(records: dict) -> bool:
           Blocks;
       no PR link in the report / gh down -> card untouched, a warn line in runs.jsonl (a flaky
       gh must not bounce a card or ping a human).
-    Only Validate cards are looked at, so a tick with none never calls gh or the stand."""
+    Only Validate cards are looked at, so a tick with none never calls gh or the stand. Each card
+    is driven in its own try/except (like _bring_up): a failure on one card — an unparseable base
+    workspace.toml, a stand host crash — is localized to a warn + a one-time comment, so the tick
+    keeps advancing the other Validate cards and the claim step still runs."""
     changed = False
     for card in ops.list_cards(column="Validate"):
-        ref = card["reference"]
-        rec = records.get(ref)
-        view = ops.show_card(ref)
-        pr = _pr_url(view)
-        if not pr:
-            STATE.log_run("validate", reference=ref, result="no-pr-ref", level="warn")
-            continue
-        status = worker.poll_pr(pr)
-        if status is None:
-            STATE.log_run("validate", reference=ref, result="gh-unavailable", pr=pr, level="warn")
-            continue
-
-        if status["merged"]:
-            ops.move_card("dispatcher", ref, "Done")
-            records.pop(ref, None)          # session over; drop the workspace bookkeeping
-            STATE.log_run("validate", reference=ref, to="Done", pr=pr)
-            changed = True
-        elif status["rollup"] == "FAILURE":
-            job = status.get("failed_job") or "?"
-            tail = worker.scrub_secrets(status.get("failed_log") or "(лог недоступен)")
-            comment = (f"CI красный: джоба «{job}» упала. Хвост лога:\n```\n{tail}\n```\n"
-                       f"Карточка возвращена в In progress на доработку. PR: {pr}")
-            ops.add_comment("dispatcher", ref, comment, marker=model.MARKER_VALIDATE_RED)
-            ops.move_card("dispatcher", ref, model.IN_PROGRESS)
-            if rec is not None:
-                # Baseline past the red comment so the stale done report isn't re-read as a new one,
-                # and restart the watchdog clock — the worker is only now handed work again. The
-                # stand fail-count resets too: rework is a fresh code state, its own retry budget.
-                rec["comment_baseline"] = len(ops.show_card(ref)["comments"])
-                rec["last_activity"] = time.time()
-                rec["stand_fails"] = 0
-                worker.notify(rec.get("handle", ""),
-                              f"CI по {pr} красный — джоба «{job}» упала, карточка вернулась в "
-                              f"In progress. Разбор в комментарии карточки, почини и снова report done.")
-            STATE.log_run("validate", reference=ref, to=model.IN_PROGRESS, reason="ci-red",
-                          job=job, pr=pr)
-            changed = True
-        elif status["rollup"] == "SUCCESS":
-            stand_cfg = worker.read_stand_config(card.get("project") or "")
-            if stand_cfg is None:
-                # No stand: layer 1 green is the pre-merge verdict (unchanged behaviour).
-                if not _has_marker(view, model.MARKER_VALIDATE_GREEN):
-                    ops.add_comment("dispatcher", ref,
-                                    f"CI зелёный по {pr}. Слой 1 пройден, ждёт ручного мержа vladmesh.",
-                                    marker=model.MARKER_VALIDATE_GREEN)
-                    STATE.log_run("validate", reference=ref, result="ci-green", pr=pr)
-            elif not _has_marker(view, model.MARKER_STAND_GREEN):
-                # Stand project: layer 1 green is not enough — gate on a green stand run.
-                changed = _stand_gate(ref, pr, card, stand_cfg, records, view) or changed
-        else:
-            STATE.log_run("validate", reference=ref, result=f"ci-{status['rollup'].lower()}", pr=pr)
+        try:
+            changed = _validate_card(card, records) or changed
+        except Exception as e:  # noqa: BLE001 — one bad card must not abort the whole tick
+            _validate_error(card["reference"], e)
     return changed
+
+
+def _validate_card(card: dict, records: dict) -> bool:
+    """Drive one Validate card by its PR (and, for stand projects, the stand). Returns whether
+    `records` changed. Raises only on an unexpected failure, which _validate localizes."""
+    ref = card["reference"]
+    rec = records.get(ref)
+    view = ops.show_card(ref)
+    pr = _pr_url(view)
+    if not pr:
+        STATE.log_run("validate", reference=ref, result="no-pr-ref", level="warn")
+        return False
+    status = worker.poll_pr(pr)
+    if status is None:
+        STATE.log_run("validate", reference=ref, result="gh-unavailable", pr=pr, level="warn")
+        return False
+
+    if status["merged"]:
+        ops.move_card("dispatcher", ref, "Done")
+        records.pop(ref, None)              # session over; drop the workspace bookkeeping
+        STATE.log_run("validate", reference=ref, to="Done", pr=pr)
+        return True
+    if status["rollup"] == "FAILURE":
+        job = status.get("failed_job") or "?"
+        tail = worker.scrub_secrets(status.get("failed_log") or "(лог недоступен)")
+        comment = (f"CI красный: джоба «{job}» упала. Хвост лога:\n```\n{tail}\n```\n"
+                   f"Карточка возвращена в In progress на доработку. PR: {pr}")
+        ops.add_comment("dispatcher", ref, comment, marker=model.MARKER_VALIDATE_RED)
+        ops.move_card("dispatcher", ref, model.IN_PROGRESS)
+        if rec is not None:
+            # Baseline past the red comment so the stale done report isn't re-read as a new one,
+            # and restart the watchdog clock — the worker is only now handed work again. The stand
+            # fail-count resets too: rework is a fresh code state, its own retry budget.
+            rec["comment_baseline"] = len(ops.show_card(ref)["comments"])
+            rec["last_activity"] = time.time()
+            rec["stand_fails"] = 0
+            worker.notify(rec.get("handle", ""),
+                          f"CI по {pr} красный — джоба «{job}» упала, карточка вернулась в "
+                          f"In progress. Разбор в комментарии карточки, почини и снова report done.")
+        STATE.log_run("validate", reference=ref, to=model.IN_PROGRESS, reason="ci-red", job=job, pr=pr)
+        return True
+    if status["rollup"] == "SUCCESS":
+        stand_cfg = worker.read_stand_config(card.get("project") or "")
+        if stand_cfg is None:
+            # No stand: layer 1 green is the pre-merge verdict (unchanged behaviour).
+            if not _has_marker(view, model.MARKER_VALIDATE_GREEN):
+                ops.add_comment("dispatcher", ref,
+                                f"CI зелёный по {pr}. Слой 1 пройден, ждёт ручного мержа vladmesh.",
+                                marker=model.MARKER_VALIDATE_GREEN)
+                STATE.log_run("validate", reference=ref, result="ci-green", pr=pr)
+            return False
+        if not _has_marker(view, model.MARKER_STAND_GREEN):
+            # Stand project: layer 1 green is not enough — gate on a green stand run.
+            return _stand_gate(ref, pr, card, stand_cfg, records, view)
+        return False
+    STATE.log_run("validate", reference=ref, result=f"ci-{status['rollup'].lower()}", pr=pr)
+    return False
+
+
+def _validate_error(ref: str, exc: Exception) -> None:
+    """Localize a per-card validate failure: a warn line, plus one scrubbed comment on the card
+    (guarded so repeated failing ticks don't spam it). Best-effort — if even commenting fails, the
+    warn line is the record and the tick moves on."""
+    STATE.log_run("validate", reference=ref, result="error", level="warn",
+                  error=worker.scrub_secrets(str(exc)))
+    try:
+        if not _has_marker(ops.show_card(ref), model.MARKER_VALIDATE_ERROR):
+            ops.add_comment("dispatcher", ref,
+                            "Слой 2 (Validate) не смог отработать по этой карточке: "
+                            + worker.scrub_secrets(str(exc))
+                            + ". Тик продолжает остальные карточки; нужна ручная проверка "
+                              "манифеста/окружения проекта.",
+                            marker=model.MARKER_VALIDATE_ERROR)
+    except Exception:  # noqa: BLE001 — commenting is best-effort; never re-raise from here
+        pass
 
 
 def _task_md(card: dict, spec: str) -> str:

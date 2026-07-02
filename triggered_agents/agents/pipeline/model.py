@@ -70,6 +70,9 @@ MARKER_VALIDATE_RED = "validate:ci-red"
 # failed run; two consecutive stand failures send the card to Blocked (one auto-retry).
 MARKER_STAND_GREEN = "validate:stand-green"
 MARKER_STAND_RED = "validate:stand-red"
+# Posted once when validating a single card blows up unexpectedly (e.g. a base workspace.toml that
+# won't parse). The failure is localized to that card — the tick keeps going for the others.
+MARKER_VALIDATE_ERROR = "validate:error"
 
 
 class GuardError(RuntimeError):

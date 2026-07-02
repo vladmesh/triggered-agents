@@ -14,6 +14,12 @@ The stand config is the `[stand]` section of the project's committed `workspace.
 the base repo (not the PR worktree) so a PR cannot rewrite its own gate. Absent section -> the
 project has no layer 2 and `read_config` returns None. Required keys: `namespace`, `compose`
 (list, relative to the repo root), `e2e_command`. Everything else has a default.
+
+Trust boundary: the compose files and e2e script that run here come from the PR checkout and
+execute on the host with the dispatcher's full environment. The pipeline assumes the PR author is
+trusted (the same person who could push to the repo); this is not a sandbox and does not defend
+against a hostile PR. That assumption is fine for a single-maintainer pipeline and must be
+revisited before opening the board to untrusted contributors.
 """
 from __future__ import annotations
 
@@ -49,7 +55,12 @@ def read_config(repo_root: Path) -> dict | None:
     manifest = repo_root / "workspace.toml"
     if not manifest.is_file():
         return None
-    cfg = tomllib.loads(manifest.read_text(encoding="utf-8"))
+    try:
+        cfg = tomllib.loads(manifest.read_text(encoding="utf-8"))
+    except (tomllib.TOMLDecodeError, OSError) as e:
+        # A broken base manifest must be a localized, visible failure on the card, not a crash
+        # that takes the whole dispatcher tick down with it (the caller catches StandError).
+        raise StandError(f"{manifest} is not readable/valid TOML: {e}") from e
     stand = cfg.get("stand")
     return stand if isinstance(stand, dict) and stand else None
 
@@ -77,6 +88,11 @@ def _run(cmd: list[str], *, cwd: Path | None = None, env: dict | None = None,
     except subprocess.TimeoutExpired as e:
         out = (e.stdout or "") + (e.stderr or "") if isinstance(e.stdout, str) else ""
         return 124, out + f"\n[stand] `{' '.join(cmd)}` timed out after {timeout}s"
+    except OSError as e:
+        # docker/git missing from PATH, daemon socket gone, bad cwd — a real red run, not a
+        # silent no-op. Must not raise: run()'s `finally: down` calls _run too, and an escaping
+        # OSError would bubble past it and be swallowed upstream as "unavailable" (infinite retry).
+        return 127, f"[stand] `{' '.join(cmd)}` could not run: {e}"
     return p.returncode, (p.stdout or "") + (p.stderr or "")
 
 
