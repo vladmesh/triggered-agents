@@ -142,12 +142,46 @@ def create_workspace(project: str, name: str, base_branch: str) -> str:
     return path
 
 
+def _worktree_holding(repo_workspace: str, branch: str) -> str | None:
+    """Path of another worktree of the same repo currently checked out on `branch`, via `git
+    worktree list --porcelain`, or None if `branch` is free (or held only by `repo_workspace`
+    itself). A stale ref from an earlier bring-up on the same card/PR is otherwise indistinguishable
+    from a live one — this is how `_claim_branch` tells them apart."""
+    out = _git_ok(repo_workspace, ["worktree", "list", "--porcelain"])
+    me = str(Path(repo_workspace).resolve())
+    path = None
+    for line in out.splitlines():
+        if line.startswith("worktree "):
+            path = line[len("worktree "):]
+        elif line == f"branch refs/heads/{branch}" and path and str(Path(path).resolve()) != me:
+            return path
+    return None
+
+
+def _claim_branch(workspace: str, branch: str) -> None:
+    """Make `workspace` the sole holder of `branch` (git branch -M), freeing it first from
+    wherever an earlier bring-up on the same card/PR left it: a Blocked worker's worktree left
+    alive for a human, or a reviewer branch that outlived its own worktree's teardown (worktree
+    removal drops the checkout, not the ref). Origin is the pipeline's sync point — every actor's
+    Done/verdict is already there before this ever runs — so reclaiming a stale local worktree
+    loses nothing the pipeline promises to keep. The stale worktree goes through the normal
+    teardown path (stop terminals, orca rm, rm -rf/sudo fallback), not a raw `git worktree
+    remove`, so orca's own bookkeeping never points at a directory that's quietly gone; `worktree
+    prune` after clears the now-stale administrative entry so the rename below never trips over
+    it. A plain `-m` fails outright the moment `branch` already exists at all (even unheld) — `-M`
+    is what makes the second and later bring-up on the same ref/PR idempotent."""
+    other = _worktree_holding(workspace, branch)
+    if other:
+        teardown(other)
+        _git_ok(workspace, ["worktree", "prune"])
+    _git_ok(workspace, ["branch", "-M", branch])
+
+
 def set_branch(workspace: str, branch: str) -> None:
-    """Rename the worktree's freshly created branch to `branch` (git branch -m) before any head
-    starts — every actor lands on its own named ref (`pipeline/<ref>`, `review/<ref>`), never
-    whatever name `orca worktree create` happened to pick, so no head ever has to create or
-    rename its own branch."""
-    _git_ok(workspace, ["branch", "-m", branch])
+    """Land the worktree on `branch` (see `_claim_branch`) before any head starts — every actor
+    gets its own named ref (`pipeline/<ref>`, `review/<ref>`), never whatever name `orca worktree
+    create` happened to pick, so no head ever has to create or rename its own branch."""
+    _claim_branch(workspace, branch)
 
 
 def land_pr_head(workspace: str, pr_branch: str, review_branch: str) -> None:
@@ -158,7 +192,7 @@ def land_pr_head(workspace: str, pr_branch: str, review_branch: str) -> None:
     worker's live worktree still sitting on that exact branch."""
     _git_ok(workspace, ["fetch", "origin", pr_branch])
     _git_ok(workspace, ["reset", "--hard", "FETCH_HEAD"])
-    _git_ok(workspace, ["branch", "-m", review_branch])
+    _claim_branch(workspace, review_branch)
 
 
 def provision(workspace: str) -> tuple[bool, str]:

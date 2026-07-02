@@ -56,6 +56,12 @@ class GitHygieneTest(unittest.TestCase):
         p.start()
         self.addCleanup(p.stop)
 
+        # _claim_branch's fallback path (stale worktree still holding the branch) goes through
+        # the real worker.teardown, which refuses any path outside WORKSPACES_ROOT.
+        wr = mock.patch.object(worker, "WORKSPACES_ROOT", root)
+        wr.start()
+        self.addCleanup(wr.stop)
+
         self.worktrees = []
 
         def fake_orca_json(args):
@@ -77,14 +83,14 @@ class GitHygieneTest(unittest.TestCase):
         self.addCleanup(oj.stop)
 
     def _push_new_commit_on(self, branch, content):
-        tmp_co = Path(self.tmp.name) / f"push-{branch.replace('/', '-')}"
+        tmp_co = Path(tempfile.mkdtemp(dir=self.tmp.name, prefix=f"push-{branch.replace('/', '-')}-"))
         subprocess.run(["git", "clone", "-q", str(self.bare), str(tmp_co)], check=True)
         for cmd in (["config", "user.email", "t@t"], ["config", "user.name", "t"]):
             _git(tmp_co, *cmd)
         _git(tmp_co, "checkout", "-q", "-B", branch)
         (tmp_co / "f.txt").write_text(content)
         _git(tmp_co, "commit", "-q", "-am", content)
-        _git(tmp_co, "push", "-q", "origin", branch)
+        _git(tmp_co, "push", "-q", "-f", "origin", branch)
 
     def test_create_workspace_builds_off_freshly_fetched_origin_base(self):
         # A commit lands on origin's main *after* the checkout was cloned — create_workspace must
@@ -105,6 +111,52 @@ class GitHygieneTest(unittest.TestCase):
         worker.land_pr_head(ws, "pipeline/triggered-agents-220", "review/triggered-agents-220")
         self.assertEqual(_current_branch(ws), "review/triggered-agents-220")
         self.assertEqual((Path(ws) / "f.txt").read_text(), "worker-content")
+
+    def _no_real_orca(self, real_run):
+        """subprocess.run stand-in for tests that exercise worker.teardown for real: orca calls
+        (there is no live orca/daemon in a unit test) report failure so teardown falls through to
+        its real `rm -rf` fallback; every other command (git, rm) runs for real."""
+        def fake_run(args, **kw):
+            if args[:1] == [worker.ORCA]:
+                return subprocess.CompletedProcess(args, 1, "", "no orca in test")
+            return real_run(args, **kw)
+        return fake_run
+
+    def test_repeated_reviewer_spawn_reuses_the_review_branch(self):
+        # Blocker A (review triggered-agents-220): a red verdict tears down the reviewer worktree
+        # via worker.teardown, which drops the checkout but not the `review/<ref>` ref itself. The
+        # *next* review spawn must still be able to claim that same branch name, not fail with
+        # "a branch named ... already exists".
+        self._push_new_commit_on("pipeline/triggered-agents-220", "v1-worker-content")
+        real_run = subprocess.run
+        with mock.patch("subprocess.run", side_effect=self._no_real_orca(real_run)):
+            ws1 = worker.create_workspace("proj", "rev1", "main")
+            worker.land_pr_head(ws1, "pipeline/triggered-agents-220", "review/triggered-agents-220")
+            worker.teardown(ws1)   # red verdict -> _clear_review tears the reviewer worktree down
+        self.assertFalse(Path(ws1).exists())
+
+        self._push_new_commit_on("pipeline/triggered-agents-220", "v2-after-fix")
+        ws2 = worker.create_workspace("proj", "rev2", "main")
+        worker.land_pr_head(ws2, "pipeline/triggered-agents-220", "review/triggered-agents-220")
+        self.assertEqual(_current_branch(ws2), "review/triggered-agents-220")
+        self.assertEqual((Path(ws2) / "f.txt").read_text(), "v2-after-fix")
+
+    def test_reclaim_frees_the_branch_from_a_still_alive_old_worktree(self):
+        # Blocker B (worker triggered-agents-220): a Blocked card's worktree is deliberately left
+        # alive for a human. When vladmesh moves the card back to Ready, bring-up creates a BRAND
+        # NEW worktree (naming.dedupe) and must still land it on `pipeline/<ref>` even though the
+        # old, still-alive worktree is sitting on that exact branch right now.
+        real_run = subprocess.run
+        with mock.patch("subprocess.run", side_effect=self._no_real_orca(real_run)):
+            old_ws = worker.create_workspace("proj", "w1", "main")
+            worker.set_branch(old_ws, "pipeline/triggered-agents-220")
+            self.assertTrue(Path(old_ws).exists())   # never torn down while Blocked
+
+            new_ws = worker.create_workspace("proj", "w1-2", "main")
+            worker.set_branch(new_ws, "pipeline/triggered-agents-220")   # must not raise
+
+        self.assertFalse(Path(old_ws).exists())   # reclaimed via the normal teardown path
+        self.assertEqual(_current_branch(new_ws), "pipeline/triggered-agents-220")
 
     def test_land_pr_head_never_checks_out_the_pr_branch_name_itself(self):
         # The bug this replaces: `gh pr checkout` names the local branch after the PR's own head,

@@ -1367,7 +1367,7 @@ class WorkerHostCallsTest(unittest.TestCase):
                                        "pipeline/proj-1", "review/proj-1")
         ws, args = self.git_calls[-1]
         self.assertEqual(ws, "/ws/fresh")
-        self.assertEqual(args, ["branch", "-m", "review/proj-1"])
+        self.assertEqual(args, ["branch", "-M", "review/proj-1"])
         self.assertIn(["fetch", "origin", "pipeline/proj-1"], [a for _, a in self.git_calls])
         self.assertIn(["reset", "--hard", "FETCH_HEAD"], [a for _, a in self.git_calls])
         self.assertFalse(any("push" in args for _, args in self.git_calls))
