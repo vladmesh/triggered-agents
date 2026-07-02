@@ -450,6 +450,15 @@ class ValidateTest(_DispatcherBase):
         self.assertIn(self.PR, self.worker.polled)
         self.assertTrue(any(r["event"] == "validate" and r.get("to") == "Done" for r in self._runs()))
 
+    def test_merged_pr_tears_down_worker_workspace(self):
+        # Done for a card must not leave its worker workspace/head behind — same tick tears it down.
+        ref = self._to_validate()
+        ws = dispatcher._load_cards()[ref]["workspace"]
+        self.worker.pr_status = {"merged": True, "state": "MERGED", "rollup": "SUCCESS",
+                                 "failed_job": None, "failed_log": None}
+        dispatcher.tick()
+        self.assertEqual(self.worker.torn_down, [ws])
+
     def test_red_ci_returns_to_in_progress_notifies_and_scrubs(self):
         ref = self._to_validate()
         self.worker.pr_status = {
@@ -1034,6 +1043,101 @@ class WorkerHostCallsTest(unittest.TestCase):
             with self.assertRaises(self.worker.WorkspaceError):
                 self.worker.spawn_reviewer("proj", "rev-1", "main", "REVIEW body")
         self.assertEqual(torn, ["/ws/rev"])
+
+
+class TeardownTest(unittest.TestCase):
+    """worker.teardown(): guard the path before any rm runs, stop terminals before the worktree
+    goes away, and log a sudo-fallback trip (should stay silent after the personal_site PR#24
+    non-root fix — a trip here is the signal root-owned grief is back)."""
+
+    def setUp(self):
+        from triggered_agents.agents.pipeline import worker
+        self.worker = worker
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = (Path(self.tmp.name) / "workspaces").resolve()
+        self.root.mkdir()
+        self._patch_root = mock.patch.object(worker, "WORKSPACES_ROOT", self.root)
+        self._patch_root.start()
+        self.addCleanup(self._patch_root.stop)
+        self.calls = []
+
+    def _ws(self, name="proj/worker-1"):
+        ws = self.root / name
+        ws.mkdir(parents=True)
+        return ws
+
+    def test_refuses_path_outside_root(self):
+        outside = Path(self.tmp.name) / "elsewhere"
+        outside.mkdir()
+        with mock.patch("subprocess.run") as run:
+            with self.assertRaises(self.worker.WorkspaceError):
+                self.worker.teardown(str(outside))
+            run.assert_not_called()          # guard fires before any orca/rm call
+        self.assertTrue(outside.exists())    # nothing was touched
+
+    def test_stops_terminals_before_worktree_rm(self):
+        import subprocess
+        import shutil
+
+        ws = self._ws()
+
+        def fake_run(args, **kw):
+            self.calls.append(args)
+            if args[:2] == [self.worker.ORCA, "worktree"]:
+                shutil.rmtree(ws, ignore_errors=True)
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        with mock.patch("subprocess.run", side_effect=fake_run):
+            self.worker.teardown(str(ws))
+        self.assertEqual(self.calls[0][:3], [self.worker.ORCA, "terminal", "stop"])
+        self.assertEqual(self.calls[1][:2], [self.worker.ORCA, "worktree"])
+        self.assertFalse(ws.exists())
+
+    def test_sudo_fallback_is_logged(self):
+        import json
+        import subprocess
+
+        ws = self._ws()
+        state_dir = Path(self.tmp.name) / "state"
+
+        def fake_run(args, **kw):
+            self.calls.append(args)
+            if args[:2] == [self.worker.ORCA, "worktree"]:
+                return subprocess.CompletedProcess(args, 1, "", "denied")   # orca rm fails
+            if args[:2] == ["rm", "-rf"]:
+                return subprocess.CompletedProcess(args, 1, "", "denied")   # plain rm fails too
+            if args[:1] == ["sudo"]:
+                import shutil
+                shutil.rmtree(ws, ignore_errors=True)
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        with mock.patch.object(self.worker.STATE, "dir", state_dir), \
+             mock.patch("subprocess.run", side_effect=fake_run):
+            self.worker.teardown(str(ws))
+
+        runs = [json.loads(line) for line in (state_dir / "runs.jsonl").read_text().splitlines()]
+        self.assertTrue(any(r["event"] == "teardown-sudo-fallback" and r.get("workspace") == str(ws)
+                            for r in runs))
+        self.assertTrue(any(a[:1] == ["sudo"] for a in self.calls))
+
+    def test_clean_removal_does_not_trip_sudo_fallback(self):
+        import subprocess
+        import shutil
+
+        ws = self._ws()
+        state_dir = Path(self.tmp.name) / "state"
+
+        def fake_run(args, **kw):
+            self.calls.append(args)
+            if args[:2] == [self.worker.ORCA, "worktree"]:
+                shutil.rmtree(ws, ignore_errors=True)
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        with mock.patch.object(self.worker.STATE, "dir", state_dir), \
+             mock.patch("subprocess.run", side_effect=fake_run):
+            self.worker.teardown(str(ws))
+        self.assertFalse((state_dir / "runs.jsonl").exists())
 
 
 if __name__ == "__main__":

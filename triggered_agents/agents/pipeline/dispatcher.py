@@ -20,7 +20,8 @@ Per-tick order:
                 layers are green -> layer 3: spawn an independent reviewer head (not the worker,
                 no code access), read its verdict (green -> waits for merge; red -> back to
                 In progress with a nudge, capped returns then Blocked). PR merged (by a human) ->
-                Done, record dropped. gh unavailable or no PR link -> card untouched, a warn line.
+                worker workspace torn down (terminals stopped, worktree removed), Done, record
+                dropped. gh unavailable or no PR link -> card untouched, a warn line.
   3. claim    — top Ready card by position; claim through ops (its guards run), create the Orca
                 worktree off base_branch, run setup+smoke; smoke fail -> Blocked with the log and
                 no head; success -> drop TASK.md and launch the worker head. One claim per tick.
@@ -338,7 +339,7 @@ def _stand_gate(ref: str, pr: str, card: dict, cfg: dict, records: dict, view: d
 def _validate(records: dict) -> bool:
     """Drive each Validate card by its PR (zero LLM). Merge stays a human action; the dispatcher
     only reacts to what gh and the stand report:
-      merged  -> Done, record dropped (the worker session is over);
+      merged  -> worker workspace torn down, Done, record dropped (the worker session is over);
       CI red  -> back to In progress with a scrubbed comment + a nudge to the live worker;
       CI green (layer 1):
         - project without a [stand] section: a one-time verdict comment, waiting for merge;
@@ -378,6 +379,8 @@ def _validate_card(card: dict, records: dict) -> bool:
     if status["merged"]:
         if rec is not None:
             _clear_review(rec)              # drop any in-flight reviewer worktree
+            if rec.get("workspace"):
+                worker.teardown(rec["workspace"])  # stop its terminals, remove the worktree
         ops.move_card("dispatcher", ref, "Done")
         records.pop(ref, None)              # session over; drop the workspace bookkeeping
         STATE.log_run("validate", reference=ref, to="Done", pr=pr)
