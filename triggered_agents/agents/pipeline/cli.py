@@ -185,9 +185,9 @@ def main(argv=None) -> int:
             # The reviewer's one code-creation exception: findings out of the card's scope go to
             # Идеи (never Ready) so they enter the queue only via a human, not the reviewer.
             desc = _text_arg(args.description, args.description_file)
-            return _emit(ops.create_card(
+            return _emit(ops.reviewer_idea(
                 project=args.project, task_type=args.task_type, title=args.title,
-                description=desc, ref=args.ref, column="Идеи", model_name=args.model_name))
+                description=desc, ref=args.ref, model_name=args.model_name))
         if args.cmd == "comment":
             if not _need_role(role, ROLES):
                 return 2

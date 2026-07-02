@@ -81,6 +81,10 @@ MARKER_STAND_RED = "validate:stand-red"
 # with a nudge, up to a cap of returns (then Blocked до vladmesh).
 MARKER_REVIEW_GREEN = "review:green"
 MARKER_REVIEW_RED = "review:red"
+# The dispatcher's own note when a red verdict sends a card back for rework. Deliberately NOT a
+# review:* marker: the invariant "only the reviewer posts a verdict" must not hinge on baseline
+# arithmetic — if this carried [review:red] and any baseline shift re-read it, the card would loop.
+MARKER_REVIEW_RETURN = "validate:review-return"
 # Posted once when validating a single card blows up unexpectedly (e.g. a base workspace.toml that
 # won't parse). The failure is localized to that card — the tick keeps going for the others.
 MARKER_VALIDATE_ERROR = "validate:error"

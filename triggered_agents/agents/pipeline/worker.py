@@ -61,7 +61,13 @@ def scrub_secrets(text: str) -> str:
 def _orca_json(args: list[str]) -> dict:
     import json
 
-    p = subprocess.run([ORCA, *args, "--json"], capture_output=True, text=True, timeout=ORCA_TIMEOUT_S)
+    try:
+        p = subprocess.run([ORCA, *args, "--json"], capture_output=True, text=True, timeout=ORCA_TIMEOUT_S)
+    except subprocess.TimeoutExpired as e:
+        # A hung orca must surface as a WorkspaceError (the module's spawn-failure contract), not a
+        # raw TimeoutExpired that escapes create_workspace/launch_worker/spawn_reviewer and lands in
+        # the caller's generic error path with a misleading message.
+        raise WorkspaceError(f"orca {' '.join(args)} timed out after {ORCA_TIMEOUT_S}s") from e
     if p.returncode != 0:
         raise WorkspaceError(f"orca {' '.join(args)} failed: {(p.stderr or p.stdout).strip()}")
     data = json.loads(p.stdout)
@@ -205,12 +211,20 @@ def spawn_reviewer(project: str, worker_id: str, base_branch: str, review_md: st
     reviewer only reads code and drives gh/board-CLI, so it needs no app deps. Returns
     (workspace, terminal handle)."""
     ws = create_workspace(project, worker_id, base_branch)
-    _write_excluded(ws, "REVIEW.md", review_md)
-    ensure_trust(ws)
-    ensure_theme()
-    data = _orca_json(["terminal", "create", "--worktree", f"path:{ws}",
-                       "--title", f"Claude reviewer {worker_id}",
-                       "--command", _reviewer_command(worker_id)])
+    try:
+        _write_excluded(ws, "REVIEW.md", review_md)
+        ensure_trust(ws)
+        ensure_theme()
+        data = _orca_json(["terminal", "create", "--worktree", f"path:{ws}",
+                           "--title", f"Claude reviewer {worker_id}",
+                           "--command", _reviewer_command(worker_id)])
+    except Exception as e:
+        teardown(ws)   # the worktree already exists; don't leave an orphan on a failed launch
+        # Normalize to WorkspaceError so every bring-up failure (orca error/timeout, an OSError from
+        # writing REVIEW.md) reaches the dispatcher's single spawn-failure path and its retry cap.
+        if isinstance(e, WorkspaceError):
+            raise
+        raise WorkspaceError(f"reviewer head bring-up failed: {e}") from e
     term = data.get("terminal", data)
     return ws, (term.get("handle") or term.get("id") or "")
 

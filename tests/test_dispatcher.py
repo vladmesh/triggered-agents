@@ -798,6 +798,30 @@ class ValidateReviewTest(_DispatcherBase):
         self.assertEqual(len(self.worker.reviewer_spawns), 1)
         self.assertIn("review_baseline", dispatcher._load_cards()[ref])
 
+    def test_red_return_note_uses_dedicated_marker_not_review_red(self):
+        # The dispatcher's own return note must not carry [review:red] — only the reviewer's verdict
+        # does, else a baseline shift would re-read the note as a fresh red and loop.
+        ref = self._spawned()
+        ops.verdict(ref, "red", "блокер: X")
+        dispatcher.tick()
+        markers = self._markers(ref)
+        self.assertEqual(markers.count(f"[{model.MARKER_REVIEW_RED}]"), 1)   # just the verdict
+        self.assertIn(f"[{model.MARKER_REVIEW_RETURN}]", markers)             # dispatcher's own note
+
+    def test_spawn_cap_blocks_after_repeated_failures(self):
+        ref = self._to_validate()
+        self._ci_green()
+        self.worker.reviewer_raises = worker.WorkspaceError("orca terminal create failed")
+        for i in range(dispatcher.REVIEW_SPAWN_ATTEMPTS - 1):
+            dispatcher.tick()
+            self.assertEqual(self._column(ref), "Validate")
+            self.assertEqual(dispatcher._load_cards()[ref]["review_spawn_fails"], i + 1)
+        dispatcher.tick()                                       # the attempt that hits the cap
+        self.assertEqual(self._column(ref), "Blocked")
+        self.assertNotIn(ref, dispatcher._load_cards())
+        self.assertTrue(any(r["event"] == "review" and r.get("reason") == "spawn-cap"
+                            for r in self._runs()))
+
     def test_merge_during_review_tears_down_and_done(self):
         ref = self._spawned()
         self.worker.pr_status = {"merged": True, "state": "MERGED", "rollup": "SUCCESS",
@@ -805,6 +829,36 @@ class ValidateReviewTest(_DispatcherBase):
         dispatcher.tick()
         self.assertEqual(self._column(ref), "Done")
         self.assertEqual(len(self._rev_ws_torndown()), 1)
+
+    def test_spawn_persists_record_before_tick_ends(self):
+        # A crash after the reviewer is up (but before the end-of-tick save) must still find the
+        # baseline on disk, or the next tick spawns a second reviewer on the same PR.
+        ref = self._to_validate()
+        self._ci_green()
+
+        def claim_then_die(records):
+            raise KeyboardInterrupt("die after validate spawned the reviewer")
+
+        with mock.patch.object(dispatcher, "_claim_next", claim_then_die):
+            with self.assertRaises(KeyboardInterrupt):
+                dispatcher.tick()
+        self.assertIn("review_baseline", dispatcher._load_cards()[ref])
+
+    def test_reconcile_adopts_validate_card_and_reviews(self):
+        # cards.json lost (a dispatcher redeploy): a claimed Validate card with no record must be
+        # adopted so layer 3 still runs, not left waiting for a review that never spawns.
+        self.board.add_task("V", "Validate", swimlane="personal_site",
+                            meta={model.META_TASK_TYPE: "code", model.META_PROJECT: "personal_site",
+                                  model.META_CLAIM: "w-old"})
+        ref = self._ref_of("V")
+        ops.add_comment("po", ref, f"PR: {self.PR}")
+        self._ci_green()
+        self.assertEqual(dispatcher._load_cards(), {})
+        dispatcher.tick()
+        self.assertIn(ref, dispatcher._load_cards())
+        self.assertEqual(len(self.worker.reviewer_spawns), 1)
+        self.assertTrue(any(r["event"] == "reconcile" and r.get("column") == "Validate"
+                            for r in self._runs()))
 
     def test_untracked_validate_card_skipped_with_warn(self):
         self.board.add_task("U", "Validate", swimlane="personal_site",
@@ -817,6 +871,19 @@ class ValidateReviewTest(_DispatcherBase):
         self.assertEqual(self.worker.reviewer_spawns, [])
         self.assertTrue(any(r["event"] == "review" and r.get("result") == "untracked"
                             for r in self._runs()))
+
+
+class OrcaJsonTimeoutTest(unittest.TestCase):
+    """A hung orca CLI must surface as WorkspaceError (worker's spawn-failure contract), not a raw
+    TimeoutExpired that escapes create_workspace/launch_worker/spawn_reviewer and lands in the
+    caller's generic error path with a misleading message."""
+
+    def test_timeout_becomes_workspace_error(self):
+        import subprocess
+        with mock.patch("subprocess.run",
+                        side_effect=subprocess.TimeoutExpired(cmd="orca", timeout=1)):
+            with self.assertRaises(worker.WorkspaceError):
+                worker._orca_json(["terminal", "list"])
 
 
 class ProjectRootTest(unittest.TestCase):
@@ -949,6 +1016,24 @@ class WorkerHostCallsTest(unittest.TestCase):
         self.worker.launch_worker("/ws/fresh", None, "worker-1")
         self.assertEqual(self.ensured, ["ensure_trust", "ensure_theme"])
         self.assertEqual(self.calls[0][0], "terminal")
+
+    def test_spawn_reviewer_tears_down_worktree_on_launch_failure(self):
+        # The worktree is created first; if the head fails to launch after that, the worktree must
+        # not be left orphaned on disk.
+        torn = []
+
+        def orca_raise_on_terminal(args):
+            self.calls.append(args)
+            if args[0] == "worktree":
+                return {"worktree": {"path": "/ws/rev"}}
+            raise self.worker.WorkspaceError("terminal create boom")
+
+        with mock.patch.object(self.worker, "_orca_json", orca_raise_on_terminal), \
+             mock.patch.object(self.worker, "_write_excluded", lambda *a: "/ws/rev/REVIEW.md"), \
+             mock.patch.object(self.worker, "teardown", lambda ws: torn.append(ws)):
+            with self.assertRaises(self.worker.WorkspaceError):
+                self.worker.spawn_reviewer("proj", "rev-1", "main", "REVIEW body")
+        self.assertEqual(torn, ["/ws/rev"])
 
 
 if __name__ == "__main__":

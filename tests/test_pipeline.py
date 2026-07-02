@@ -407,6 +407,29 @@ class TestVerdict(PatchedBoardTest):
         posted = board.method_calls("createComment")
         self.assertTrue(posted[0]["content"].startswith(f"[{model.MARKER_REVIEW_RED}]"))
 
+    def test_verdict_body_is_scrubbed(self):
+        board = self.make_board()
+        ref = board.add_task("A", "Validate")
+        ops.verdict(ref, "red", "нашёл в логе KANBOARD_API_TOKEN=supersecretvalue123 — утечка")
+        posted = board.method_calls("createComment")
+        self.assertNotIn("supersecretvalue123", posted[0]["content"])
+
+
+class TestReviewerIdea(PatchedBoardTest):
+    def test_creates_card_in_ideas(self):
+        board = self.make_board()
+        out = ops.reviewer_idea("personal_site", "pre-existing долг в X", "детали")
+        self.assertEqual(out["column"], "Идеи")
+
+    def test_title_and_description_scrubbed(self):
+        board = self.make_board()
+        ops.reviewer_idea("personal_site", "секрет API_TOKEN=supersecretvalue123 в конфиге",
+                          "тело: KANBOARD_SECRET=anothersecretvalue999")
+        created = board.method_calls("createTask")
+        blob = created[0]["title"] + created[0].get("description", "")
+        self.assertNotIn("supersecretvalue123", blob)
+        self.assertNotIn("anothersecretvalue999", blob)
+
 
 class TestReviewerRole(unittest.TestCase):
     """Role guards for the layer-3 reviewer at the CLI seam: it may post a verdict and file Идеи
@@ -416,7 +439,7 @@ class TestReviewerRole(unittest.TestCase):
         from triggered_agents.agents.pipeline import cli
         self.cli = cli
         self.calls = []
-        for name in ("verdict", "create_card", "move_card", "claim_card", "report"):
+        for name in ("verdict", "reviewer_idea", "claim_card", "report"):
             p = mock.patch(f"triggered_agents.agents.pipeline.ops.{name}",
                            lambda *a, n=name, **k: self.calls.append((n, a, k)) or {"ok": n})
             p.start()
@@ -431,12 +454,12 @@ class TestReviewerRole(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(self.calls[0][0], "verdict")
 
-    def test_reviewer_idea_forces_ideas_column(self):
+    def test_reviewer_idea_routes_to_reviewer_idea_op(self):
         rc = self._run(["--role", "reviewer", "idea", "--project", "p", "--title", "t",
                         "--description", "d"])
         self.assertEqual(rc, 0)
-        self.assertEqual(self.calls[0][0], "create_card")
-        self.assertEqual(self.calls[0][2]["column"], "Идеи")
+        self.assertEqual(self.calls[0][0], "reviewer_idea")
+        self.assertEqual(self.calls[0][2]["project"], "p")
 
     def test_worker_cannot_verdict(self):
         rc = self._run(["--role", "worker", "verdict", "--ref", "R", "--kind", "green"])

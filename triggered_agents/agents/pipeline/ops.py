@@ -20,7 +20,7 @@ import os
 
 from ...runtime.state import AgentState
 from ..board.kanboard import KanboardError, call
-from . import model
+from . import model, worker
 
 STATE = AgentState("pipeline")
 
@@ -258,16 +258,27 @@ def report(reference: str, kind: str, body: str = "") -> dict:
 def verdict(reference: str, kind: str, body: str = "") -> dict:
     """Reviewer-only: post the layer-3 verdict as `[review:green]`/`[review:red]`. A red verdict
     needs a body (the blocker findings) — the dispatcher returns the card on red, so an empty red
-    would send a card back with nothing to fix."""
+    would send a card back with nothing to fix. The body is scrubbed: the reviewer hunts for secret
+    leaks and may quote one, so its own comment must not become the leak."""
     if kind not in ("green", "red"):
         raise model.GuardError(f"verdict kind must be 'green' or 'red', not {kind!r}")
     if kind == "red" and not body.strip():
         raise model.GuardError("a red verdict requires a non-empty body (the blocker findings)")
     marker = model.MARKER_REVIEW_GREEN if kind == "green" else model.MARKER_REVIEW_RED
-    out = add_comment("reviewer", reference, body, marker=marker)
+    out = add_comment("reviewer", reference, worker.scrub_secrets(body), marker=marker)
     out["action"] = "verdict"
     out["kind"] = kind
     return out
+
+
+def reviewer_idea(project: str, title: str, description: str = "", task_type: str = "code",
+                  ref: str | None = None, model_name: str | None = None) -> dict:
+    """Reviewer-only: file an out-of-scope finding as an Идеи card (the reviewer's single
+    code-creation exception). Title and description are scrubbed for the same reason as a verdict."""
+    return create_card(project=project, task_type=task_type,
+                       title=worker.scrub_secrets(title),
+                       description=worker.scrub_secrets(description),
+                       ref=ref, column="Идеи", model_name=model_name)
 
 
 def feedback(reference: str, body: str) -> dict:
