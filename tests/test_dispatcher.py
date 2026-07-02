@@ -40,6 +40,10 @@ class FakeWorker:
         self.pr_status = None            # dict returned by poll_pr, or None for gh-unavailable
         self.polled = []                 # PR urls poll_pr was asked about
         self.notified = []               # (handle, text) nudges sent to worker terminals
+        self.stand_config = None         # dict from read_stand_config, or None for no-stand project
+        self.stand_branch = "pipeline/x"  # branch pr_branch returns (None -> gh can't answer)
+        self.stand_result = None         # dict from run_stand, or None for unavailable
+        self.stand_runs = []             # (project, branch) each run_stand was asked about
         self._n = 0
 
     def read_base_branch(self, project):
@@ -73,6 +77,16 @@ class FakeWorker:
         self.notified.append((handle, text))
         return bool(handle)
 
+    def read_stand_config(self, project):
+        return self.stand_config
+
+    def pr_branch(self, pr_url):
+        return self.stand_branch
+
+    def run_stand(self, project, branch, cfg):
+        self.stand_runs.append((project, branch))
+        return self.stand_result
+
     def teardown(self, workspace):
         self.torn_down.append(workspace)
 
@@ -89,7 +103,8 @@ class _DispatcherBase(unittest.TestCase):
 
         self.worker = FakeWorker()
         for name in ("read_base_branch", "create_workspace", "provision", "write_task",
-                     "launch_worker", "activity", "poll_pr", "notify", "teardown"):
+                     "launch_worker", "activity", "poll_pr", "notify", "teardown",
+                     "read_stand_config", "pr_branch", "run_stand"):
             wp = mock.patch(f"triggered_agents.agents.pipeline.worker.{name}",
                             getattr(self.worker, name))
             wp.start()
@@ -470,6 +485,142 @@ class ValidateTest(_DispatcherBase):
         self.assertIn(ref, dispatcher._load_cards())
         self.assertTrue(any(r["event"] == "validate" and r.get("result") == "gh-unavailable"
                             and r.get("level") == "warn" for r in self._runs()))
+
+
+class ValidateStandTest(_DispatcherBase):
+    """Validate layer 2: for a project with a [stand] manifest section, CI green is not enough —
+    the dispatcher deploys the PR branch to the stand (worker.run_stand, stubbed) and gates on a
+    green e2e run. Green comes only after a green stand run; a red run retries once then Blocks."""
+
+    PR = "https://github.com/vladmesh/personal_site/pull/42"
+    STAND = {"namespace": "personal_site_stand", "compose": ["infra/docker-compose.stand.yml"],
+             "e2e_command": "bash infra/e2e/run.sh"}
+
+    def setUp(self):
+        super().setUp()
+        self.worker.stand_config = self.STAND        # every card here is a stand project
+        self.worker.stand_branch = "pipeline/A"
+
+    def _markers(self, ref):
+        tid = next(t["id"] for t in self.board.tasks.values() if t["reference"] == ref)
+        return " ".join(c["comment"] for c in self.board.comments.get(tid, []))
+
+    def _to_validate(self, pr=PR):
+        ref = self._claim_one()
+        ops.report(ref, "done", f"готово\nPR: {pr}")
+        self.worker.pr_status = None
+        dispatcher.tick()
+        self.assertEqual(self._column(ref), "Validate")
+        return ref
+
+    def _ci_green(self):
+        self.worker.pr_status = {"merged": False, "state": "OPEN", "rollup": "SUCCESS",
+                                 "failed_job": None, "failed_log": None}
+
+    def test_ci_green_runs_stand_not_ci_green_verdict(self):
+        ref = self._to_validate()
+        self._ci_green()
+        self.worker.stand_result = {"ok": True, "stage": "e2e", "log": "e2e: all checks passed"}
+        dispatcher.tick()
+        self.assertEqual(self._column(ref), "Validate")
+        self.assertEqual(self.worker.stand_runs, [("personal_site", "pipeline/A")])
+        journal = self._markers(ref)
+        self.assertIn(f"[{model.MARKER_STAND_GREEN}]", journal)
+        self.assertNotIn(f"[{model.MARKER_VALIDATE_GREEN}]", journal)   # green only via the stand
+        self.assertTrue(any(r["event"] == "stand" and r.get("result") == "green" for r in self._runs()))
+
+    def test_stand_green_is_posted_once_and_not_rerun(self):
+        ref = self._to_validate()
+        self._ci_green()
+        self.worker.stand_result = {"ok": True, "stage": "e2e", "log": "ok"}
+        dispatcher.tick()
+        dispatcher.tick()                        # already stand-green -> must not run the stand again
+        self.assertEqual(len(self.worker.stand_runs), 1)
+        self.assertEqual(self._markers(ref).count(f"[{model.MARKER_STAND_GREEN}]"), 1)
+
+    def test_stand_red_once_retries_stays_in_validate(self):
+        ref = self._to_validate()
+        self._ci_green()
+        self.worker.stand_result = {"ok": False, "stage": "e2e",
+                                    "log": "FAIL: backend health\nleaked TOKEN=supersecretvalue123"}
+        dispatcher.tick()
+        self.assertEqual(self._column(ref), "Validate")           # one auto-retry, not blocked yet
+        journal = self._markers(ref)
+        self.assertIn(f"[{model.MARKER_STAND_RED}]", journal)
+        self.assertNotIn("supersecretvalue123", journal)          # scrubbed before posting
+        self.assertEqual(dispatcher._load_cards()[ref]["stand_fails"], 1)
+
+    def test_stand_red_twice_blocks_with_log(self):
+        ref = self._to_validate()
+        self._ci_green()
+        self.worker.stand_result = {"ok": False, "stage": "e2e", "log": "boom"}
+        dispatcher.tick()                                          # fail 1 -> retry
+        self.assertEqual(self._column(ref), "Validate")
+        dispatcher.tick()                                          # fail 2 -> Blocked
+        self.assertEqual(self._column(ref), "Blocked")
+        self.assertNotIn(ref, dispatcher._load_cards())
+        self.assertEqual(self._markers(ref).count(f"[{model.MARKER_STAND_RED}]"), 2)
+        self.assertTrue(any(r["event"] == "stand" and r.get("to") == "Blocked" for r in self._runs()))
+
+    def test_stand_green_then_merge_to_done(self):
+        ref = self._to_validate()
+        self._ci_green()
+        self.worker.stand_result = {"ok": True, "stage": "e2e", "log": "ok"}
+        dispatcher.tick()
+        self.worker.pr_status = {"merged": True, "state": "MERGED", "rollup": "SUCCESS",
+                                 "failed_job": None, "failed_log": None}
+        dispatcher.tick()
+        self.assertEqual(self._column(ref), "Done")
+
+    def test_pr_branch_unknown_warns_without_running_stand(self):
+        ref = self._to_validate()
+        self._ci_green()
+        self.worker.stand_branch = None                           # gh can't resolve the branch
+        dispatcher.tick()
+        self.assertEqual(self.worker.stand_runs, [])
+        self.assertEqual(self._column(ref), "Validate")
+        self.assertTrue(any(r["event"] == "stand" and r.get("result") == "no-branch" for r in self._runs()))
+
+    def test_stand_unavailable_warns_without_verdict(self):
+        ref = self._to_validate()
+        self._ci_green()
+        self.worker.stand_result = None                           # host/stand infra unknown
+        dispatcher.tick()
+        self.assertEqual(self._column(ref), "Validate")
+        self.assertNotIn(f"[{model.MARKER_STAND_GREEN}]", self._markers(ref))
+        self.assertTrue(any(r["event"] == "stand" and r.get("result") == "unavailable"
+                            for r in self._runs()))
+
+    def test_ci_red_resets_stand_retry_budget(self):
+        ref = self._to_validate()
+        self._ci_green()
+        self.worker.stand_result = {"ok": False, "stage": "e2e", "log": "boom"}
+        dispatcher.tick()                                         # stand fail 1
+        self.assertEqual(dispatcher._load_cards()[ref]["stand_fails"], 1)
+        # CI goes red -> card bounces to In progress; the stand fail-count must reset.
+        self.worker.pr_status = {"merged": False, "state": "OPEN", "rollup": "FAILURE",
+                                 "failed_job": "CI", "failed_log": "red"}
+        dispatcher.tick()
+        self.assertEqual(self._column(ref), model.IN_PROGRESS)
+        self.assertEqual(dispatcher._load_cards()[ref]["stand_fails"], 0)
+        # rework, back to Validate, CI green again, stand fails once more -> still just a retry.
+        ops.report(ref, "done", "починил")
+        self.worker.pr_status = None
+        dispatcher.tick()
+        self.assertEqual(self._column(ref), "Validate")
+        self._ci_green()
+        dispatcher.tick()
+        self.assertEqual(self._column(ref), "Validate")           # first fail of the reworked PR
+        self.assertEqual(dispatcher._load_cards()[ref]["stand_fails"], 1)
+
+    def test_no_stand_project_keeps_layer1_green(self):
+        # A project without a stand section must behave exactly as before: CI green -> ci-green.
+        self.worker.stand_config = None
+        ref = self._to_validate()
+        self._ci_green()
+        dispatcher.tick()
+        self.assertEqual(self.worker.stand_runs, [])
+        self.assertIn(f"[{model.MARKER_VALIDATE_GREEN}]", self._markers(ref))
 
 
 class ProjectRootTest(unittest.TestCase):

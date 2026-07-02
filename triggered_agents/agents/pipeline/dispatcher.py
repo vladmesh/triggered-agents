@@ -14,9 +14,11 @@ Per-tick order:
                 its record: the worker session lives on for CI rework.
   2. validate — for each Validate card, poll its PR through gh (worker.poll_pr, the only gh
                 touch; a tick with no Validate card never calls it). CI red -> back to In progress
-                with a scrubbed comment and a nudge to the live worker; CI green -> a one-time
-                verdict comment; PR merged (by a human) -> Done, record dropped. gh unavailable
-                or no PR link in the report -> card untouched, a warn line in runs.jsonl.
+                with a scrubbed comment and a nudge to the live worker; CI green -> layer 2 for
+                projects with a [stand] manifest section (deploy the PR branch to the stand + e2e,
+                green only after a green run, one auto-retry then Blocked), or a one-time verdict
+                comment for projects without a stand; PR merged (by a human) -> Done, record
+                dropped. gh unavailable or no PR link in the report -> card untouched, a warn line.
   3. claim    — top Ready card by position; claim through ops (its guards run), create the Orca
                 worktree off base_branch, run setup+smoke; smoke fail -> Blocked with the log and
                 no head; success -> drop TASK.md and launch the worker head. One claim per tick.
@@ -246,15 +248,76 @@ def _has_marker(view: dict, marker: str) -> bool:
     return any(f"[{marker}]" in c.get("text", "") for c in view["comments"])
 
 
+def _count_marker(view: dict, marker: str) -> int:
+    return sum(1 for c in view["comments"] if f"[{marker}]" in c.get("text", ""))
+
+
+def _stand_gate(ref: str, pr: str, card: dict, cfg: dict, records: dict, view: dict) -> bool:
+    """Validate layer 2 for a card whose CI (layer 1) is green: deploy the PR branch to the
+    project's stand and run e2e. Green -> a one-time stand-green verdict (the pre-merge signal for
+    stand projects; the card only becomes 'waiting for merge' now, so green comes only after a
+    green stand run). Red -> a scrubbed stand-red comment; two consecutive stand failures send the
+    card to Blocked (one auto-retry). Returns whether `records` changed. A run only fires when
+    there is no stand-green yet, so a passed layer 2 never re-runs the expensive stand.
+
+    The consecutive-fail count lives in the card record (reset when the card (re)enters Validate
+    and on a CI-red bounce). When the record is missing (an untracked Validate card), it falls
+    back to counting stand-red comments on the board, so the auto-retry still holds."""
+    rec = records.get(ref)
+    branch = worker.pr_branch(pr)
+    if not branch:
+        STATE.log_run("stand", reference=ref, result="no-branch", pr=pr, level="warn")
+        return False
+    result = worker.run_stand(card.get("project") or "", branch, cfg)
+    if result is None:                       # host/stand infra unknown — retry next tick, no verdict
+        STATE.log_run("stand", reference=ref, result="unavailable", pr=pr, branch=branch, level="warn")
+        return False
+
+    if result["ok"]:
+        ops.add_comment("dispatcher", ref,
+                        f"Стенд + e2e зелёные по ветке `{branch}` ({pr}). Слои 1-2 пройдены, "
+                        f"ждёт ручного мержа vladmesh.",
+                        marker=model.MARKER_STAND_GREEN)
+        STATE.log_run("stand", reference=ref, result="green", pr=pr, branch=branch)
+        return False
+
+    stage = result.get("stage") or "e2e"
+    tail = worker.scrub_secrets(result.get("log") or "(лог недоступен)")
+    prior = rec.get("stand_fails", 0) if rec is not None else _count_marker(view, model.MARKER_STAND_RED)
+    fails = prior + 1
+    last = fails >= 2
+    ops.add_comment("dispatcher", ref,
+                    f"Стенд красный на этапе «{stage}» (ветка `{branch}`, {pr}). "
+                    + ("Второй фейл подряд — карточка в Blocked." if last
+                       else "Один авторетрай на следующем тике.")
+                    + f"\nХвост лога:\n```\n{tail}\n```",
+                    marker=model.MARKER_STAND_RED)
+    if last:
+        ops.move_card("dispatcher", ref, "Blocked")
+        records.pop(ref, None)
+        STATE.log_run("stand", reference=ref, to="Blocked", reason="stand-red", stage=stage,
+                      fails=fails, pr=pr, branch=branch)
+        return True
+    if rec is not None:
+        rec["stand_fails"] = fails
+    STATE.log_run("stand", reference=ref, result="stand-red-retry", stage=stage, fails=fails,
+                  pr=pr, branch=branch)
+    return rec is not None
+
+
 def _validate(records: dict) -> bool:
-    """Drive each Validate card by its PR through gh (Validate layer 1, zero LLM). Merge stays a
-    human action; the dispatcher only reacts to what gh reports:
+    """Drive each Validate card by its PR (zero LLM). Merge stays a human action; the dispatcher
+    only reacts to what gh and the stand report:
       merged  -> Done, record dropped (the worker session is over);
       CI red  -> back to In progress with a scrubbed comment + a nudge to the live worker;
-      CI green-> a one-time verdict comment (repeat green ticks don't re-post);
+      CI green (layer 1):
+        - project without a [stand] section: a one-time verdict comment, waiting for merge;
+        - project with a stand: run layer 2 (_stand_gate) — deploy the PR branch to the stand and
+          run e2e; only a green stand run posts the pre-merge verdict, a red one retries once then
+          Blocks;
       no PR link in the report / gh down -> card untouched, a warn line in runs.jsonl (a flaky
       gh must not bounce a card or ping a human).
-    Only Validate cards are looked at, so a tick with none never calls gh."""
+    Only Validate cards are looked at, so a tick with none never calls gh or the stand."""
     changed = False
     for card in ops.list_cards(column="Validate"):
         ref = card["reference"]
@@ -283,9 +346,11 @@ def _validate(records: dict) -> bool:
             ops.move_card("dispatcher", ref, model.IN_PROGRESS)
             if rec is not None:
                 # Baseline past the red comment so the stale done report isn't re-read as a new one,
-                # and restart the watchdog clock — the worker is only now handed work again.
+                # and restart the watchdog clock — the worker is only now handed work again. The
+                # stand fail-count resets too: rework is a fresh code state, its own retry budget.
                 rec["comment_baseline"] = len(ops.show_card(ref)["comments"])
                 rec["last_activity"] = time.time()
+                rec["stand_fails"] = 0
                 worker.notify(rec.get("handle", ""),
                               f"CI по {pr} красный — джоба «{job}» упала, карточка вернулась в "
                               f"In progress. Разбор в комментарии карточки, почини и снова report done.")
@@ -293,11 +358,17 @@ def _validate(records: dict) -> bool:
                           job=job, pr=pr)
             changed = True
         elif status["rollup"] == "SUCCESS":
-            if not _has_marker(view, model.MARKER_VALIDATE_GREEN):
-                ops.add_comment("dispatcher", ref,
-                                f"CI зелёный по {pr}. Слой 1 пройден, ждёт ручного мержа vladmesh.",
-                                marker=model.MARKER_VALIDATE_GREEN)
-                STATE.log_run("validate", reference=ref, result="ci-green", pr=pr)
+            stand_cfg = worker.read_stand_config(card.get("project") or "")
+            if stand_cfg is None:
+                # No stand: layer 1 green is the pre-merge verdict (unchanged behaviour).
+                if not _has_marker(view, model.MARKER_VALIDATE_GREEN):
+                    ops.add_comment("dispatcher", ref,
+                                    f"CI зелёный по {pr}. Слой 1 пройден, ждёт ручного мержа vladmesh.",
+                                    marker=model.MARKER_VALIDATE_GREEN)
+                    STATE.log_run("validate", reference=ref, result="ci-green", pr=pr)
+            elif not _has_marker(view, model.MARKER_STAND_GREEN):
+                # Stand project: layer 1 green is not enough — gate on a green stand run.
+                changed = _stand_gate(ref, pr, card, stand_cfg, records, view) or changed
         else:
             STATE.log_run("validate", reference=ref, result=f"ci-{status['rollup'].lower()}", pr=pr)
     return changed
