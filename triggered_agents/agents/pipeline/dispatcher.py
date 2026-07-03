@@ -42,7 +42,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from ...runtime.state import AgentState
-from . import model, naming, ops, validate, worker
+from . import health, heads, model, naming, ops, validate, worker
 # Re-exported so dispatcher.<NAME> keeps resolving for existing callers/tests — validate.py owns
 # these now (its layer-3 rework/spawn/stall caps), dispatcher just orchestrates the tick.
 from .validate import REVIEW_RETURN_CAP, REVIEW_SPAWN_ATTEMPTS, VALIDATE_STALL_ATTEMPTS  # noqa: F401
@@ -197,8 +197,15 @@ def precheck() -> int:
     tell a live-but-idle dispatcher from one that stopped ticking. Cheap: one board list, before
     any task workspace/head is touched — _ff_agent_worktrees is the one exception, a best-effort
     side step against the agents' own worktrees (never a task workspace) that runs first and can
-    never affect the return value below."""
+    never affect the return value below. health.refresh is the same kind of best-effort side
+    step: it re-probes any resource whose TTL lapsed and logs a red<->green flip; a broken
+    heads.toml must not crash precheck over this, so a raise here is caught and logged same as a
+    bad ff-agents worktree."""
     _ff_agent_worktrees()
+    try:
+        health.refresh()
+    except Exception as e:  # noqa: BLE001 — must never break precheck's own board check
+        STATE.log_run("head-health", result="error", level="warn", error=worker.scrub_secrets(str(e)))
     try:
         cards = ops.list_cards()
     except Exception as e:  # noqa: BLE001 — any precheck failure must be logged, not just KanboardError
@@ -275,12 +282,20 @@ def _reconcile(records: dict) -> bool:
     return changed
 
 
-def _advance(records: dict) -> bool:
+def _advance(records: dict, statuses: dict[str, str]) -> bool:
     """Move each tracked In-progress card by its worker's report or the watchdog. Returns whether
     `records` changed. A card that reaches Validate keeps its record — the worker session lives on
     for CI rework, and validate.run needs the terminal handle to nudge it. Records for cards
     sitting in Validate are left to validate.run; records whose card has left both columns are
-    dropped."""
+    dropped.
+
+    `statuses` (this tick's resource health, from health.refresh) freezes the watchdog clock for a
+    card whose head sits on a red resource: silence explained by "the subscription/key is down
+    right now" must not read as "this head died" (2026-07-03 incident — a 5h subscription limit
+    silenced a live head and the watchdog blocked its card before a human could react). Frozen
+    means last_activity keeps sliding to now every tick the resource stays red, so once it turns
+    green again the card gets a full fresh WATCHDOG_SECONDS window rather than an instantly-expired
+    one."""
     by_ref = {c["reference"]: c for c in ops.list_cards()}
     changed = False
     for ref, rec in list(records.items()):
@@ -323,6 +338,11 @@ def _advance(records: dict) -> bool:
             if last:
                 rec["last_activity"] = last
                 changed = True
+            resource = health.resource_of(rec["head"]) if rec.get("head") else None
+            if resource and statuses.get(resource) == health.RED:
+                rec["last_activity"] = time.time()
+                changed = True
+                continue
             silent = time.time() - rec.get("last_activity", rec.get("claimed_at", time.time()))
             if silent > WATCHDOG_SECONDS:
                 ws_note = (f"воркспейс {rec['workspace']} оставлен для разбора"
@@ -472,12 +492,16 @@ def _block(ref: str, reason: str, body: str, **log_fields) -> None:
     STATE.log_run("bringup", reference=ref, to="Blocked", reason=reason, **log_fields)
 
 
-def _bring_up(card: dict, worker_id: str, records: dict) -> None:
+def _bring_up(card: dict, worker_id: str, records: dict, head: str) -> None:
     """After a successful claim: worktree, setup+smoke, then the worker head — or Blocked on any
     failure. The claim already persists on the board, so nothing here may escape as a traceback:
     an unhandled error would leave the card In progress but invisible to _advance/watchdog.
     Records are saved as soon as the head is up, shrinking the crash window claim->save (the
-    remainder is covered by _reconcile)."""
+    remainder is covered by _reconcile).
+
+    `head` is the profile _claim_next already resolved through health.resolve_head — it may be a
+    fallback, not card's own metadata head, so it's recorded verbatim (not re-derived from the
+    card) both for the launch and for _advance's later watchdog-freeze lookup."""
     ref = card["reference"]
     project = card.get("project") or ""
     ws = None
@@ -493,7 +517,7 @@ def _bring_up(card: dict, worker_id: str, records: dict) -> None:
         view = ops.show_card(ref)
         worker.write_task(ws, _task_md(card, view))
         title = naming.worker_title(naming.card_id(ref), card.get("title") or ref)
-        handle = worker.launch_worker(ws, card.get("head") or None, worker_id, title)
+        handle = worker.launch_worker(ws, head, worker_id, title)
     except Exception as e:
         stage = "workspace-create" if ws is None else "launch"
         _block(ref, stage, f"bring-up упал ({stage}): {e}" + (f"\nВоркспейс {ws} оставлен." if ws else ""),
@@ -505,23 +529,41 @@ def _bring_up(card: dict, worker_id: str, records: dict) -> None:
         "worker": worker_id,
         "handle": handle,
         "title": title,
+        "head": head,
         "claimed_at": now,
         "last_activity": now,
         "comment_baseline": len(view["comments"]),
     }
     _save_cards(records)
-    STATE.log_run("bringup", reference=ref, to="In progress", workspace=ws,
-                  head=card.get("head") or "default")
+    STATE.log_run("bringup", reference=ref, to="In progress", workspace=ws, head=head)
 
 
-def _claim_next(records: dict) -> None:
+def _claim_next(records: dict, statuses: dict[str, str]) -> None:
     """Claim the top eligible Ready card and bring up its worker. One per tick. A per-card guard
-    (blocked_by, one-code-per-project) skips that card and tries the next; the global cap stops
-    the tick."""
+    (blocked_by, one-code-per-project, or its whole head+fallback chain sitting on red resources)
+    skips that card and tries the next; the global cap stops the tick.
+
+    The head actually launched is resolved here, once, through health.resolve_head against this
+    tick's `statuses` — the card's own `head` metadata is only ever the *preference*, never
+    rewritten: once the preferred resource turns green again, the very next claim of a fresh card
+    with that head goes back to using it. An unknown/stale preferred head is left to
+    ops.claim_card's own guard below (its message names the bad id) rather than folded into the
+    red-resource skip reason, which would otherwise misreport a bad profile as a red one."""
     ready = ops.list_cards(column="Ready")
     ready.sort(key=lambda c: (c["position"], c["id"]))
     for card in ready:
         ref = card["reference"]
+        preferred = card.get("head") or heads.DEFAULT_PROFILE
+        try:
+            heads.load_registry().profile(preferred)
+        except heads.HeadRegistryError:
+            resolved = preferred
+        else:
+            resolved = health.resolve_head(preferred, statuses)
+            if resolved is None:
+                STATE.log_run("claim-skip", reference=ref,
+                              reason=f"head {preferred!r} and its whole fallback chain are on red resources")
+                continue
         worker_id = _worker_id(card)
         try:
             ops.claim_card(ref, worker_id, cap=WORKER_CAP)
@@ -530,7 +572,7 @@ def _claim_next(records: dict) -> None:
             if "cap reached" in str(e):
                 return
             continue
-        _bring_up(card, worker_id, records)
+        _bring_up(card, worker_id, records, resolved)
         return
     STATE.log_run("tick", result="no-claimable-ready")
 
@@ -538,11 +580,16 @@ def _claim_next(records: dict) -> None:
 def tick() -> int:
     with _tick_lock():
         records = _load_cards()
+        try:
+            statuses = health.refresh()
+        except Exception as e:  # noqa: BLE001 — a broken heads.toml must not stall the whole tick
+            STATE.log_run("head-health", result="error", level="warn", error=worker.scrub_secrets(str(e)))
+            statuses = {}
         changed = _reconcile(records)
-        changed = _advance(records) or changed
+        changed = _advance(records, statuses) or changed
         changed = validate.run(records, WATCHDOG_SECONDS, _save_cards) or changed
         before = json.dumps(records, sort_keys=True)
-        _claim_next(records)
+        _claim_next(records, statuses)
         if changed or json.dumps(records, sort_keys=True) != before:
             _save_cards(records)
     return 0

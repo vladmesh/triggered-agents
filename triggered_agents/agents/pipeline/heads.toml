@@ -1,9 +1,11 @@
 # Head registry — a worker/reviewer head is data here, not the hardcoded `claude` binary in
 # worker.py. A resource is a shared account/limit a head draws from (probe is a health-check
-# command for that resource; a stub "true" until the health-probe card wires it up for real). A
-# profile names its resource, an adapter (which render_<adapter> in heads.py turns role+prompt
-# into a launch command), and an ordered fallback chain of other profile ids (unused until the
-# retry card; the data shape exists now so that card is a pure consumer, no registry rework).
+# command for that resource, run on a TTL by pipeline/health.py — red lives on the resource, every
+# profile drawing from it inherits that redness). A profile names its resource, an adapter (which
+# render_<adapter> in heads.py turns role+prompt into a launch command), and an ordered fallback
+# chain of other profile ids health.resolve_head walks at claim time when the preferred profile's
+# resource is red (the data shape existed before the walk did, so this card is a pure consumer, no
+# registry rework).
 #
 # Adding a head (Codex, another Hermes model, ...) is a new [profiles.<id>] entry here plus, only
 # if its launch shape is genuinely new, one more render_<adapter> function in heads.py — the
@@ -11,15 +13,19 @@
 
 [resources.claude-sub]
 # The shared Claude subscription every claude-* profile below draws from — one account, no
-# per-profile credential.
+# per-profile credential. Probe: one real haiku token through the shared OAuth-authenticated
+# `claude` CLI (health.probe_claude_sub) — red exactly during a subscription rate-limit or an API
+# outage, free the rest of the time (once per health.PROBE_TTL_S, not per tick).
 account = "claude-subscription"
-probe = "true"
+probe = "python3 -m triggered_agents pipeline probe --resource claude-sub"
 
 [resources.openrouter]
 # Pay-per-token OpenRouter credit (key: project_inspect/.env open_router_key). Debug-only resource
-# — see hermes-flash below, no prod profile falls back onto it.
+# — see hermes-flash below, no prod profile falls back onto it. Probe: one real 1-token chat
+# completion against gemini-flash (health.probe_openrouter) — red on a missing key, a non-2xx
+# response, or a timeout.
 account = "openrouter-pooled-key"
-probe = "true"
+probe = "python3 -m triggered_agents pipeline probe --resource openrouter"
 
 [profiles.claude-sonnet]
 resource = "claude-sub"
