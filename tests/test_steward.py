@@ -311,6 +311,17 @@ class CliTest(StewardTestBase):
         self.board.add_task("A", "Blocked", meta={"project": "personal_site"})
         self.assertEqual(cli.cmd_precheck(), 0)
 
+    # Kanboard недоступен/битый env: исход error, rc=2 отличимый и от dispatch(0), и от skip(1)
+    def test_precheck_error_when_scan_raises(self):
+        with mock.patch.object(signals, "scan", side_effect=RuntimeError("connection refused")):
+            rc = cli.cmd_precheck()
+        self.assertEqual(rc, 2)
+        self.assertNotIn(rc, (0, 1))
+        runs = [json.loads(l) for l in (cli.STATE.dir / "runs.jsonl").read_text().splitlines()]
+        precheck_runs = [r for r in runs if r["event"] == "precheck"]
+        self.assertTrue(any(r.get("result") == "error" and r.get("error_class") == "RuntimeError"
+                             for r in precheck_runs))
+
     def test_advance_without_scan_first_fails(self):
         self.assertEqual(cli.cmd_advance(), 1)
 
