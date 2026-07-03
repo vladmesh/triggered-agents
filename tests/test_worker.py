@@ -425,5 +425,98 @@ class ScrubSecretsTest(unittest.TestCase):
         self.assertIn("blob", out)
 
 
+class CloseOrphanTerminalsTest(unittest.TestCase):
+    """worker._close_orphan_terminals: `--activate` (create_workspace) leaves an empty default
+    shell tab behind in every fresh worktree (confirmed empirically on triggered-agents-247 —
+    `orca worktree create --agent claude` proved the only alternative, `--agent`, hardcodes its
+    own launch command and drops our `--model`/`BOARD_ROLE` env, so it can't replace our own
+    `terminal create`). launch_worker/spawn_reviewer call this right after creating their own
+    terminal to close everything else in the workspace — these tests exercise that logic directly
+    against a fake orca terminal list/close, no git, no real orca."""
+
+    def test_closes_every_handle_except_the_one_to_keep(self):
+        calls = []
+
+        def fake_orca_json(args):
+            if args[:2] == ["terminal", "list"]:
+                return {"terminals": [{"handle": "term-default"}, {"handle": "term-mine"}]}
+            if args[:2] == ["terminal", "close"]:
+                calls.append(args[args.index("--terminal") + 1])
+                return {"close": {"handle": args[args.index("--terminal") + 1]}}
+            raise AssertionError(f"unexpected orca call: {args}")
+
+        with mock.patch.object(worker, "_orca_json", fake_orca_json):
+            worker._close_orphan_terminals("/ws", "term-mine")
+
+        self.assertEqual(calls, ["term-default"])
+
+    def test_never_closes_the_kept_handle(self):
+        def fake_orca_json(args):
+            if args[:2] == ["terminal", "list"]:
+                return {"terminals": [{"handle": "only-mine"}]}
+            raise AssertionError(f"must not call close on the only, kept terminal: {args}")
+
+        with mock.patch.object(worker, "_orca_json", fake_orca_json):
+            worker._close_orphan_terminals("/ws", "only-mine")  # no close call, no raise
+
+    def test_listing_failure_is_swallowed(self):
+        def fake_orca_json(args):
+            raise worker.WorkspaceError("boom")
+
+        with mock.patch.object(worker, "_orca_json", fake_orca_json):
+            worker._close_orphan_terminals("/ws", "term-mine")  # must not raise
+
+    def test_one_orphans_close_failure_does_not_stop_the_others(self):
+        calls = []
+
+        def fake_orca_json(args):
+            if args[:2] == ["terminal", "list"]:
+                return {"terminals": [{"handle": "orphan-1"}, {"handle": "orphan-2"}, {"handle": "mine"}]}
+            if args[:2] == ["terminal", "close"]:
+                handle = args[args.index("--terminal") + 1]
+                calls.append(handle)
+                if handle == "orphan-1":
+                    raise worker.WorkspaceError("close failed")
+                return {"close": {"handle": handle}}
+            raise AssertionError(f"unexpected orca call: {args}")
+
+        with mock.patch.object(worker, "_orca_json", fake_orca_json):
+            worker._close_orphan_terminals("/ws", "mine")
+
+        self.assertEqual(calls, ["orphan-1", "orphan-2"])
+
+
+class LaunchWorkerClosesOrphanTest(unittest.TestCase):
+    """launch_worker must hand its own freshly created handle to _close_orphan_terminals as the
+    one to keep — not close its own head's terminal along with the leftover default shell."""
+
+    def test_launch_worker_closes_orphans_keeping_its_own_handle(self):
+        with mock.patch.object(worker, "ensure_trust"), \
+             mock.patch.object(worker, "ensure_theme"), \
+             mock.patch.object(worker, "_orca_json", return_value={"terminal": {"handle": "term-new"}}), \
+             mock.patch.object(worker, "_close_orphan_terminals") as close:
+            handle = worker.launch_worker("/ws", None, "w1", "title")
+        self.assertEqual(handle, "term-new")
+        close.assert_called_once_with("/ws", "term-new")
+
+
+class SpawnReviewerClosesOrphanTest(unittest.TestCase):
+    """Same contract as LaunchWorkerClosesOrphanTest, for the reviewer's own bring-up path."""
+
+    def test_spawn_reviewer_closes_orphans_keeping_its_own_handle(self):
+        with mock.patch.object(worker, "create_workspace", return_value="/ws"), \
+             mock.patch.object(worker, "land_pr_head"), \
+             mock.patch.object(worker, "_write_excluded"), \
+             mock.patch.object(worker, "ensure_trust"), \
+             mock.patch.object(worker, "ensure_theme"), \
+             mock.patch.object(worker, "_orca_json", return_value={"terminal": {"handle": "term-rev"}}), \
+             mock.patch.object(worker, "_close_orphan_terminals") as close:
+            ws, handle = worker.spawn_reviewer(
+                "proj", "rev1", "main", "REVIEW.md content", "title", "pr-branch", "review-branch")
+        self.assertEqual(ws, "/ws")
+        self.assertEqual(handle, "term-rev")
+        close.assert_called_once_with("/ws", "term-rev")
+
+
 if __name__ == "__main__":
     unittest.main()
