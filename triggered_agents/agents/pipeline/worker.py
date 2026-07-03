@@ -415,6 +415,37 @@ def ensure_theme() -> None:
         raise WorkspaceError(str(e)) from e
 
 
+def _close_orphan_terminals(workspace: str, keep_handle: str) -> None:
+    """Best-effort: close every terminal in `workspace` other than `keep_handle`. `create_workspace`'s
+    `--activate` makes Orca reveal the fresh worktree with an empty default shell tab already open
+    (confirmed empirically — orca has no `--activate --no-default-terminal` to suppress it, see
+    ~/projects/orca/PR-IDEAS.md); the head's own terminal, just created by launch_worker/
+    spawn_reviewer, then leaves that shell tab behind as a permanent orphan no head reads or closes
+    on its own. A listing/close failure is swallowed, same discipline as stop_terminals — a
+    leftover empty tab is cosmetic, not a bring-up blocker, so it must never fail the caller.
+
+    `keep_handle` empty (launch_worker/spawn_reviewer's `term.get("handle") or term.get("id") or
+    ""` fallback, for a create response that carried neither) must never fall through to "close
+    everything" — an empty string cannot equal any real handle in the loop below, so without this
+    guard the just-spawned head itself would be closed alongside the orphan shell (review verdict,
+    triggered-agents-247). Bailing out here is exactly the pre-fix behavior for that same
+    degenerate response: no orphan gets closed, but the head survives."""
+    if not keep_handle:
+        return
+    try:
+        data = _orca_json(["terminal", "list", "--worktree", f"path:{workspace}", "--limit", "50"])
+    except (WorkspaceError, subprocess.TimeoutExpired):
+        return
+    for t in data.get("terminals") or []:
+        handle = t.get("handle") or t.get("id")
+        if not handle or handle == keep_handle:
+            continue
+        try:
+            _orca_json(["terminal", "close", "--terminal", handle])
+        except (WorkspaceError, subprocess.TimeoutExpired):
+            pass
+
+
 def launch_worker(workspace: str, head: str | None, worker_id: str, title: str) -> str:
     """Spawn the worker head in the workspace; return the terminal handle. `title` seeds the
     tab's display name; the caller (dispatcher) pins it back every tick via rename_terminal since
@@ -425,7 +456,9 @@ def launch_worker(workspace: str, head: str | None, worker_id: str, title: str) 
                        "--title", title,
                        "--command", _launch_command(head, worker_id)])
     term = data.get("terminal", data)
-    return term.get("handle") or term.get("id") or ""
+    handle = term.get("handle") or term.get("id") or ""
+    _close_orphan_terminals(workspace, handle)
+    return handle
 
 
 def _reviewer_command(worker_id: str) -> str:
@@ -467,7 +500,9 @@ def spawn_reviewer(project: str, worker_id: str, base_branch: str, review_md: st
             raise
         raise WorkspaceError(f"reviewer head bring-up failed: {e}") from e
     term = data.get("terminal", data)
-    return ws, (term.get("handle") or term.get("id") or "")
+    handle = term.get("handle") or term.get("id") or ""
+    _close_orphan_terminals(ws, handle)
+    return ws, handle
 
 
 def activity(workspace: str) -> float | None:
