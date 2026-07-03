@@ -24,7 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))       # repo root
 
 from test_pipeline import FakeBoard  # noqa: E402
 
-from triggered_agents.agents.pipeline import dispatcher, model, ops, worker  # noqa: E402
+from triggered_agents.agents.pipeline import dispatcher, health, heads, model, ops, worker  # noqa: E402
 
 
 class FakeWorker:
@@ -166,6 +166,15 @@ class _DispatcherBase(unittest.TestCase):
             if f.exists():
                 f.unlink()
         self._orig_watchdog = dispatcher.WATCHDOG_SECONDS
+
+        # Resource health defaults to all-green (regular behavior, untouched by this card) unless
+        # a test mutates self.statuses — real probing (subprocess/network) never runs in a unit
+        # test. A test that needs a custom registry (fallback chains beyond claude-sonnet/opus'
+        # real empty ones) patches heads.load_registry separately.
+        self.statuses = {"claude-sub": "green", "openrouter": "green"}
+        hp = mock.patch.object(health, "refresh", lambda registry=None: dict(self.statuses))
+        hp.start()
+        self.addCleanup(hp.stop)
 
     def tearDown(self):
         dispatcher.WATCHDOG_SECONDS = self._orig_watchdog
@@ -506,8 +515,8 @@ class DispatcherTest(_DispatcherBase):
         ref = self._ready_card("A")
         orig = dispatcher._claim_next
 
-        def claim_then_die(records):
-            orig(records)
+        def claim_then_die(records, statuses):
+            orig(records, statuses)
             raise KeyboardInterrupt("kill right after bring-up")
 
         with mock.patch.object(dispatcher, "_claim_next", claim_then_die):
@@ -690,6 +699,119 @@ class DispatcherTest(_DispatcherBase):
         src = Path(dispatcher.__file__).read_text()
         self.assertNotIn("kanboard", src)
         self.assertNotIn("from ..board", src)
+
+
+class HeadHealthTest(_DispatcherBase):
+    """Per-resource health at claim time (fallback selection, full-chain skip) and watchdog
+    freeze/unfreeze for a head sitting on a red resource. self.statuses (from _DispatcherBase)
+    starts all-green; each test reddens exactly the resource(s) it needs."""
+
+    def _two_resource_registry(self):
+        # primary/secondary sit on genuinely different resources, mirroring the real registry's
+        # claude-sub/openrouter split — proves fallback selection isn't hardcoded to one resource.
+        return heads.Registry(
+            resources={"res-a": {"probe": "true"}, "res-b": {"probe": "true"}},
+            profiles={
+                "primary": {"resource": "res-a", "adapter": "claude", "fallback": ["secondary"]},
+                "secondary": {"resource": "res-b", "adapter": "claude", "fallback": []},
+            },
+        )
+
+    # claim-time fallback -----------------------------------------------------
+    def test_claim_uses_preferred_head_when_its_resource_is_green(self):
+        reg = self._two_resource_registry()
+        with mock.patch.object(heads, "load_registry", return_value=reg):
+            ref = self._ready_card("A", head="primary")
+            dispatcher.tick()
+        self.assertEqual(self._column(ref), model.IN_PROGRESS)
+        self.assertEqual(self.worker.launched[0]["head"], "primary")
+
+    def test_claim_falls_back_to_first_green_profile_in_chain(self):
+        reg = self._two_resource_registry()
+        self.statuses = {"res-a": "red", "res-b": "green"}
+        with mock.patch.object(heads, "load_registry", return_value=reg):
+            ref = self._ready_card("A", head="primary")
+            dispatcher.tick()
+        self.assertEqual(self._column(ref), model.IN_PROGRESS)
+        self.assertEqual(self.worker.launched[0]["head"], "secondary")
+        # the card's own metadata preference is untouched — once res-a is green again, a fresh
+        # claim of a card asking for "primary" goes back to using it.
+        self.assertEqual(ops.show_card(ref)["metadata"][model.META_HEAD], "primary")
+
+    def test_claim_skips_card_when_whole_fallback_chain_is_red(self):
+        reg = self._two_resource_registry()
+        self.statuses = {"res-a": "red", "res-b": "red"}
+        with mock.patch.object(heads, "load_registry", return_value=reg):
+            ref = self._ready_card("A", head="primary")
+            dispatcher.tick()
+        self.assertEqual(self._column(ref), "Ready")   # not Blocked — waits for a resource to recover
+        self.assertEqual(self.worker.launched, [])
+        runs = [r for r in self._runs() if r["event"] == "claim-skip"]
+        self.assertTrue(any(r.get("reference") == ref and "red" in r.get("reason", "") for r in runs))
+
+    def test_unknown_head_still_reports_its_own_guard_error_not_a_red_resource(self):
+        # An unknown/stale profile must not be misreported as "its resources are red" — the
+        # claim-skip reason has to name the actual problem, same as ops.claim_card always did.
+        ref = self._ready_card("A", head="codex-nope")
+        dispatcher.tick()
+        self.assertEqual(self._column(ref), "Ready")
+        runs = [r for r in self._runs() if r["event"] == "claim-skip" and r.get("reference") == ref]
+        self.assertTrue(runs)
+        self.assertIn("codex-nope", runs[0]["reason"])
+        self.assertNotIn("red", runs[0]["reason"])
+
+    def test_red_head_does_not_block_a_green_card_behind_it(self):
+        # Two Ready cards, first one's whole chain red: claim must skip it and still claim the
+        # second (mirrors test_claim_orders_by_position_and_skips_blocked_by), whose head sits on
+        # an unrelated, green resource.
+        reg = self._two_resource_registry()
+        reg.profiles["other"] = {"resource": "res-c", "adapter": "claude", "fallback": []}
+        reg.resources["res-c"] = {"probe": "true"}
+        self.statuses = {"res-a": "red", "res-b": "red", "res-c": "green"}
+        with mock.patch.object(heads, "load_registry", return_value=reg):
+            ref_a = self._ready_card("A", head="primary")
+            ref_b = self._ready_card("B", head="other")
+            for t in self.board.tasks.values():
+                if t["reference"] == ref_a:
+                    t["position"] = 1
+                elif t["reference"] == ref_b:
+                    t["position"] = 2
+            dispatcher.tick()
+        self.assertEqual(self._column(ref_a), "Ready")
+        self.assertEqual(self._column(ref_b), model.IN_PROGRESS)
+
+    # watchdog freeze -----------------------------------------------------------
+    def test_watchdog_frozen_while_head_resource_is_red(self):
+        ref = self._claim_one(head="claude-opus")   # real registry: resource claude-sub
+        dispatcher.WATCHDOG_SECONDS = -1
+        self.worker.activity_ts = None
+        self.statuses["claude-sub"] = "red"
+        dispatcher.tick()
+        self.assertEqual(self._column(ref), model.IN_PROGRESS)   # frozen, not Blocked
+        self.assertEqual(self.worker.torn_down, [])
+
+    def test_watchdog_resumes_once_resource_goes_green_again(self):
+        ref = self._claim_one(head="claude-opus")
+        dispatcher.WATCHDOG_SECONDS = -1
+        self.worker.activity_ts = None
+        self.statuses["claude-sub"] = "red"
+        dispatcher.tick()
+        self.assertEqual(self._column(ref), model.IN_PROGRESS)   # still frozen
+        self.statuses["claude-sub"] = "green"
+        dispatcher.tick()   # clock resumes counting from "now" (the last frozen tick), still silent
+        self.assertEqual(self._column(ref), "Blocked")
+        runs = [r for r in self._runs() if r["event"] == "advance" and r.get("reason") == "watchdog"]
+        self.assertTrue(any(r.get("reference") == ref for r in runs))
+
+    def test_unfrozen_watchdog_still_holds_when_worker_is_actually_active(self):
+        ref = self._claim_one(head="claude-opus")
+        self.statuses["claude-sub"] = "red"
+        dispatcher.WATCHDOG_SECONDS = 600
+        dispatcher.tick()   # frozen tick
+        self.statuses["claude-sub"] = "green"
+        self.worker.activity_ts = time.time()   # fresh output once the resource recovers
+        dispatcher.tick()
+        self.assertEqual(self._column(ref), model.IN_PROGRESS)
 
 
 class TaskMdHistoryTest(_DispatcherBase):
@@ -1392,7 +1514,7 @@ class ValidateReviewTest(_DispatcherBase):
         ref = self._to_validate()
         self._ci_green()
 
-        def claim_then_die(records):
+        def claim_then_die(records, statuses):
             raise KeyboardInterrupt("die after validate spawned the reviewer")
 
         with mock.patch.object(dispatcher, "_claim_next", claim_then_die):

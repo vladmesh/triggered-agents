@@ -4,8 +4,12 @@ Role is a global `--role` (or env BOARD_ROLE) checked before the command runs: c
 PO-only, claim is dispatcher-only, report/feedback are worker-only, move/ready defer to the
 transition matrix for the role, comment is open to any role (the role becomes the marker).
 update accepts any role at this layer but is PO-only in ops (GuardError otherwise), same as
-move's per-role matrix. setup/list/show need no role. Guards live in model/ops; this layer
+move's per-role matrix. setup/list/show/probe need no role. Guards live in model/ops; this layer
 only wires argv to them and maps failures to exit codes.
+
+`probe --resource <id>` exits 0/1 for green/red (see health.run_builtin_probe), not the generic
+KanboardError/GuardError table below — it is heads.toml's own probe command, run by
+health.refresh, never touching the board at all.
 
 Exit codes: 0 ok, 1 KanboardError, 2 usage/bad-args/role, 3 GuardError. Kanboard-touching
 commands emit JSON on stdout; errors go to stderr prefixed `pipeline: `.
@@ -58,6 +62,9 @@ def _build_parser() -> argparse.ArgumentParser:
     sub.add_parser("setup")
     sub.add_parser("tick")       # dispatcher: one deterministic tick (claim/advance)
     sub.add_parser("precheck")   # dispatcher: exit 0 if there is work, non-zero to skip
+
+    p_probe = sub.add_parser("probe")   # heads.toml's own probe command for a resource
+    p_probe.add_argument("--resource", required=True)
 
     p_create = sub.add_parser("create")
     p_create.add_argument("--project", required=True)
@@ -151,6 +158,15 @@ def main(argv=None) -> int:
         if args.cmd in ("tick", "precheck"):
             from . import dispatcher
             return dispatcher.tick() if args.cmd == "tick" else dispatcher.precheck()
+        if args.cmd == "probe":
+            from . import health
+            try:
+                ok = health.run_builtin_probe(args.resource)
+            except KeyError:
+                _err(f"no builtin probe for resource {args.resource!r} "
+                    f"(known: {', '.join(sorted(health.BUILTIN_PROBES))})")
+                return 2
+            return 0 if ok else 1
         if args.cmd == "list":
             return _emit(ops.list_cards(column=args.column, project=args.project))
         if args.cmd == "show":
