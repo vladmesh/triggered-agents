@@ -48,6 +48,19 @@ class BuildTaskTest(unittest.TestCase):
     def test_forbids_pushing_the_review_branch(self):
         self.assertIn("не пушить", self._build())
 
+    def test_tells_reviewer_to_run_workers_claimed_live_checks(self):
+        # triggered-agents-245: a human no longer double-checks a green verdict before merge, so
+        # the reviewer itself must re-run whatever the worker's report claimed it verified live.
+        text = self._build()
+        self.assertIn("живые проверки", text)
+        self.assertIn("прогнал", text)
+        self.assertIn("не смог", text)
+
+    def test_points_at_the_worker_report_via_show_command(self):
+        ref = "triggered-agents-220"
+        text = self._build(ref=ref)
+        self.assertIn(f"pipeline show --ref {ref}", text)
+
 
 class ContribBuildTaskTest(unittest.TestCase):
     """Contrib (fork) cards have no PR in this pipeline — REVIEW.md points at the reported
@@ -86,6 +99,11 @@ class ContribBuildTaskTest(unittest.TestCase):
 
     def test_forbids_pushing_the_review_branch(self):
         self.assertIn("не пушить", self._build())
+
+    def test_points_at_the_worker_report_via_show_command(self):
+        ref = "agent-kanban-9"
+        text = self._build(ref=ref)
+        self.assertIn(f"pipeline show --ref {ref}", text)
 
 
 if __name__ == "__main__":

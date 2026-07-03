@@ -25,11 +25,12 @@ layer 3 (independent review, every project): once the lower layers are green, sp
     verdict exactly the way dispatcher._advance drives an In-progress card by the worker's report:
     spawn once per code state, read the verdict past a baseline, act. Red -> back to In progress
     with a nudge, up to REVIEW_RETURN_CAP returns over the card's life, then Blocked до vladmesh.
-    Green on a PR project without a stand waits for a human merge; green on a PR stand project
-    triggers the dispatcher's own squash merge; green on a contrib card has nothing to wait for
-    (no PR in this pipeline) and goes straight to Done with the worker workspace torn down. A
-    reviewer that goes silent without a verdict is caught by the same watchdog threshold as a
-    worker head.
+    Green on a PR project (stand or not) triggers the dispatcher's own squash merge, one-shot: a
+    failed attempt (conflict, red required check, gh down) goes straight to Blocked, never a
+    retry-loop — TA_AUTOMERGE=off reverts this to waiting for a human merge, no redeploy needed.
+    Green on a contrib card has nothing to wait for (no PR in this pipeline) and goes straight to
+    Done with the worker workspace torn down. A reviewer that goes silent without a verdict is
+    caught by the same watchdog threshold as a worker head.
 
 `run(records, watchdog_seconds, save_cards)` is the single entry point dispatcher.tick calls once
 per tick; every other name here is private. `watchdog_seconds` and `save_cards` are threaded in
@@ -64,6 +65,15 @@ VALIDATE_STALL_ATTEMPTS = int(os.environ.get("TA_VALIDATE_STALL_ATTEMPTS", "5"))
 # arriving. Time-based rather than tick-count: a long-but-real CI run must not misfire, only a
 # rollup that never terminates at all should.
 CI_PENDING_STALL_SECONDS = int(os.environ.get("TA_CI_PENDING_STALL_SECONDS", str(6 * 3600)))
+
+
+def _automerge_enabled() -> bool:
+    """Kill switch for the dispatcher's own squash-merge on a green layer-3 verdict — read fresh
+    on every call (not a module-load constant) so flipping it back is a plain env change, no
+    redeploy. off/0/false (case-insensitive) disables it; unset or anything else leaves it on."""
+    return os.environ.get("TA_AUTOMERGE", "").strip().lower() not in ("off", "0", "false")
+
+
 # PR link the worker pastes into its report (the done protocol in TASK.md requires it). The last
 # one on the card wins, so a re-opened/re-pushed PR link supersedes an earlier one.
 _PR_URL_RE = re.compile(r"https://github\.com/[\w.-]+/[\w.-]+/pull/\d+")
@@ -171,14 +181,15 @@ def _stand_gate(ref: str, pr: str, card: dict, cfg: dict, records: dict, view: d
 
 
 def run(records: dict, watchdog_seconds: int, save_cards) -> bool:
-    """Drive each Validate card (zero LLM below layer 3). Merge stays a human action; the
-    dispatcher only reacts to what gh and the stand report:
+    """Drive each Validate card (zero LLM below layer 3). The dispatcher merges a green-reviewed
+    PR itself (_review_green; TA_AUTOMERGE=off reverts merging to a human); below layer 3 it only
+    reacts to what gh and the stand report:
       merged  -> worker workspace torn down, Done, record dropped (the worker session is over);
       closed without a merge -> Blocked with the reason, record dropped (a human closed it, or it
         went stale — the card must not sit in Validate forever waiting for a merge that won't come);
       CI red  -> back to In progress with a scrubbed comment + a nudge to the live worker;
       CI green (layer 1):
-        - project without a [stand] section: a one-time verdict comment, waiting for merge;
+        - project without a [stand] section: spawn the layer-3 reviewer directly;
         - project with a stand: run layer 2 (_stand_gate) — deploy the PR branch to the stand and
           run e2e; only a green stand run posts the pre-merge verdict, a red one retries once then
           Blocks;
@@ -449,8 +460,9 @@ def _validate_error(ref: str, exc: Exception) -> None:
 # After the mechanical layers are green, the dispatcher spawns a reviewer head (worker.spawn_reviewer)
 # — not the worker, no write access to the code — and drives the card by its verdict exactly the way
 # dispatcher._advance drives an In-progress card by the worker's report: spawn once per code state,
-# read the verdict comment past a baseline, act. green -> the card waits for a human merge (or, for
-# a contrib card, goes straight to Done — no PR to wait on); red -> back to In progress with a
+# read the verdict comment past a baseline, act. green -> the dispatcher squash-merges the PR
+# itself (TA_AUTOMERGE=off waits for a human merge instead, no redeploy needed), or, for a contrib
+# card, goes straight to Done — no PR to wait on; red -> back to In progress with a
 # nudge, up to REVIEW_RETURN_CAP returns over the card's life, then Blocked до vladmesh. A reviewer
 # that goes silent without a verdict is caught by the same watchdog as a worker, so the card never
 # sits in Validate forever with a dead head.
@@ -611,16 +623,22 @@ def _review_green_contrib(ref: str, rec: dict, records: dict) -> bool:
 def _review_green(ref: str, pr: str | None, is_stand: bool, rec: dict, records: dict,
                   contrib: tuple[str, str] | None = None) -> bool:
     """Green verdict: all three layers clear. Tear the reviewer worktree down once. A contrib card
-    (`contrib` set) has nothing left to wait for — straight to Done (_review_green_contrib). A
-    regular project without a [stand] section still waits for a human merge: log the terminal
-    green exactly once (`review_green_logged`), not on every tick the card idles here waiting —
-    the same one-shot contract this event had before automerge existed. A stand project's e2e run
-    on a live stand is enough assurance (vladmesh, 2026-07-02) that the dispatcher merges the PR
-    itself (squash) instead, once per green verdict: `automerge_done` makes a repeated tick that
-    still sees the same green verdict (gh merge-state lag before `poll_pr` reports merged) a no-op
-    rather than a second `gh pr merge` call. A failed attempt — conflict, stale branch, gh down —
-    is a final outcome here, not a retry: a comment with the reason and straight to Blocked so a
-    human is pulled in instead of the tick hammering `gh pr merge` forever."""
+    (`contrib` set) has nothing left to wait for — straight to Done (_review_green_contrib).
+
+    With automerge on (the default — _automerge_enabled; TA_AUTOMERGE=off reverts to a human merge
+    with no redeploy) the dispatcher squash-merges the PR itself, once per green verdict, whether
+    the project has a stand or not: a stand's e2e run, or CI + independent review for a project
+    with no stand, is assurance enough (vladmesh: stand automerge on 2026-07-02, extended to every
+    project on 2026-07-04 after 12 green-reviewed merges in a row needed no human catch).
+    `automerge_done` makes a repeated tick that still sees the same green verdict (gh merge-state
+    lag before `poll_pr` reports merged) a no-op rather than a second `gh pr merge` call. A failed
+    attempt — conflict, stale branch, gh down — is a final outcome here, not a retry: a comment
+    with the reason and straight to Blocked so a human is pulled in instead of the tick hammering
+    `gh pr merge` forever.
+
+    With automerge off, the card logs the terminal green exactly once (`review_green_logged`), not
+    on every tick it idles here waiting for a human to merge — the original one-shot contract this
+    event had before automerge existed at all."""
     changed = False
     if rec.get("review_ws"):
         worker.teardown(rec["review_ws"])
@@ -628,7 +646,7 @@ def _review_green(ref: str, pr: str | None, is_stand: bool, rec: dict, records: 
         changed = True
     if contrib is not None:
         return _review_green_contrib(ref, rec, records) or changed
-    if not is_stand:
+    if not _automerge_enabled():
         if rec.get("review_green_logged"):
             return changed
         rec["review_green_logged"] = True
@@ -639,8 +657,9 @@ def _review_green(ref: str, pr: str | None, is_stand: bool, rec: dict, records: 
     rec["automerge_done"] = True
     result = worker.merge_pr(pr)
     if result["ok"]:
+        layers = "CI, стенд, ревью" if is_stand else "CI, ревью"
         ops.add_comment("dispatcher", ref,
-                        f"Все слои валидации зелёные (CI, стенд, ревью) — автомерж {pr}.",
+                        f"Все слои валидации зелёные ({layers}) — автомерж {pr}.",
                         marker=model.MARKER_AUTOMERGE)
         STATE.log_run("review", reference=ref, result="green-automerge", pr=pr)
         return True
