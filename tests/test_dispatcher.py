@@ -1693,20 +1693,42 @@ class ValidateReviewTest(_DispatcherBase):
         dispatcher.tick()                                # verdict still pending -> no re-spawn
         self.assertEqual(len(self.worker.reviewer_spawns), 1)
 
-    def test_green_verdict_waits_for_merge_and_tears_down_once(self):
+    def _automerge_off(self):
+        os.environ["TA_AUTOMERGE"] = "off"
+        self.addCleanup(lambda: os.environ.pop("TA_AUTOMERGE", None))
+
+    def test_green_verdict_automerges_by_default(self):
+        # Default behavior (this card): a no-stand project's green review is no longer left for a
+        # human — the dispatcher squash-merges it itself, same as a stand project always has.
+        ref = self._spawned()
+        ops.verdict(ref, "green", "каждый criterion реально выполнен")
+        dispatcher.tick()
+        self.assertEqual(self.worker.merged, [self.PR])
+        self.assertEqual(self._column(ref), "Validate")   # still waits on gh to report merged
+        self.assertEqual(len(self._rev_ws_torndown()), 1)        # reviewer worktree cleaned up
+        dispatcher.tick()                                        # no-op, no second merge/teardown
+        self.assertEqual(self.worker.merged, [self.PR])
+        self.assertEqual(len(self._rev_ws_torndown()), 1)
+        self.assertTrue(any(r["event"] == "review" and r.get("result") == "green-automerge"
+                            for r in self._runs()))
+
+    def test_green_verdict_with_automerge_off_waits_for_merge_and_tears_down_once(self):
+        self._automerge_off()
         ref = self._spawned()
         ops.verdict(ref, "green", "каждый criterion реально выполнен")
         dispatcher.tick()
         self.assertEqual(self._column(ref), "Validate")          # waits for a human merge
+        self.assertEqual(self.worker.merged, [])                 # switch off -> gh pr merge never called
         self.assertEqual(len(self._rev_ws_torndown()), 1)        # reviewer worktree cleaned up
         dispatcher.tick()                                        # no-op, no second teardown
         self.assertEqual(len(self._rev_ws_torndown()), 1)
         self.assertTrue(any(r["event"] == "review" and r.get("result") == "green" for r in self._runs()))
 
-    def test_green_verdict_logs_terminal_green_exactly_once(self):
+    def test_green_verdict_with_automerge_off_logs_terminal_green_exactly_once(self):
         # Regression (review #1 on triggered-agents-221): a no-stand card idling in Validate on a
         # settled green verdict must log the terminal "review green" event once, not on every tick
         # it sits there waiting for a human merge.
+        self._automerge_off()
         ref = self._spawned()
         ops.verdict(ref, "green", "ок")
         for _ in range(3):
@@ -2145,7 +2167,9 @@ class AutomergeTest(_DispatcherBase):
     """triggered-agents-221: for a project with a [stand] section, a green review verdict on top
     of already-green CI and stand triggers the dispatcher's own squash merge (worker.merge_pr)
     instead of waiting for a human — vladmesh's 2026-07-02 call that the live-stand e2e gate is
-    enough assurance. Projects without a stand keep the old human-merge behaviour."""
+    enough assurance. triggered-agents-245 extends the same one-shot automerge to every project,
+    stand or not, on a green review verdict — TA_AUTOMERGE=off is the kill switch back to a human
+    merge, no redeploy needed."""
 
     PR = "https://github.com/vladmesh/personal_site/pull/101"
     STAND = {"namespace": "personal_site_stand", "compose": ["infra/docker-compose.stand.yml"],
@@ -2174,6 +2198,22 @@ class AutomergeTest(_DispatcherBase):
         dispatcher.tick()                     # stand run -> stand-green
         dispatcher.tick()                     # stand green noted -> spawn reviewer
         self.assertEqual(len(self.worker.reviewer_spawns), 1)
+        ops.verdict(ref, "green", "все критерии реально выполнены")
+        return ref
+
+    def _to_review_green_no_stand(self, pr=PR, project="personal_site"):
+        """Same as _to_review_green but for a project with no [stand] section: CI green is the
+        last mechanical layer, straight to the reviewer."""
+        self.worker.stand_config = None
+        before = len(self.worker.reviewer_spawns)
+        ref = self._claim_one(project=project)
+        ops.report(ref, "done", f"готово\nPR: {pr}")
+        self.worker.pr_status = None
+        dispatcher.tick()
+        self.assertEqual(self._column(ref), "Validate")
+        self._ci_green()
+        dispatcher.tick()                     # no stand -> spawns the reviewer directly
+        self.assertEqual(len(self.worker.reviewer_spawns), before + 1)
         ops.verdict(ref, "green", "все критерии реально выполнены")
         return ref
 
@@ -2219,18 +2259,49 @@ class AutomergeTest(_DispatcherBase):
         dispatcher.tick()                                  # Blocked, off the board -> no retry
         self.assertEqual(self.worker.merged, [self.PR])
 
-    def test_no_stand_project_green_review_waits_for_human(self):
-        ref = self._claim_one()
-        ops.report(ref, "done", f"готово\nPR: {self.PR}")
-        self.worker.pr_status = None
+    def test_no_stand_project_green_review_also_automerges(self):
+        ref = self._to_review_green_no_stand()
         dispatcher.tick()
-        self._ci_green()
-        dispatcher.tick()                                  # no stand -> spawns the reviewer directly
-        self.assertEqual(len(self.worker.reviewer_spawns), 1)
-        ops.verdict(ref, "green", "ок")
+        self.assertEqual(self.worker.merged, [self.PR])
+        journal = self._markers(ref)
+        self.assertIn(f"[{model.MARKER_AUTOMERGE}]", journal)
+        self.assertEqual(self._column(ref), "Validate")   # still waits on gh to report merged
+        self.assertTrue(any(r["event"] == "review" and r.get("result") == "green-automerge"
+                            for r in self._runs()))
+
+    def test_no_stand_automerge_is_attempted_once_across_ticks(self):
+        ref = self._to_review_green_no_stand()
+        dispatcher.tick()
+        self.assertEqual(self.worker.merged, [self.PR])
+        dispatcher.tick()
+        self.assertEqual(self.worker.merged, [self.PR])
+
+    def test_no_stand_merge_failure_blocks_with_reason_and_does_not_retry(self):
+        ref = self._to_review_green_no_stand()
+        self.worker.merge_result = {"ok": False, "error": "PR is not mergeable: conflicting files"}
+        dispatcher.tick()
+        self.assertEqual(self._column(ref), "Blocked")
+        self.assertNotIn(ref, dispatcher._load_cards())
+        journal = self._markers(ref)
+        self.assertIn("conflicting files", journal)
+        self.assertEqual(self.worker.merged, [self.PR])
+        self.assertTrue(any(r["event"] == "review" and r.get("reason") == "automerge-fail"
+                            for r in self._runs()))
+        dispatcher.tick()                                  # Blocked, off the board -> no retry
+        self.assertEqual(self.worker.merged, [self.PR])
+
+    def test_automerge_off_switch_reverts_both_stand_and_no_stand_to_human_merge(self):
+        os.environ["TA_AUTOMERGE"] = "off"
+        self.addCleanup(lambda: os.environ.pop("TA_AUTOMERGE", None))
+        stand_ref = self._to_review_green()
         dispatcher.tick()
         self.assertEqual(self.worker.merged, [])
-        self.assertEqual(self._column(ref), "Validate")
+        self.assertEqual(self._column(stand_ref), "Validate")
+        no_stand_ref = self._to_review_green_no_stand(
+            pr="https://github.com/vladmesh/other_project/pull/1", project="other_project")
+        dispatcher.tick()
+        self.assertEqual(self.worker.merged, [])
+        self.assertEqual(self._column(no_stand_ref), "Validate")
 
 
 class OrcaJsonTimeoutTest(unittest.TestCase):
