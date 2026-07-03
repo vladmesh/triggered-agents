@@ -181,14 +181,15 @@ def _stand_gate(ref: str, pr: str, card: dict, cfg: dict, records: dict, view: d
 
 
 def run(records: dict, watchdog_seconds: int, save_cards) -> bool:
-    """Drive each Validate card (zero LLM below layer 3). Merge stays a human action; the
-    dispatcher only reacts to what gh and the stand report:
+    """Drive each Validate card (zero LLM below layer 3). The dispatcher merges a green-reviewed
+    PR itself (_review_green; TA_AUTOMERGE=off reverts merging to a human); below layer 3 it only
+    reacts to what gh and the stand report:
       merged  -> worker workspace torn down, Done, record dropped (the worker session is over);
       closed without a merge -> Blocked with the reason, record dropped (a human closed it, or it
         went stale — the card must not sit in Validate forever waiting for a merge that won't come);
       CI red  -> back to In progress with a scrubbed comment + a nudge to the live worker;
       CI green (layer 1):
-        - project without a [stand] section: a one-time verdict comment, waiting for merge;
+        - project without a [stand] section: spawn the layer-3 reviewer directly;
         - project with a stand: run layer 2 (_stand_gate) — deploy the PR branch to the stand and
           run e2e; only a green stand run posts the pre-merge verdict, a red one retries once then
           Blocks;
