@@ -31,6 +31,12 @@ Per-tick order:
                 worktree off base_branch, run setup+smoke; smoke fail -> Blocked with the log and
                 no head; success -> drop TASK.md and launch the worker head. One claim per tick.
 
+precheck (the gate a systemd unit run always calls, board state or not) also fast-forwards every
+triggered-agent's own worktree — board/curator/pipeline/retro — to origin/main
+(_ff_agent_worktrees), replacing the manual "push, then go ff every agent worktree by hand" step.
+Strictly --ff-only per worktree; a warn with the worktree's name on anything that can't
+fast-forward, never a reset.
+
 Bookkeeping (which card maps to which workspace/head, the claim time, the comment baseline that
 separates a fresh worker's report from older comments) lives in state/pipeline/cards.json. The
 tick holds its own lockfile, separate from the claim's lock in ops, so the two never deadlock.
@@ -157,6 +163,42 @@ def _worker_id(card: dict) -> str:
     return naming.dedupe(base, lambda n: worker.workspace_exists(project, n))
 
 
+def _ff_agent_worktrees() -> None:
+    """Fast-forward every triggered-agent's own worktree (board/curator/pipeline/retro/...) to
+    origin/main — the manual step this replaces ("push to triggered-agents, then go ff every
+    agent worktree by hand or the automations keep running stale code"). Runs on every precheck,
+    independent of board state, so a quiet board (the common case) never leaves it undone: this
+    is the one hook that fires on every timer tick regardless of what precheck returns.
+
+    Strictly --ff-only per worktree (worker.ff_worktree): a worktree with local commits or a
+    diverged history just warns with its name and is left untouched, never reset or forced. Safe
+    to run against a worktree with a live head — these worktrees never carry local edits (agents
+    don't commit to this repo, by convention), and deploy/provision.py already `reset --hard`s
+    every one of them on every redeploy with no head check at all; an --ff-only pull is a strictly
+    gentler version of that same accepted move. Best-effort end to end: any failure here (a
+    missing manifest, a gone worktree, a hung git) is logged and swallowed, never allowed to turn
+    into a precheck error."""
+    try:
+        base = worker.read_base_branch("triggered-agents")
+        worktrees = worker.list_agent_worktrees()
+    except Exception as e:  # noqa: BLE001 — must never break precheck's own board check
+        STATE.log_run("ff-agents", result="error", level="warn", error=worker.scrub_secrets(str(e)))
+        return
+    for name, path in worktrees:
+        try:
+            result = worker.ff_worktree(path, base)
+        except Exception as e:  # noqa: BLE001 — one bad worktree must not skip the rest
+            STATE.log_run("ff-agents", agent=name, result="error", level="warn",
+                          error=worker.scrub_secrets(str(e)))
+            continue
+        if not result["ok"]:
+            STATE.log_run("ff-agents", agent=name, result="blocked", level="warn",
+                          reason=worker.scrub_secrets(result.get("reason") or ""))
+        elif result.get("before") != result.get("after"):
+            STATE.log_run("ff-agents", agent=name, result="ff", before=result.get("before"),
+                          after=result.get("after"))
+
+
 def precheck() -> int:
     """Exit 0 when there is work: a Ready card to claim, an In-progress card to advance, or a
     Validate card whose PR needs polling. Exit 1 when precheck ran fine and found nothing to do.
@@ -164,7 +206,10 @@ def precheck() -> int:
     from a plain skip, so a dead board doesn't read as "nothing to do" in journalctl/runs.jsonl.
     Every run logs exactly one event to runs.jsonl regardless of outcome, so health-check can
     tell a live-but-idle dispatcher from one that stopped ticking. Cheap: one board list, before
-    any worktree/head is touched."""
+    any task workspace/head is touched — _ff_agent_worktrees is the one exception, a best-effort
+    side step against the agents' own worktrees (never a task workspace) that runs first and can
+    never affect the return value below."""
+    _ff_agent_worktrees()
     try:
         cards = ops.list_cards()
     except Exception as e:  # noqa: BLE001 — any precheck failure must be logged, not just KanboardError
