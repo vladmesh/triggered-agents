@@ -348,10 +348,15 @@ def claim_card(reference: str, worker: str, cap: int = 3) -> dict:
 
 
 def add_comment(role: str, reference: str, body: str, marker: str | None = None) -> dict:
-    """Post a comment as `[marker or role]\\n<body>`; user_id=0 (app-token author)."""
+    """Post a comment as `[marker or role]\\n<body>`; user_id=0 (app-token author). Scrubbed for
+    steward specifically (worker.scrub_secrets), same as the reviewer's verdict/reviewer_idea:
+    steward reads more raw system surface than any other role (transcripts, journalctl, env
+    files) and could quote a secret by accident (2026-07-04 review, triggered-agents-244 remark
+    Z1). Every other role keeps its body verbatim, unchanged from before."""
     task = _get_by_ref(reference)
     tag = marker or role
-    call("createComment", task_id=int(task["id"]), user_id=0, content=f"[{tag}]\n{body}")
+    text = worker.scrub_secrets(body) if role == "steward" else body
+    call("createComment", task_id=int(task["id"]), user_id=0, content=f"[{tag}]\n{text}")
     return {"action": "commented", "reference": reference, "marker": tag}
 
 

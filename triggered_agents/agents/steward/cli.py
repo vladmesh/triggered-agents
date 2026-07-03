@@ -44,6 +44,13 @@ def cmd_advance() -> int:
         return 1
     pending = json.loads(STATE.pending_file.read_text(encoding="utf-8"))
     with STATE.lock():
+        # Fold in currently-Blocked refs fresh, not just the scan-time snapshot: the skill's own
+        # action phase (after scan(), before advance()) may have escalated a brand new card to
+        # Blocked — without this it would look "new" again on the very next hour's scan, one
+        # wasted wake-up for a card this same run just put there (2026-07-04 review,
+        # triggered-agents-244 note Z2).
+        current_blocked = {c["reference"] for c in signals.pipeline_ops.list_cards(column="Blocked")}
+        pending["notified_blocked"] = sorted(set(pending["notified_blocked"]) | current_blocked)
         STATE.save_watermark(pending)
         STATE.pending_file.unlink()
     STATE.log_run("advance")

@@ -99,6 +99,13 @@ def main() -> int:
         rc, _ = run_board("steward", ["move", "--ref", ref, "--to", "Blocked"])
         check("steward escalates Ready -> Blocked rc=0", rc == 0)
 
+        # 1b. the pipeline deliberately leaves a Blocked card's workspace on disk with no
+        # cards.json record — a preserved workspace for THIS card must never register as an
+        # orphan (2026-07-04 review, triggered-agents-244 blocker B1).
+        card_id = ref.rsplit("-", 1)[-1]
+        preserved = Path(_WS_DIR) / "personal_site" / f"{card_id}-e2e-stuck-card"
+        preserved.mkdir(parents=True)
+
         # 2. anomaly: a warn line in the pipeline's own runs.jsonl (staged directly — a real one
         #    would come from a live dispatcher tick, but the file format is all steward reads).
         signals.PIPELINE_RUNS.parent.mkdir(parents=True, exist_ok=True)
@@ -109,8 +116,9 @@ def main() -> int:
         # 3. anomaly: a resource health flip (claude-sub forced red via heads.toml's own bypass).
         os.environ["TA_HEALTH_FORCE_RED"] = "claude-sub"
 
-        # 4. anomaly: an orphan workspace directory nobody's cards.json record points at.
-        orphan = Path(_WS_DIR) / "personal_site" / "217-e2e-orphan"
+        # 4. anomaly: an orphan workspace directory nobody's cards.json record points at, and no
+        #    active card owns by id either.
+        orphan = Path(_WS_DIR) / "personal_site" / "999999-e2e-orphan"
         orphan.mkdir(parents=True)
 
         # precheck now finds a real signal, at zero LLM cost so far.
@@ -124,7 +132,9 @@ def main() -> int:
         check("scan sees new_blocked", ref in s["new_blocked"])
         check("scan sees log warn", len(s["log"]) >= 1)
         check("scan sees resource_flip to red", s["resource_flip"].get("claude-sub") == "red")
-        check("scan sees the orphan workspace", any("217-e2e-orphan" in p for p in s["new_orphan_workspaces"]))
+        check("scan sees the real orphan", any("999999-e2e-orphan" in p for p in s["new_orphan_workspaces"]))
+        check("scan does NOT flag the Blocked card's own preserved workspace as an orphan",
+             not any("e2e-stuck-card" in p for p in s["new_orphan_workspaces"]))
         check("scan wrote a pending file", steward_cli.STATE.pending_file.is_file())
 
         # 5. steward acts: comments on the card, then legally recovers it (Blocked -> Ready).
@@ -157,6 +167,7 @@ def main() -> int:
         # green, to see zero flip signal.
         del os.environ["TA_HEALTH_FORCE_RED"]
         shutil.rmtree(orphan)
+        shutil.rmtree(preserved)
         rc, _ = run_steward(["advance"])
         check("advance rc=0", rc == 0)
         rc, _ = run_steward(["precheck"])

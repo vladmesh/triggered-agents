@@ -28,6 +28,7 @@ from pathlib import Path
 
 from ...runtime.state import AgentState
 from ..pipeline import health as pipeline_health
+from ..pipeline import naming as pipeline_naming
 from ..pipeline import ops as pipeline_ops
 
 STATE = AgentState("steward")
@@ -40,7 +41,6 @@ STALE_HOURS = float(os.environ.get("TA_STEWARD_STALE_HOURS", "24"))
 
 _PIPELINE_STATE = AgentState("pipeline")
 PIPELINE_RUNS = _PIPELINE_STATE.dir / "runs.jsonl"
-PIPELINE_CARDS = _PIPELINE_STATE.dir / "cards.json"
 
 WORKSPACES_ROOT = Path(os.environ.get("TA_WORKSPACES_ROOT") or Path.home() / "orca" / "workspaces").resolve()
 # The runtime's own agent worktrees (board/curator/pipeline/retro/steward, one per agent, not one
@@ -119,49 +119,55 @@ def _resource_signals(mark: dict) -> tuple[dict, dict]:
     as a fresh red, both are worth a post-mortem look — current status map for every resource). A
     resource with no prior entry (first-ever scan, or a resource heads.toml just introduced) is a
     new baseline, not a flip — otherwise the very first cold-start scan would "flip" every
-    currently-green resource and spawn a head for nothing to report."""
+    currently-green resource and spawn a head for nothing to report.
+
+    A refresh() failure (broken heads.toml, transient I/O) keeps the PREVIOUS baseline rather than
+    resetting to {} — pipeline.dispatcher.tick() already logs its own head-health error to
+    runs.jsonl (caught by _log_signals), so this module doesn't need to double-report it, and
+    resetting to {} would silently erase whatever flip happened on the very next real probe
+    (2026-07-04 review, triggered-agents-244 note Z3)."""
     try:
         current = pipeline_health.refresh()
     except Exception:
-        current = {}
+        current = dict(mark["resource_status"])
     prev = mark["resource_status"]
     changed = {r: s for r, s in current.items() if r in prev and prev[r] != s}
     return changed, current
 
 
-def _in_flight_workspaces() -> set[str]:
-    """Every worker/reviewer workspace path the dispatcher's own bookkeeping still tracks
-    (state/pipeline/cards.json — cleared by worker.teardown on Done/Blocked-with-cleanup, so a
-    path lingering here but gone from disk, or vice versa, is exactly what this module hunts)."""
-    if not PIPELINE_CARDS.is_file():
-        return set()
-    try:
-        records = json.loads(PIPELINE_CARDS.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
-        return set()
-    paths = set()
-    for rec in records.values():
-        for key in ("workspace", "review_ws"):
-            p = rec.get(key)
-            if p:
-                paths.add(str(Path(p).resolve()))
-    return paths
+def _active_card_id_prefixes(project: str) -> set[str]:
+    """id-prefixes (`<id>-`, `review-<id>-`) for every active card of `project`, in ANY column —
+    including Blocked. The pipeline deliberately leaves a card's worker/reviewer workspace on disk
+    with NO cards.json record at all once it reaches Blocked (dispatcher.py's report:blocked path,
+    validate.py's Blocked-from-Validate/contrib paths — "left alive for a human to inspect"), so
+    matching against cards.json would flag every one of those as a false-positive orphan
+    (2026-07-04 review, triggered-agents-244 blocker B1). The board itself, not the dispatcher's
+    local cache, is the source of truth for "does an active card still own this workspace" — a
+    dedup suffix (naming.dedupe: `<id>-<slug>-2`) still starts with the plain `<id>-` prefix, so
+    prefix match survives that without needing the exact slug/dedupe count."""
+    prefixes = set()
+    for card in pipeline_ops.list_cards(project=project):
+        cid = pipeline_naming.card_id(card["reference"])
+        prefixes.add(f"{cid}-")
+        prefixes.add(f"review-{cid}-")
+    return prefixes
 
 
 def _orphan_signals(mark: dict) -> tuple[list[str], list[str]]:
     """(new orphan workspace paths, every orphan path found this scan) — a directory under
-    WORKSPACES_ROOT/<project>/* the dispatcher no longer (or never did) associate with an
-    in-flight card: a tick killed between workspace-create and the cards.json save, a teardown
-    that failed partway, a manual leftover."""
+    WORKSPACES_ROOT/<project>/* whose name matches no active card of that project by id-prefix
+    (see _active_card_id_prefixes): a tick killed between workspace-create and the cards.json
+    save, a teardown that failed partway, a manual leftover, a workspace whose card left the board
+    entirely."""
     if not WORKSPACES_ROOT.is_dir():
         return [], []
-    in_flight = _in_flight_workspaces()
     orphans = []
     for project_dir in sorted(WORKSPACES_ROOT.iterdir()):
         if not project_dir.is_dir() or project_dir.name == _AGENTS_PROJECT:
             continue
+        prefixes = _active_card_id_prefixes(project_dir.name)
         for ws in sorted(project_dir.iterdir()):
-            if ws.is_dir() and str(ws.resolve()) not in in_flight:
+            if ws.is_dir() and not any(ws.name.startswith(p) for p in prefixes):
                 orphans.append(str(ws))
     notified = set(mark["notified_orphans"])
     new = [o for o in orphans if o not in notified]

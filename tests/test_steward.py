@@ -60,7 +60,6 @@ class StewardTestBase(unittest.TestCase):
         self._patch(signals, "STATE", new_steward_state)
         self._patch(cli, "STATE", new_steward_state)
         self._patch(signals, "PIPELINE_RUNS", new_pipeline_state.dir / "runs.jsonl")
-        self._patch(signals, "PIPELINE_CARDS", new_pipeline_state.dir / "cards.json")
         self.pipeline_state = new_pipeline_state
 
         self.ws_root = root / "workspaces"
@@ -72,10 +71,6 @@ class StewardTestBase(unittest.TestCase):
         with open(signals.PIPELINE_RUNS, "w", encoding="utf-8") as f:
             for rec in records:
                 f.write(json.dumps(rec) + "\n")
-
-    def _write_cards_json(self, records: dict) -> None:
-        self.pipeline_state.ensure_dir()
-        signals.PIPELINE_CARDS.write_text(json.dumps(records), encoding="utf-8")
 
 
 class LogSignalsTest(StewardTestBase):
@@ -200,6 +195,10 @@ class ResourceSignalsTest(StewardTestBase):
 
 
 class OrphanSignalsTest(StewardTestBase):
+    """2026-07-04 review, blocker B1: orphan-ness is matched against the board (any column,
+    including Blocked — the pipeline deliberately leaves a Blocked card's workspace on disk with
+    no cards.json record), not against the dispatcher's local cache."""
+
     def test_untracked_workspace_dir_is_an_orphan(self):
         (self.ws_root / "personal_site").mkdir()
         (self.ws_root / "personal_site" / "217-fix-bug").mkdir()
@@ -207,19 +206,47 @@ class OrphanSignalsTest(StewardTestBase):
         self.assertEqual(len(batch["signals"]["new_orphan_workspaces"]), 1)
         self.assertIn("217-fix-bug", batch["signals"]["new_orphan_workspaces"][0])
 
-    def test_workspace_tracked_in_cards_json_is_not_an_orphan(self):
+    def test_workspace_of_an_in_progress_card_is_not_an_orphan(self):
         ws = self.ws_root / "personal_site" / "217-fix-bug"
         ws.mkdir(parents=True)
-        self._write_cards_json({"personal_site-217": {"workspace": str(ws)}})
+        self.board.add_task("A", "In progress", reference="personal_site-217",
+                            meta={"project": "personal_site"})
+        batch = signals.scan()
+        self.assertEqual(batch["signals"]["new_orphan_workspaces"], [])
+
+    def test_workspace_of_a_blocked_card_with_no_cards_json_record_is_not_an_orphan(self):
+        """The exact false-positive from B1: dispatcher/validate drop the cards.json record on
+        Blocked but leave the workspace alive on disk for a human to inspect."""
+        ws = self.ws_root / "personal_site" / "217-fix-bug"
+        ws.mkdir(parents=True)
+        self.board.add_task("A", "Blocked", reference="personal_site-217",
+                            meta={"project": "personal_site"})
+        batch = signals.scan()
+        self.assertEqual(batch["signals"]["new_orphan_workspaces"], [])
+
+    def test_dedupe_suffixed_workspace_still_matches_by_id_prefix(self):
+        ws = self.ws_root / "personal_site" / "217-fix-bug-2"
+        ws.mkdir(parents=True)
+        self.board.add_task("A", "In progress", reference="personal_site-217",
+                            meta={"project": "personal_site"})
         batch = signals.scan()
         self.assertEqual(batch["signals"]["new_orphan_workspaces"], [])
 
     def test_review_workspace_is_also_covered(self):
         ws = self.ws_root / "personal_site" / "review-217-fix-bug"
         ws.mkdir(parents=True)
-        self._write_cards_json({"personal_site-217": {"review_ws": str(ws)}})
+        self.board.add_task("A", "Validate", reference="personal_site-217",
+                            meta={"project": "personal_site"})
         batch = signals.scan()
         self.assertEqual(batch["signals"]["new_orphan_workspaces"], [])
+
+    def test_workspace_of_a_different_card_id_is_still_an_orphan(self):
+        (self.ws_root / "personal_site" / "218-other").mkdir(parents=True)
+        self.board.add_task("A", "In progress", reference="personal_site-217",
+                            meta={"project": "personal_site"})
+        batch = signals.scan()
+        self.assertEqual(len(batch["signals"]["new_orphan_workspaces"]), 1)
+        self.assertIn("218-other", batch["signals"]["new_orphan_workspaces"][0])
 
     def test_agent_worktrees_directory_is_excluded(self):
         (self.ws_root / "triggered-agents" / "curator").mkdir(parents=True)
@@ -277,6 +304,18 @@ class CliTest(StewardTestBase):
         cli.cmd_scan(as_json=True)
         cli.cmd_advance()
         self.assertEqual(cli.cmd_status(), 0)
+
+    def test_advance_folds_in_a_card_escalated_during_the_run(self):
+        """2026-07-04 review, triggered-agents-244 note Z2: a card the skill itself escalates to
+        Blocked AFTER scan() but BEFORE advance() must not look "new" again next hour."""
+        # scan() sees a quiet board (nothing Blocked yet) ...
+        self.assertEqual(cli.cmd_scan(as_json=True), 0)
+        # ... then, still within the same run, the skill escalates a card to Blocked.
+        ref = self.board.add_task("A", "Blocked", meta={"project": "personal_site"})
+        self.assertEqual(cli.cmd_advance(), 0)
+        mark = signals.load_watermark()
+        self.assertIn(ref, mark["notified_blocked"])
+        self.assertEqual(cli.cmd_precheck(), 1)  # no fresh wake-up for the same card next hour
 
 
 if __name__ == "__main__":

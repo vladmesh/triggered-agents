@@ -634,6 +634,33 @@ class TestStewardOverride(PatchedBoardTest):
         self.assertEqual(board.method_calls("createComment"), [])
 
 
+class TestAddComment(PatchedBoardTest):
+    """2026-07-04 review, triggered-agents-244 remark Z1: steward reads more raw system surface
+    than any other role (transcripts, journalctl, env files) and could quote a secret by
+    accident — its comments get the same scrub_secrets backstop as the reviewer's verdict."""
+
+    def test_steward_comment_is_scrubbed(self):
+        board = self.make_board()
+        ref = board.add_task("A", "Blocked")
+        ops.add_comment("steward", ref, "нашёл в логе KANBOARD_API_TOKEN=supersecretvalue123")
+        posted = board.method_calls("createComment")
+        self.assertNotIn("supersecretvalue123", posted[0]["content"])
+
+    def test_other_roles_are_not_scrubbed(self):
+        board = self.make_board()
+        ref = board.add_task("A", "Blocked")
+        ops.add_comment("dispatcher", ref, "token KANBOARD_API_TOKEN=supersecretvalue123")
+        posted = board.method_calls("createComment")
+        self.assertIn("supersecretvalue123", posted[0]["content"])
+
+    def test_ordinary_steward_comment_text_survives_unchanged(self):
+        board = self.make_board()
+        ref = board.add_task("A", "Blocked")
+        ops.add_comment("steward", ref, "разобрался, ложное срабатывание")
+        posted = board.method_calls("createComment")
+        self.assertEqual(posted[0]["content"], "[steward]\nразобрался, ложное срабатывание")
+
+
 class TestReport(PatchedBoardTest):
     def test_blocked_without_body_raises(self):
         board = self.make_board()
