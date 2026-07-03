@@ -3,8 +3,9 @@
 Role is a global `--role` (or env BOARD_ROLE) checked before the command runs: create is
 PO-only, claim is dispatcher-only, report/feedback are worker-only, move/ready defer to the
 transition matrix for the role, comment is open to any role (the role becomes the marker).
-setup/list/show need no role. Guards live in model/ops; this layer only wires argv to them
-and maps failures to exit codes.
+update accepts any role at this layer but is PO-only in ops (GuardError otherwise), same as
+move's per-role matrix. setup/list/show need no role. Guards live in model/ops; this layer
+only wires argv to them and maps failures to exit codes.
 
 Exit codes: 0 ok, 1 KanboardError, 2 usage/bad-args/role, 3 GuardError. Kanboard-touching
 commands emit JSON on stdout; errors go to stderr prefixed `pipeline: `.
@@ -69,6 +70,12 @@ def _build_parser() -> argparse.ArgumentParser:
     p_create.add_argument("--slug")
     p_create.add_argument("--description")
     p_create.add_argument("--description-file")
+
+    p_update = sub.add_parser("update")
+    p_update.add_argument("--ref", required=True)
+    p_update.add_argument("--blocked-by", dest="blocked_by")
+    p_update.add_argument("--model", dest="model_name")
+    p_update.add_argument("--slug")
 
     p_ready = sub.add_parser("ready")
     p_ready.add_argument("--ref", required=True)
@@ -157,6 +164,12 @@ def main(argv=None) -> int:
                 project=args.project, task_type=args.task_type, title=args.title,
                 description=desc, ref=args.ref, column=args.column,
                 blocked_by=args.blocked_by, model_name=args.model_name, slug=args.slug))
+        if args.cmd == "update":
+            if not _need_role(role, ROLES):
+                return 2
+            return _emit(ops.update_card(
+                role, args.ref, slug=args.slug,
+                model_name=args.model_name, blocked_by=args.blocked_by))
         if args.cmd == "ready":
             if not _need_role(role, ROLES):
                 return 2

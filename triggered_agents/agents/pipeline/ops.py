@@ -155,6 +155,39 @@ def create_card(project: str, task_type: str, title: str, description: str = "",
     return {"action": "created", "id": task_id, "reference": ref, "column": column}
 
 
+def update_card(role: str, reference: str, slug: str | None = None,
+                model_name: str | None = None, blocked_by: str | None = None) -> dict:
+    """PO-only: patch slug/model/blocked_by metadata on an existing card. Only the fields
+    passed (not None) change; column and claim are never touched. Same validation as
+    create_card (slug SLUG_RE, blocked_by pointing at an existing card), all checked before
+    anything is written so a rejected update leaves metadata untouched."""
+    if role != "po":
+        raise model.GuardError(f"role {role!r} may not update card metadata (po only)")
+    if slug is not None and not naming.SLUG_RE.match(slug):
+        raise model.GuardError(f"slug {slug!r} must match [a-z0-9-]{{1,30}}")
+    pid = board_id()
+    task = _get_by_ref(reference)
+    if blocked_by is not None and not call("getTaskByReference", project_id=pid, reference=blocked_by):
+        raise model.GuardError(f"blocked_by {blocked_by!r} does not exist")
+    values = {}
+    if slug is not None:
+        values[model.META_SLUG] = slug
+    if model_name is not None:
+        values[model.META_MODEL] = model_name
+    if blocked_by is not None:
+        values[model.META_BLOCKED_BY] = blocked_by
+    if values:
+        call("saveTaskMetadata", task_id=int(task["id"]), values=values)
+    meta = call("getTaskMetadata", task_id=int(task["id"])) or {}
+    return {
+        "action": "updated",
+        "reference": reference,
+        "slug": meta.get(model.META_SLUG, ""),
+        "model": meta.get(model.META_MODEL, ""),
+        "blocked_by": meta.get(model.META_BLOCKED_BY, ""),
+    }
+
+
 def _move_position(pid: int, task_id: int, column_id: int, swimlane_id: int) -> None:
     """moveTaskPosition, raising if Kanboard reports failure. It returns false instead of an
     RPC error, so a bare call() would pass silently (e.g. claim stamped, card still Ready)."""
