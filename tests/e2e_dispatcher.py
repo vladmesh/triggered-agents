@@ -91,7 +91,7 @@ def _stub_provision_fail(workspace):
     return False, "[provision] FAIL: smoke command failed (exit 1)\n"
 
 
-def _stub_launch(workspace, model_name, worker_id, title):
+def _stub_launch(workspace, head, worker_id, title):
     return f"stub-handle-{worker_id}"
 
 
@@ -134,7 +134,7 @@ def main() -> int:
         # 2. PO creates a Ready fixture card on personal_site
         rc = _run_cli("po", ["create", "--project", "personal_site", "--type", "code",
                              "--title", "e2e: dispatcher smoke", "--column", "Ready",
-                             "--model", "sonnet", "--description", "spec body for the worker"])
+                             "--head", "claude-sonnet", "--description", "spec body for the worker"])
         check("create Ready card rc=0", rc == 0)
         cards = ops.list_cards(column="Ready")
         ref = cards[0]["reference"]

@@ -7,11 +7,13 @@ command worker.py hands to `orca terminal create`. A new head is a new `[profile
 plus, only if its launch shape is genuinely new, one more `_render_*` function here — dispatcher.py
 and worker.py never change.
 
-Pure and I/O-light (one toml read, cached per process): no Kanboard, no orca, no subprocess.
+Pure and I/O-light (`load_registry` caches its toml read per process — see its docstring): no
+Kanboard, no orca, no subprocess.
 """
 from __future__ import annotations
 
 import tomllib
+from functools import lru_cache
 from pathlib import Path
 
 HEADS_TOML = Path(__file__).with_name("heads.toml")
@@ -83,7 +85,14 @@ def _validate(resources: dict, profiles: dict) -> None:
                 raise HeadRegistryError(f"profile {pid!r} fallback references unknown profile {fb!r}")
 
 
+@lru_cache(maxsize=None)
 def load_registry(path: Path = HEADS_TOML) -> Registry:
+    """heads.toml, parsed and validated. Cached per (process, path) — every dispatcher tick is a
+    fresh `python3 -m triggered_agents pipeline tick` process, so this only dedupes the 2+ reads
+    a single tick already does (claim's `_check_head`, then bring-up's `render_command`), never a
+    long-lived process going stale against an edited file on disk. A raised HeadRegistryError is
+    not cached — the next call re-reads, so a fixed-then-retried registry recovers without a
+    process restart."""
     try:
         text = path.read_text(encoding="utf-8")
     except FileNotFoundError as e:
