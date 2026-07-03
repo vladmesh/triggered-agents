@@ -129,6 +129,14 @@ class DiscoverHermesSessionsTest(_HermesFixtureCase):
         con.close()
         self.assertEqual(discover.hermes_sessions(), [])
 
+    def test_corrupted_db_degrades_to_empty_instead_of_raising(self):
+        # A state.db that fails to open/query (mid-write corruption, foreign-format file,
+        # transient lock) must not take down the whole harvest tick over an unrelated
+        # Hermes hiccup -- degrade to "no Hermes sessions this run", same as a missing file.
+        self.db_path.write_bytes(b"not a sqlite file")
+        self.assertEqual(discover.hermes_sessions(), [])
+        self.assertEqual(discover.hermes_messages("whatever"), [])
+
 
 class HermesMessagesAndParsingTest(_HermesFixtureCase):
     def setUp(self):

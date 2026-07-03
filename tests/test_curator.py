@@ -1,6 +1,7 @@
 """Unit tests for triggered_agents.agents.curator — discovery and watermark state for both
-session transcripts and personal-memory files. No network, no real ~/.claude — TA_CLAUDE_PROJECTS_DIR
-points discovery at a synthetic tree and TA_STATE gives the curator its own scratch watermark.
+session transcripts and personal-memory files. No network, no real ~/.claude and no real
+~/.hermes — TA_CLAUDE_PROJECTS_DIR/TA_HERMES_HOME_DIR point discovery at synthetic (empty)
+trees and TA_STATE gives the curator its own scratch watermark.
 """
 from __future__ import annotations
 
@@ -13,7 +14,13 @@ from pathlib import Path
 
 _PROJECTS_DIR = tempfile.mkdtemp(prefix="ta-curator-projects-")
 _STATE_DIR = tempfile.mkdtemp(prefix="ta-curator-state-")
+# Empty on purpose: all_sessions()/all_memory_files() unconditionally also scan the Hermes
+# side (discover.HERMES_STATE_DB/HERMES_MEMORY_DIR under this dir). Without this, a run on
+# the curator's own host -- which has a real ~/.hermes -- leaks live Hermes sessions/memory
+# into tests that assert exact counts from the Claude-only fixture tree below.
+_HERMES_HOME_DIR = tempfile.mkdtemp(prefix="ta-curator-hermes-home-")
 os.environ["TA_CLAUDE_PROJECTS_DIR"] = _PROJECTS_DIR
+os.environ["TA_HERMES_HOME_DIR"] = _HERMES_HOME_DIR
 os.environ["TA_STATE"] = _STATE_DIR
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))

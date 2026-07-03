@@ -106,10 +106,23 @@ def claude_sessions() -> list[dict]:
     return out
 
 
-def _hermes_connect() -> sqlite3.Connection:
-    # Read-only: state.db is live-written by real Hermes sessions (WAL mode per its own
-    # docstring, concurrent readers are safe) -- the curator only ever reads it.
-    return sqlite3.connect(f"file:{HERMES_STATE_DB}?mode=ro", uri=True)
+def _hermes_query(sql: str, params: tuple = ()) -> list[tuple] | None:
+    """Run one read-only query against state.db. Returns None (not []) on any sqlite
+    failure -- a corrupted or transiently write-locked DB must degrade Hermes discovery
+    to empty, not raise and take down the whole harvest tick, including the unrelated
+    Claude side."""
+    try:
+        # Read-only: state.db is live-written by real Hermes sessions (WAL mode per its
+        # own docstring, concurrent readers are safe) -- the curator only ever reads it.
+        con = sqlite3.connect(f"file:{HERMES_STATE_DB}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return None
+    try:
+        return con.execute(sql, params).fetchall()
+    except sqlite3.Error:
+        return None
+    finally:
+        con.close()
 
 
 def hermes_sessions() -> list[dict]:
@@ -120,11 +133,9 @@ def hermes_sessions() -> list[dict]:
     out = []
     if not HERMES_STATE_DB.is_file():
         return out
-    con = _hermes_connect()
-    try:
-        rows = con.execute("SELECT id, cwd FROM sessions WHERE archived = 0 ORDER BY id").fetchall()
-    finally:
-        con.close()
+    rows = _hermes_query("SELECT id, cwd FROM sessions WHERE archived = 0 ORDER BY id")
+    if not rows:
+        return out
     for session_id, cwd in rows:
         cwd = cwd or ""
         if cwd and _excluded(cwd):
@@ -142,15 +153,13 @@ def hermes_messages(session_id: str, since_id: int = 0) -> list[dict]:
     """
     if not HERMES_STATE_DB.is_file():
         return []
-    con = _hermes_connect()
-    try:
-        rows = con.execute(
-            "SELECT id, role, content, timestamp FROM messages "
-            "WHERE session_id = ? AND id > ? AND active = 1 ORDER BY id",
-            (session_id, since_id),
-        ).fetchall()
-    finally:
-        con.close()
+    rows = _hermes_query(
+        "SELECT id, role, content, timestamp FROM messages "
+        "WHERE session_id = ? AND id > ? AND active = 1 ORDER BY id",
+        (session_id, since_id),
+    )
+    if not rows:
+        return []
     return [{"id": r[0], "role": r[1], "content": r[2], "timestamp": r[3]} for r in rows]
 
 
