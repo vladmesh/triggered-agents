@@ -56,10 +56,14 @@ class FakeWorker:
         self.agent_worktrees = []        # [(name, path), ...] list_agent_worktrees returns
         self.ff_results = {}             # path -> ff_worktree result dict (default: clean no-op ff)
         self.ff_calls = []               # (path, base_branch) every ff_worktree call
+        self.contrib_projects = set()    # project names is_contrib() should report True for
         self._n = 0
 
     def read_base_branch(self, project):
         return "main"
+
+    def is_contrib(self, project):
+        return project in self.contrib_projects
 
     def list_agent_worktrees(self):
         return list(self.agent_worktrees)
@@ -145,8 +149,8 @@ class _DispatcherBase(unittest.TestCase):
         self.addCleanup(p.stop)
 
         self.worker = FakeWorker()
-        for name in ("read_base_branch", "create_workspace", "set_branch", "provision", "write_task",
-                     "launch_worker", "activity", "poll_pr", "notify", "teardown",
+        for name in ("read_base_branch", "is_contrib", "create_workspace", "set_branch", "provision",
+                     "write_task", "launch_worker", "activity", "poll_pr", "notify", "teardown",
                      "read_stand_config", "pr_branch", "run_stand", "spawn_reviewer",
                      "workspace_exists", "workspace_path", "rename_terminal", "merge_pr",
                      "list_agent_worktrees", "ff_worktree"):
@@ -712,6 +716,21 @@ class TaskMdHistoryTest(_DispatcherBase):
         (_, content), = self.worker.tasks_written
         self.assertIn("force-push запрещён", content)
         self.assertIn(f"pipeline/{ref}", content)
+
+    # контриб-карточка: TASK.md явно говорит push только в origin, upstream не трогать -----------
+    def test_contrib_project_task_md_warns_against_touching_upstream(self):
+        self.worker.contrib_projects = {"agent-kanban"}
+        self._ready_card("A", project="agent-kanban")
+        dispatcher.tick()
+        (_, content), = self.worker.tasks_written
+        self.assertIn("upstream", content)
+        self.assertIn("origin", content)
+
+    def test_non_contrib_project_task_md_has_no_upstream_warning(self):
+        self._ready_card("A")  # default project ("personal_site") is never in contrib_projects
+        dispatcher.tick()
+        (_, content), = self.worker.tasks_written
+        self.assertNotIn("upstream", content)
 
     def test_metadata_section_has_type_model_slug_blocked_by(self):
         pred = self._ready_card("Pred")

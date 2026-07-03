@@ -172,6 +172,193 @@ class GitHygieneTest(unittest.TestCase):
         self.assertNotEqual(_current_branch(worker_ws), _current_branch(review_ws))
 
 
+class ManifestLookupTest(unittest.TestCase):
+    """_load_manifest (via read_base_branch/is_contrib) chains: workspace.toml in the project's
+    own repo, else the central control-panel manifest for contrib forks that don't commit one to
+    their own repo (agent-kanban-232), else plain defaults — the same three cases provision.py's
+    own lookup has to cover, just for worker.py's slice of the decision (base_branch, contrib)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        root = Path(self.tmp.name)
+        self.projects_dir = root / "projects"
+        self.projects_dir.mkdir()
+        self.control_panel = root / "control-panel"
+        (self.control_panel / "pipeline" / "manifests").mkdir(parents=True)
+
+        p1 = mock.patch.object(worker, "PROJECTS_DIR", self.projects_dir)
+        p1.start()
+        self.addCleanup(p1.stop)
+        p2 = mock.patch.object(worker, "CONTROL_PANEL", self.control_panel)
+        p2.start()
+        self.addCleanup(p2.stop)
+
+    def _project_dir(self, name: str) -> Path:
+        d = self.projects_dir / name
+        d.mkdir()
+        return d
+
+    def _central_manifest(self, name: str) -> Path:
+        return self.control_panel / "pipeline" / "manifests" / f"{name}.toml"
+
+    def test_local_workspace_toml_wins_over_central_manifest(self):
+        d = self._project_dir("local-proj")
+        (d / "workspace.toml").write_text('[workspace]\nbase_branch = "develop"\ncontrib = true\n')
+        self._central_manifest("local-proj").write_text(
+            '[workspace]\nbase_branch = "central-should-not-win"\n')
+        self.assertEqual(worker.read_base_branch("local-proj"), "develop")
+        self.assertTrue(worker.is_contrib("local-proj"))
+
+    def test_falls_back_to_central_manifest_when_no_local_one(self):
+        self._project_dir("fork-proj")  # on disk, but carries no workspace.toml of its own
+        self._central_manifest("fork-proj").write_text(
+            '[workspace]\nbase_branch = "main"\ncontrib = true\n')
+        self.assertEqual(worker.read_base_branch("fork-proj"), "main")
+        self.assertTrue(worker.is_contrib("fork-proj"))
+
+    def test_defaults_when_neither_manifest_exists(self):
+        self._project_dir("bare-proj")
+        self.assertEqual(worker.read_base_branch("bare-proj"), "main")
+        self.assertFalse(worker.is_contrib("bare-proj"))
+
+
+class ContribBaseRefTest(unittest.TestCase):
+    """ensure_contrib_base_ref: idempotent `orca repo set-base-ref` against `orca repo show`'s
+    current worktreeBaseRef — a contrib bring-up must converge Orca's host-local default to the
+    manifest's declaration without hitting the write path when it's already converged."""
+
+    def setUp(self):
+        self.repo_state = {}
+        self.calls = []
+
+        def fake_orca_json(args):
+            self.calls.append(args)
+            if args[0] == "repo" and args[1] == "show":
+                return {"repo": dict(self.repo_state)}
+            if args[0] == "repo" and args[1] == "set-base-ref":
+                ref = args[args.index("--ref") + 1]
+                self.repo_state["worktreeBaseRef"] = ref
+                return {"repo": dict(self.repo_state)}
+            raise AssertionError(f"unexpected orca call: {args}")
+
+        p = mock.patch.object(worker, "_orca_json", fake_orca_json)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_noop_when_already_set(self):
+        self.repo_state = {"worktreeBaseRef": "upstream/main",
+                            "gitRemoteIdentity": {"remoteName": "upstream"}}
+        remote = worker.ensure_contrib_base_ref(Path("/repo"), "main")
+        self.assertEqual(remote, "upstream")
+        self.assertFalse(any(c[:2] == ["repo", "set-base-ref"] for c in self.calls))
+
+    def test_sets_when_missing_or_stale(self):
+        self.repo_state = {"worktreeBaseRef": "origin/main",
+                            "gitRemoteIdentity": {"remoteName": "upstream"}}
+        remote = worker.ensure_contrib_base_ref(Path("/repo"), "main")
+        self.assertEqual(remote, "upstream")
+        set_calls = [c for c in self.calls if c[:2] == ["repo", "set-base-ref"]]
+        self.assertEqual(len(set_calls), 1)
+        self.assertIn("upstream/main", set_calls[0])
+
+
+class ContribForkBringUpTest(unittest.TestCase):
+    """create_workspace for a contrib-fork project (manifest `[workspace] contrib = true`)
+    branches the worktree off the upstream remote, never origin — the whole point being that a
+    worker's branch (and thus its PR back to the fork) never carries the fork's own origin/main
+    history forward (agent-kanban-232's precedent). Real git remotes, fake orca (same discipline
+    as GitHygieneTest above)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        root = Path(self.tmp.name)
+
+        self.origin_bare = root / "origin.git"
+        self.upstream_bare = root / "upstream.git"
+        self.checkout = root / "checkout"
+        subprocess.run(["git", "init", "-q", "-b", "main", str(self.checkout)], check=True)
+        for cmd in (["config", "user.email", "t@t"], ["config", "user.name", "t"]):
+            _git(self.checkout, *cmd)
+        subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(self.origin_bare)], check=True)
+        subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(self.upstream_bare)], check=True)
+        _git(self.checkout, "remote", "add", "origin", str(self.origin_bare))
+        _git(self.checkout, "remote", "add", "upstream", str(self.upstream_bare))
+
+        (self.checkout / "f.txt").write_text("v1")
+        _git(self.checkout, "add", "f.txt")
+        _git(self.checkout, "commit", "-q", "-m", "v1")
+        _git(self.checkout, "push", "-q", "origin", "main")
+        _git(self.checkout, "push", "-q", "upstream", "main")
+
+        # Diverge: the fork (origin) races ahead with its own commit that upstream never sees —
+        # a contrib worktree must be cut from upstream, never from this.
+        (self.checkout / "f.txt").write_text("origin-only-v2")
+        _git(self.checkout, "commit", "-q", "-am", "origin-only-v2")
+        _git(self.checkout, "push", "-q", "origin", "main")
+        _git(self.checkout, "reset", "-q", "--hard", "HEAD~1")
+        (self.checkout / "f.txt").write_text("upstream-v2")
+        _git(self.checkout, "commit", "-q", "-am", "upstream-v2")
+        _git(self.checkout, "push", "-q", "upstream", "main")
+        _git(self.checkout, "reset", "-q", "--hard", "HEAD~1")
+
+        self.projects_dir = root / "projects"
+        self.projects_dir.mkdir()
+        (self.projects_dir / "cproj").symlink_to(self.checkout)
+        self.control_panel = root / "control-panel"
+        (self.control_panel / "pipeline" / "manifests").mkdir(parents=True)
+        (self.control_panel / "pipeline" / "manifests" / "cproj.toml").write_text(
+            '[workspace]\nbase_branch = "main"\ncontrib = true\n')
+
+        for target, value in (("PROJECTS_DIR", self.projects_dir), ("WORKSPACES_ROOT", root),
+                              ("CONTROL_PANEL", self.control_panel)):
+            p = mock.patch.object(worker, target, value)
+            p.start()
+            self.addCleanup(p.stop)
+
+        self.worktrees = []
+        self.repo_state = {"worktreeBaseRef": "upstream/main",
+                           "gitRemoteIdentity": {"remoteName": "upstream"}}
+        self.set_base_ref_calls = []
+
+        def fake_orca_json(args):
+            if args[0] == "worktree":
+                base_ref = args[args.index("--base-branch") + 1]
+                wt_name = args[args.index("--name") + 1]
+                path = root / "wt" / f"wt{len(self.worktrees)}"
+                subprocess.run(["git", "-C", str(self.checkout), "worktree", "add", "-b", wt_name,
+                               str(path), base_ref], check=True, capture_output=True)
+                self.worktrees.append(path)
+                return {"worktree": {"path": str(path)}}
+            if args[0] == "repo" and args[1] == "show":
+                return {"repo": dict(self.repo_state)}
+            if args[0] == "repo" and args[1] == "set-base-ref":
+                ref = args[args.index("--ref") + 1]
+                self.set_base_ref_calls.append(ref)
+                self.repo_state["worktreeBaseRef"] = ref
+                return {"repo": dict(self.repo_state)}
+            return {"terminal": {"handle": "term-1"}}
+
+        oj = mock.patch.object(worker, "_orca_json", fake_orca_json)
+        oj.start()
+        self.addCleanup(oj.stop)
+
+    def test_worktree_is_cut_from_upstream_not_origin(self):
+        ws = worker.create_workspace("cproj", "w1", "main")
+        self.assertEqual((Path(ws) / "f.txt").read_text(), "upstream-v2")
+
+    def test_base_ref_already_set_is_left_alone(self):
+        worker.create_workspace("cproj", "w1", "main")
+        self.assertEqual(self.set_base_ref_calls, [])
+
+    def test_base_ref_gets_set_when_missing(self):
+        self.repo_state = {"worktreeBaseRef": "origin/main",
+                           "gitRemoteIdentity": {"remoteName": "upstream"}}
+        worker.create_workspace("cproj", "w1", "main")
+        self.assertEqual(self.set_base_ref_calls, ["upstream/main"])
+
+
 class ScrubSecretsTest(unittest.TestCase):
     """worker.scrub_secrets' generic blob backstop must spare git shas and other hex-shaped
     identifiers while still catching base64/token-looking blobs — a comment full of

@@ -898,6 +898,12 @@ def _task_md(card: dict, view: dict) -> str:
         f"проекта и только в свою ветку `{branch}`.",
         "",
     ]
+    if worker.is_contrib(card.get("project") or ""):
+        lines += [
+            f"Контриб-проект (форк): пуш только в `origin` (твой форк) — `upstream` (репо "
+            f"автора) не трогать, туда не пушить и не мержить.",
+            "",
+        ]
     lines += _task_md_metadata(card)
     lines += [
         "## Спека",
