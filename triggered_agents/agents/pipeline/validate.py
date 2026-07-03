@@ -6,20 +6,25 @@ layer 1 (mechanical, PR project): poll the card's PR through gh (worker.poll_pr)
     moves on. A contrib (fork) card has no PR in this pipeline by definition (a human opens it
     against upstream from the pushed branch afterward) — layer 1 there is just the worker's own
     report:done, which must carry `branch:`/`head:` protocol lines instead of a PR link (the
-    proof-of-push, parsed back by _contrib_ref); no gh call at all.
+    proof-of-push, parsed back by _contrib_ref); no gh call at all, but the claimed sha is checked
+    against the branch's real head on origin (worker.remote_head_sha) right before the reviewer
+    would be spawned — a mismatch stalls instead of reviewing a state the worker never claimed
+    (_validate_contrib_card), since the worker's session lives on and could keep pushing.
 layer 2 (stand, PR projects only): for a project with a `[stand]` manifest section, deploy the PR
     branch and run e2e (_stand_gate) before layer 3 — green only after a green stand run, one
     auto-retry then Blocked. Never applies to a contrib card.
 layer 3 (independent review, every project): once the lower layers are green, spawn a reviewer
     head (not the worker, no code access — worker.spawn_reviewer) off the card's own branch (PR or
-    contrib, the same branch-based bring-up either way) and drive it by its verdict exactly the way
-    dispatcher._advance drives an In-progress card by the worker's report: spawn once per code
-    state, read the verdict past a baseline, act. Red -> back to In progress with a nudge, up to
-    REVIEW_RETURN_CAP returns over the card's life, then Blocked до vladmesh. Green on a PR project
-    without a stand waits for a human merge; green on a PR stand project triggers the dispatcher's
-    own squash merge; green on a contrib card has nothing to wait for (no PR in this pipeline) and
-    goes straight to Done with the worker workspace torn down. A reviewer that goes silent without
-    a verdict is caught by the same watchdog threshold as a worker head.
+    contrib, the same branch-based bring-up either way, except a contrib card pins the reviewer's
+    worktree to the exact verified sha rather than the branch's live tip) and drive it by its
+    verdict exactly the way dispatcher._advance drives an In-progress card by the worker's report:
+    spawn once per code state, read the verdict past a baseline, act. Red -> back to In progress
+    with a nudge, up to REVIEW_RETURN_CAP returns over the card's life, then Blocked до vladmesh.
+    Green on a PR project without a stand waits for a human merge; green on a PR stand project
+    triggers the dispatcher's own squash merge; green on a contrib card has nothing to wait for
+    (no PR in this pipeline) and goes straight to Done with the worker workspace torn down. A
+    reviewer that goes silent without a verdict is caught by the same watchdog threshold as a
+    worker head.
 
 `run(records, watchdog_seconds, save_cards)` is the single entry point dispatcher.tick calls once
 per tick; every other name here is private. `watchdog_seconds` and `save_cards` are threaded in
@@ -284,11 +289,35 @@ def _validate_contrib_card(ref: str, card: dict, rec: dict | None, records: dict
     parsed back by _contrib_ref above) — the proof-of-push a PR link supplies on a regular card.
     Missing it stalls exactly like a missing PR link (_validate_stall, same cap and eventual
     Blocked), but under its own reason: a contrib card must never take the no-pr-ref path, since it
-    has no PR by definition."""
+    has no PR by definition.
+
+    The claimed sha is not trusted on its own: a worker may keep pushing after report:done (the
+    session lives on until Done/Blocked), so the branch head a review would land on can drift past
+    what the report claims. worker.remote_head_sha reads the real head straight off origin right
+    before the reviewer for this code state would be spawned (guarded by the same
+    `"review_baseline" not in rec` condition _review_gate uses, so it fires once per fresh report,
+    not every tick a reviewer is already up and being watched/verdict-read); a mismatch (or a
+    branch gh/git can't currently resolve) is not a review outcome — it stalls the same way a
+    missing branch/sha does, giving the worker a chance to push a matching sha and re-report rather
+    than reviewing a state it never claimed.
+
+    The comparison is a case-insensitive prefix match, not equality: `_CONTRIB_HEAD_RE` (and real
+    workers via `git rev-parse --short`/`git push`'s own output) allows an abbreviated and/or
+    mixed-case sha, while `git ls-remote` (remote_head_sha) always answers with the full 40-char
+    lowercase object name. A plain `!=` would flag an honestly-matching short/mixed-case sha as a
+    mismatch and escalate a perfectly good report to Blocked — the exact false-positive this gate
+    must not produce (triggered-agents-240 review)."""
     ref_info = _contrib_ref(view)
     if ref_info is None:
         return _validate_stall(ref, "no-branch-ref", rec, records)
     branch, sha = ref_info
+    if rec is None or "review_baseline" not in rec:
+        actual = worker.remote_head_sha(card.get("project") or "", branch)
+        if actual is None:
+            return _validate_stall(ref, "branch-unavailable", rec, records, branch=branch)
+        if not actual.lower().startswith(sha.lower()):
+            return _validate_stall(ref, "sha-mismatch", rec, records, branch=branch,
+                                   reported=sha, actual=actual)
     changed = bool(rec is not None and rec.pop("validate_stall_fails", None) is not None)
     baseline = int(rec.get("comment_baseline", 0)) if rec is not None else 0
     if not _has_marker_since(view, model.MARKER_VALIDATE_GREEN, baseline):
@@ -305,20 +334,23 @@ def _validate_contrib_card(ref: str, card: dict, rec: dict | None, records: dict
 
 
 def _validate_stall(ref: str, reason: str, rec: dict | None, records: dict, **log_fields) -> bool:
-    """no-pr-ref / gh-unavailable / no-branch-ref: the dispatcher couldn't even establish what to
-    validate this tick. A one-off is a silent retry (still worth a warn line for the logs);
-    VALIDATE_STALL_ATTEMPTS in a row escalates once to Blocked so a permanently missing PR link,
-    a dead gh integration, or a contrib report with no branch/head surfaces to a human instead of
-    warning forever with no signal. An untracked card (no record — a manual move or a lost
-    cards.json) has nowhere to keep the count, so it stays a bare warn, same as _review_gate does
-    for an untracked card."""
+    """no-pr-ref / gh-unavailable / no-branch-ref / branch-unavailable / sha-mismatch: the
+    dispatcher couldn't even establish what to validate this tick, or (the latter two, contrib-only)
+    established it but the reported sha doesn't hold up against the real branch head on origin. A
+    one-off is a silent retry (still worth a warn line for the logs, `**log_fields` carrying the
+    branch/reported/actual sha for sha-mismatch so the reason is legible in runs.jsonl);
+    VALIDATE_STALL_ATTEMPTS in a row escalates once to Blocked so a permanently missing PR link, a
+    dead gh integration, or a contrib report whose branch/sha never checks out surfaces to a human
+    instead of warning forever with no signal. An untracked card (no record — a manual move or a
+    lost cards.json) has nowhere to keep the count, so it stays a bare warn, same as _review_gate
+    does for an untracked card."""
     STATE.log_run("validate", reference=ref, result=reason, level="warn", **log_fields)
     if rec is None:
         return False
     fails = rec.get("validate_stall_fails", 0) + 1
     if fails >= VALIDATE_STALL_ATTEMPTS:
         ws = rec.get("workspace") or "(неизвестен)"
-        subject = "ветку/head в отчёте" if reason == "no-branch-ref" else "статус PR"
+        subject = "статус PR" if reason in ("no-pr-ref", "gh-unavailable") else "ветку/head в отчёте"
         clear_review(rec)
         ops.add_comment("dispatcher", ref,
                         f"Validate не может определить {subject} {fails} тиков подряд ({reason}). "
@@ -435,7 +467,8 @@ def _spawn_reviewer(ref: str, pr: str | None, card: dict, rec: dict, records: di
                                         branch=contrib[0] if contrib else None,
                                         head_sha=contrib[1] if contrib else None)
         ws, handle = worker.spawn_reviewer(project, _review_id(card), base, review_md, review_title,
-                                           naming.worker_branch(ref), naming.reviewer_branch(ref))
+                                           naming.worker_branch(ref), naming.reviewer_branch(ref),
+                                           head_sha=contrib[1] if contrib else None)
     except worker.WorkspaceError as e:
         # spawn_reviewer already tore down any half-created worktree. Retry a few ticks (transient
         # orca), then escalate to Blocked — a persistent failure must not retry forever with no

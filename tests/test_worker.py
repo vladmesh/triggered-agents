@@ -158,6 +158,40 @@ class GitHygieneTest(unittest.TestCase):
         self.assertFalse(Path(old_ws).exists())   # reclaimed via the normal teardown path
         self.assertEqual(_current_branch(new_ws), "pipeline/triggered-agents-220")
 
+    def test_remote_head_sha_reads_current_branch_tip(self):
+        self._push_new_commit_on("pipeline/triggered-agents-240", "v2-content")
+        want = _git(self.bare, "rev-parse", "pipeline/triggered-agents-240").stdout.strip()
+        self.assertEqual(worker.remote_head_sha("proj", "pipeline/triggered-agents-240"), want)
+
+    def test_remote_head_sha_none_for_unknown_branch(self):
+        self.assertIsNone(worker.remote_head_sha("proj", "pipeline/does-not-exist"))
+
+    def test_land_pr_head_pins_to_expected_sha_ignoring_newer_push(self):
+        # triggered-agents-240: a contrib worker's session lives on past report:done and could keep
+        # pushing before the reviewer is actually spawned — land_pr_head must still land on the sha
+        # the report claimed, not whatever origin's tip has become by the time it runs. The second
+        # push is a real fast-forward on top of the first (not a force-push off main), the way a
+        # worker that keeps committing after report:done actually behaves.
+        branch = "pipeline/triggered-agents-220"
+        tmp_co = Path(tempfile.mkdtemp(dir=self.tmp.name, prefix="chain-"))
+        subprocess.run(["git", "clone", "-q", str(self.bare), str(tmp_co)], check=True)
+        for cmd in (["config", "user.email", "t@t"], ["config", "user.name", "t"]):
+            _git(tmp_co, *cmd)
+        _git(tmp_co, "checkout", "-q", "-B", branch)
+        (tmp_co / "f.txt").write_text("reported-content")
+        _git(tmp_co, "commit", "-q", "-am", "reported-content")
+        _git(tmp_co, "push", "-q", "-f", "origin", branch)
+        reported_sha = _git(tmp_co, "rev-parse", "HEAD").stdout.strip()
+        (tmp_co / "f.txt").write_text("content-pushed-after-report")
+        _git(tmp_co, "commit", "-q", "-am", "content-pushed-after-report")
+        _git(tmp_co, "push", "-q", "origin", branch)   # fast-forward, same lineage as reported_sha
+
+        ws = worker.create_workspace("proj", "rev1", "main")
+        worker.land_pr_head(ws, branch, "review/triggered-agents-220", expected_sha=reported_sha)
+        self.assertEqual(_current_branch(ws), "review/triggered-agents-220")
+        self.assertEqual((Path(ws) / "f.txt").read_text(), "reported-content")
+        self.assertEqual(_git(ws, "rev-parse", "HEAD").stdout.strip(), reported_sha)
+
     def test_land_pr_head_never_checks_out_the_pr_branch_name_itself(self):
         # The bug this replaces: `gh pr checkout` names the local branch after the PR's own head,
         # which collides with the worker's live worktree already sitting on that exact branch. A

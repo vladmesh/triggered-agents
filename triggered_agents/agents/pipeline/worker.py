@@ -283,15 +283,37 @@ def set_branch(workspace: str, branch: str) -> None:
     _claim_branch(workspace, branch)
 
 
-def land_pr_head(workspace: str, pr_branch: str, review_branch: str) -> None:
+def land_pr_head(workspace: str, pr_branch: str, review_branch: str,
+                 expected_sha: str | None = None) -> None:
     """Fetch `pr_branch` (the worker's own branch, i.e. the PR's head — same-repo, never a fork)
     from origin into the reviewer's worktree and land it under `review_branch`. This is the
     fetch-not-checkout the reviewer uses instead of `gh pr checkout`: that command tries to check
     out the PR's own branch name locally, which collides ('already used by worktree') with the
-    worker's live worktree still sitting on that exact branch."""
+    worker's live worktree still sitting on that exact branch.
+
+    `expected_sha`, when given (a contrib card — see spawn_reviewer), pins the reset to that exact
+    commit instead of the branch's live tip: a worker that keeps pushing between
+    validate._validate_contrib_card's sha check and this call must not slip newer content past the
+    sha the review is supposed to cover. The fetch still brings `expected_sha` in regardless — it
+    is always an ancestor of the fetched tip, since force-push is against the pipeline's rules."""
     _git_ok(workspace, ["fetch", "origin", pr_branch])
-    _git_ok(workspace, ["reset", "--hard", "FETCH_HEAD"])
+    _git_ok(workspace, ["reset", "--hard", expected_sha or "FETCH_HEAD"])
     _claim_branch(workspace, review_branch)
+
+
+def remote_head_sha(project: str, branch: str) -> str | None:
+    """Current head sha of `branch` on `project`'s origin, read straight off the remote via `git
+    ls-remote` — no local fetch, no mutation of project_root (create_workspace's own git plumbing
+    root uses the same path). None when `branch` doesn't exist on origin yet or the remote can't be
+    reached this tick; validate._validate_contrib_card treats either the same as gh being briefly
+    unavailable, giving a still-pushing worker another tick before escalating."""
+    root = project_root(project)
+    try:
+        out = _git_ok(root, ["ls-remote", "origin", f"refs/heads/{branch}"], timeout=GH_TIMEOUT_S)
+    except WorkspaceError:
+        return None
+    line = out.strip()
+    return line.split()[0] if line else None
 
 
 def provision(workspace: str) -> tuple[bool, str]:
@@ -417,15 +439,20 @@ def _reviewer_command(worker_id: str) -> str:
 
 
 def spawn_reviewer(project: str, worker_id: str, base_branch: str, review_md: str, title: str,
-                   pr_branch: str, review_branch: str) -> tuple[str, str]:
+                   pr_branch: str, review_branch: str, head_sha: str | None = None) -> tuple[str, str]:
     """Bring up the layer-3 reviewer head: a fresh worktree off base_branch, landed on the PR's
     head content under its own `review_branch` (land_pr_head — fetch, not `gh pr checkout`, so the
     reviewer never touches the worker's own branch), the REVIEW.md prompt, then the head. No
     provisioning — the reviewer only reads code and drives gh/board-CLI, so it needs no app deps.
-    Returns (workspace, terminal handle). `title` seeds the tab's display name (see launch_worker)."""
+    Returns (workspace, terminal handle). `title` seeds the tab's display name (see launch_worker).
+
+    `head_sha`, given only for a contrib card (validate._spawn_reviewer), pins the reviewer's
+    worktree to the exact sha the worker's report claimed rather than the branch's live tip — see
+    land_pr_head. None for a regular PR card (out of scope: PR-card sha pinning has a human merge
+    gate downstream already)."""
     ws = create_workspace(project, worker_id, base_branch)
     try:
-        land_pr_head(ws, pr_branch, review_branch)
+        land_pr_head(ws, pr_branch, review_branch, head_sha)
         _write_excluded(ws, "REVIEW.md", review_md)
         ensure_trust(ws)
         ensure_theme()
