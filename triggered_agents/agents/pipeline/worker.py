@@ -129,6 +129,48 @@ def read_base_branch(project: str) -> str:
     return cfg.get("workspace", {}).get("base_branch", "main")
 
 
+# --- Agent worktrees (board/curator/pipeline/retro's own worktrees, not a task workspace) -----
+# Each triggered-agent gets its own named Orca worktree under AGENTS_ROOT (deploy/provision.py
+# creates it, pinned to origin/main at provision time). Agents never commit to this repo, so from
+# then on the worktree only needs to move forward with origin — the dispatcher's precheck does
+# that on every tick instead of a human doing it by hand after every push.
+AGENTS_ROOT = WORKSPACES_ROOT / "triggered-agents"
+_AGENTS_SPEC_DIR = Path(__file__).resolve().parents[2] / "agents"
+
+
+def list_agent_worktrees() -> list[tuple[str, str]]:
+    """(name, path) for every triggered-agent with a spec (triggered_agents/agents/<name>/
+    automation.toml — the same set deploy/provision.py provisions) whose own worktree already
+    exists on disk under AGENTS_ROOT. An agent not yet provisioned has nothing to fast-forward, so
+    it's silently absent here rather than warned about."""
+    names = sorted(p.name for p in _AGENTS_SPEC_DIR.iterdir() if (p / "automation.toml").is_file())
+    return [(n, str(AGENTS_ROOT / n)) for n in names if (AGENTS_ROOT / n).is_dir()]
+
+
+def ff_worktree(path: str, base_branch: str) -> dict:
+    """Fast-forward `path`'s checked-out branch to origin/<base_branch>, strictly --ff-only.
+    Returns {"ok", "reason", "before", "after"}. Never resets or force-touches the tree: an
+    impossible ff (local commits, a diverged history) is left exactly as found, with "reason"
+    carrying git's own explanation. Never raises — a gone worktree, a git binary hiccup, or a
+    hung git (via `_git`'s timeout) all come back as a plain not-ok result, same as every other
+    host call the dispatcher tick must survive without aborting."""
+    try:
+        before = _git(path, ["rev-parse", "HEAD"])
+        if before.returncode != 0:
+            return {"ok": False, "reason": (before.stderr or before.stdout).strip() or "not a git worktree"}
+        fetch = _git(path, ["fetch", "--quiet", "origin", base_branch])
+        if fetch.returncode != 0:
+            return {"ok": False, "reason": f"fetch failed: {(fetch.stderr or fetch.stdout).strip()}"}
+        merge = _git(path, ["merge", "--ff-only", f"origin/{base_branch}"])
+        if merge.returncode != 0:
+            return {"ok": False, "reason": (merge.stderr or merge.stdout).strip() or "not fast-forwardable"}
+        after = _git(path, ["rev-parse", "HEAD"])
+    except WorkspaceError as e:
+        return {"ok": False, "reason": str(e)}
+    return {"ok": True, "reason": None, "before": before.stdout.strip(),
+            "after": after.stdout.strip() if after.returncode == 0 else None}
+
+
 def create_workspace(project: str, name: str, base_branch: str) -> str:
     """Fetch base_branch fresh from origin, then create an Orca worktree off `origin/base_branch`
     (never the project's own local checkout state — a stale/switched local branch must not leak

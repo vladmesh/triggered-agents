@@ -52,10 +52,20 @@ class FakeWorker:
         self.existing_workspaces = set()  # (project, name) pairs treated as already on disk
         self.renamed = []                # (handle, title) every rename_terminal call
         self.branches_set = []           # (workspace, branch) every set_branch call
+        self.agent_worktrees = []        # [(name, path), ...] list_agent_worktrees returns
+        self.ff_results = {}             # path -> ff_worktree result dict (default: clean no-op ff)
+        self.ff_calls = []               # (path, base_branch) every ff_worktree call
         self._n = 0
 
     def read_base_branch(self, project):
         return "main"
+
+    def list_agent_worktrees(self):
+        return list(self.agent_worktrees)
+
+    def ff_worktree(self, path, base_branch):
+        self.ff_calls.append((path, base_branch))
+        return self.ff_results.get(path, {"ok": True, "reason": None, "before": "x", "after": "x"})
 
     def create_workspace(self, project, name, base_branch):
         if self.create_raises:
@@ -137,7 +147,8 @@ class _DispatcherBase(unittest.TestCase):
         for name in ("read_base_branch", "create_workspace", "set_branch", "provision", "write_task",
                      "launch_worker", "activity", "poll_pr", "notify", "teardown",
                      "read_stand_config", "pr_branch", "run_stand", "spawn_reviewer",
-                     "workspace_exists", "workspace_path", "rename_terminal", "merge_pr"):
+                     "workspace_exists", "workspace_path", "rename_terminal", "merge_pr",
+                     "list_agent_worktrees", "ff_worktree"):
             wp = mock.patch(f"triggered_agents.agents.pipeline.worker.{name}",
                             getattr(self.worker, name))
             wp.start()
@@ -217,6 +228,57 @@ class DispatcherTest(_DispatcherBase):
         runs = [r for r in self._runs() if r["event"] == "precheck"]
         self.assertTrue(any(r.get("result") == "error" and r.get("error_class") == "RuntimeError"
                              for r in runs))
+
+    # ff agent worktrees ------------------------------------------------------
+    def test_precheck_ffs_clean_agent_worktrees(self):
+        self.worker.agent_worktrees = [("board", "/ws/agents/board")]
+        self.worker.ff_results = {"/ws/agents/board": {"ok": True, "reason": None,
+                                                        "before": "aaa", "after": "bbb"}}
+        dispatcher.precheck()
+        self.assertIn(("/ws/agents/board", "main"), self.worker.ff_calls)
+        runs = [r for r in self._runs() if r["event"] == "ff-agents"]
+        self.assertTrue(any(r.get("agent") == "board" and r.get("result") == "ff"
+                             and r.get("before") == "aaa" and r.get("after") == "bbb" for r in runs))
+
+    def test_precheck_ff_noop_when_already_up_to_date(self):
+        self.worker.agent_worktrees = [("retro", "/ws/agents/retro")]
+        self.worker.ff_results = {"/ws/agents/retro": {"ok": True, "reason": None,
+                                                        "before": "aaa", "after": "aaa"}}
+        dispatcher.precheck()
+        runs = [r for r in self._runs() if r["event"] == "ff-agents"]
+        self.assertFalse(runs)  # no log spam for a no-op ff
+
+    # non-ff (local commits/conflict) warns by worktree name and never breaks the tick
+    def test_precheck_ff_blocked_warns_and_does_not_break_tick(self):
+        self.worker.agent_worktrees = [("curator", "/ws/agents/curator")]
+        self.worker.ff_results = {"/ws/agents/curator": {"ok": False,
+                                                          "reason": "local commits"}}
+        self._ready_card("A")
+        rc = dispatcher.precheck()
+        self.assertEqual(rc, 0)  # board state still decides the exit code, unaffected by ff
+        runs = [r for r in self._runs() if r["event"] == "ff-agents"]
+        self.assertTrue(any(r.get("agent") == "curator" and r.get("result") == "blocked"
+                             and r.get("level") == "warn" and "local commits" in r.get("reason", "")
+                             for r in runs))
+
+    def test_precheck_ff_one_bad_worktree_does_not_skip_the_rest(self):
+        self.worker.agent_worktrees = [("board", "/ws/agents/board"), ("retro", "/ws/agents/retro")]
+        self.worker.ff_results = {"/ws/agents/board": {"ok": False, "reason": "diverged"},
+                                  "/ws/agents/retro": {"ok": True, "reason": None,
+                                                        "before": "a", "after": "b"}}
+        dispatcher.precheck()
+        paths_called = [c[0] for c in self.worker.ff_calls]
+        self.assertEqual(paths_called, ["/ws/agents/board", "/ws/agents/retro"])
+        runs = [r for r in self._runs() if r["event"] == "ff-agents"]
+        self.assertTrue(any(r.get("agent") == "board" and r.get("result") == "blocked" for r in runs))
+        self.assertTrue(any(r.get("agent") == "retro" and r.get("result") == "ff" for r in runs))
+
+    def test_precheck_ff_survives_read_base_branch_failure(self):
+        with mock.patch.object(worker, "read_base_branch", side_effect=RuntimeError("no manifest")):
+            rc = dispatcher.precheck()
+        self.assertEqual(rc, 1)  # board still empty -> nothing-to-do, unaffected
+        runs = [r for r in self._runs() if r["event"] == "ff-agents"]
+        self.assertTrue(any(r.get("result") == "error" and r.get("level") == "warn" for r in runs))
 
     # claim + bring-up ------------------------------------------------------
     def test_tick_claims_and_launches(self):
