@@ -46,10 +46,11 @@ class FakeWorker:
         self.stand_branch = "pipeline/x"  # branch pr_branch returns (None -> gh can't answer)
         self.stand_result = None         # dict from run_stand, or None for unavailable
         self.stand_runs = []             # (project, branch) each run_stand was asked about
-        self.reviewer_spawns = []        # (project, worker_id, base) each spawn_reviewer was asked
+        self.reviewer_spawns = []        # (project, worker_id, base, title, pr_branch, review_branch)
         self.reviewer_raises = None      # set to raise from spawn_reviewer (orca failure)
         self.existing_workspaces = set()  # (project, name) pairs treated as already on disk
         self.renamed = []                # (handle, title) every rename_terminal call
+        self.branches_set = []           # (workspace, branch) every set_branch call
         self._n = 0
 
     def read_base_branch(self, project):
@@ -60,6 +61,9 @@ class FakeWorker:
             raise self.create_raises
         self._n += 1
         return f"/ws/{name}"
+
+    def set_branch(self, workspace, branch):
+        self.branches_set.append((workspace, branch))
 
     def provision(self, workspace):
         return self.provision_ok, self.provision_log
@@ -104,10 +108,10 @@ class FakeWorker:
         self.stand_runs.append((project, branch))
         return self.stand_result
 
-    def spawn_reviewer(self, project, worker_id, base_branch, review_md, title):
+    def spawn_reviewer(self, project, worker_id, base_branch, review_md, title, pr_branch, review_branch):
         if self.reviewer_raises:
             raise self.reviewer_raises
-        self.reviewer_spawns.append((project, worker_id, base_branch, title))
+        self.reviewer_spawns.append((project, worker_id, base_branch, title, pr_branch, review_branch))
         return f"/rev/{worker_id}", f"rev-handle-{worker_id}"
 
     def teardown(self, workspace):
@@ -125,7 +129,7 @@ class _DispatcherBase(unittest.TestCase):
         self.addCleanup(p.stop)
 
         self.worker = FakeWorker()
-        for name in ("read_base_branch", "create_workspace", "provision", "write_task",
+        for name in ("read_base_branch", "create_workspace", "set_branch", "provision", "write_task",
                      "launch_worker", "activity", "poll_pr", "notify", "teardown",
                      "read_stand_config", "pr_branch", "run_stand", "spawn_reviewer",
                      "workspace_exists", "rename_terminal", "merge_pr"):
@@ -207,6 +211,24 @@ class DispatcherTest(_DispatcherBase):
         records = dispatcher._load_cards()
         self.assertIn(ref, records)
         self.assertEqual(records[ref]["comment_baseline"], 0)
+
+    def test_tick_renames_branch_before_launching_the_head(self):
+        # bring-up must land the worktree on its own pipeline/<ref> branch before the worker head
+        # ever starts — no head creates or renames its own branch.
+        from triggered_agents.agents.pipeline import naming
+        ref = self._ready_card("A")
+        dispatcher.tick()
+        ws = self.worker.launched[0]["ws"]
+        self.assertEqual(self.worker.branches_set, [(ws, naming.worker_branch(ref))])
+
+    def test_task_md_states_branch_ready_not_create_it(self):
+        from triggered_agents.agents.pipeline import naming
+        ref = self._ready_card("A")
+        dispatcher.tick()
+        task_md = self.worker.tasks_written[0][1]
+        self.assertIn(f"уже стоит на ветке `{naming.worker_branch(ref)}`", task_md)
+        self.assertNotIn("git checkout -b", task_md)
+        self.assertNotIn("git branch -m", task_md)
 
     def test_tick_smoke_fail_blocks_and_no_head(self):
         ref = self._ready_card("A")
@@ -568,9 +590,11 @@ class WorkspaceNamingTest(_DispatcherBase):
         dispatcher.tick()   # CI green -> spawns the reviewer
         self.assertEqual(len(self.worker.reviewer_spawns), 1)
         expect_title = naming.reviewer_title(cid, "A")
-        _, worker_id, _, spawned_title = self.worker.reviewer_spawns[0]
+        _, worker_id, _, spawned_title, pr_branch, review_branch = self.worker.reviewer_spawns[0]
         self.assertEqual(spawned_title, expect_title)
         self.assertTrue(worker_id.startswith(f"review-{cid}-rev-slug"))
+        self.assertEqual(pr_branch, naming.worker_branch(ref))
+        self.assertEqual(review_branch, naming.reviewer_branch(ref))
         handle = f"rev-handle-{worker_id}"
         dispatcher.tick()   # no verdict yet -> watchdog path must pin the title again
         self.assertIn((handle, expect_title), self.worker.renamed)
@@ -1267,6 +1291,7 @@ class WorkerHostCallsTest(unittest.TestCase):
         from triggered_agents.agents.pipeline import worker
         self.worker = worker
         self.calls = []
+        self.git_calls = []
 
         def fake_orca_json(args):
             self.calls.append(args)
@@ -1278,6 +1303,14 @@ class WorkerHostCallsTest(unittest.TestCase):
         p.start()
         self.addCleanup(p.stop)
 
+        def fake_git_ok(cwd, args, timeout=None):
+            self.git_calls.append((str(cwd), args))
+            return ""
+
+        g = mock.patch.object(worker, "_git_ok", fake_git_ok)
+        g.start()
+        self.addCleanup(g.stop)
+
         self.ensured = []
         for name in ("ensure_trust", "ensure_theme"):
             wp = mock.patch.object(worker, name, lambda *a, n=name: self.ensured.append(n))
@@ -1288,6 +1321,20 @@ class WorkerHostCallsTest(unittest.TestCase):
         self.worker.create_workspace("proj", "worker-1", "main")
         args = self.calls[0]
         self.assertIn("--activate", args)
+
+    def test_create_workspace_fetches_base_and_creates_off_origin(self):
+        # Git hygiene: the worktree is cut from a freshly fetched origin/<base>, never whatever
+        # the project's own local checkout happens to have.
+        self.worker.create_workspace("proj", "worker-1", "main")
+        self.assertEqual(self.git_calls[0][1], ["fetch", "origin", "main"])
+        args = self.calls[0]
+        self.assertEqual(args[args.index("--base-branch") + 1], "origin/main")
+
+    def test_no_step_ever_pushes(self):
+        self.worker.create_workspace("proj", "worker-1", "main")
+        self.worker.set_branch("/ws/fresh", "pipeline/proj-1")
+        self.worker.land_pr_head("/ws/fresh", "pipeline/proj-1", "review/proj-1")
+        self.assertFalse(any("push" in args for _, args in self.git_calls))
 
     def test_launch_worker_ensures_trust_and_theme_before_terminal_create(self):
         self.worker.launch_worker("/ws/fresh", None, "worker-1", "worker A-1: title")
@@ -1310,8 +1357,20 @@ class WorkerHostCallsTest(unittest.TestCase):
              mock.patch.object(self.worker, "_write_excluded", lambda *a: "/ws/rev/REVIEW.md"), \
              mock.patch.object(self.worker, "teardown", lambda ws: torn.append(ws)):
             with self.assertRaises(self.worker.WorkspaceError):
-                self.worker.spawn_reviewer("proj", "rev-1", "main", "REVIEW body", "review A-1: title")
+                self.worker.spawn_reviewer("proj", "rev-1", "main", "REVIEW body", "review A-1: title",
+                                           "pipeline/proj-1", "review/proj-1")
         self.assertEqual(torn, ["/ws/rev"])
+
+    def test_spawn_reviewer_lands_pr_head_on_its_own_branch(self):
+        with mock.patch.object(self.worker, "_write_excluded", lambda *a: "/ws/fresh/REVIEW.md"):
+            self.worker.spawn_reviewer("proj", "rev-1", "main", "REVIEW body", "review A-1: title",
+                                       "pipeline/proj-1", "review/proj-1")
+        ws, args = self.git_calls[-1]
+        self.assertEqual(ws, "/ws/fresh")
+        self.assertEqual(args, ["branch", "-M", "review/proj-1"])
+        self.assertIn(["fetch", "origin", "pipeline/proj-1"], [a for _, a in self.git_calls])
+        self.assertIn(["reset", "--hard", "FETCH_HEAD"], [a for _, a in self.git_calls])
+        self.assertFalse(any("push" in args for _, args in self.git_calls))
 
 
 class TeardownTest(unittest.TestCase):

@@ -33,6 +33,8 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+from . import naming
+
 DOCKER = os.environ.get("DOCKER_BIN") or shutil.which("docker") or "docker"
 GIT = os.environ.get("GIT_BIN") or shutil.which("git") or "git"
 # Where per-project stand worktrees live. Persistent across runs: git fetch + a detached checkout
@@ -107,24 +109,33 @@ def _compose_base(namespace: str, compose: list[str], exec_root: Path, env_file:
     return args
 
 
-def _checkout_branch(repo_root: Path, stand_dir: Path, branch: str) -> str:
-    """Fetch `branch` from origin and detach the stand worktree onto it. Returns the log.
+def _checkout_branch(repo_root: Path, stand_dir: Path, branch: str, stand_branch: str) -> str:
+    """Fetch `branch` from origin and land the persistent stand worktree onto it, on its own named
+    ref `stand_branch` (`stand/<project>`) — never detached. Returns the log.
 
-    A detached checkout (not a local branch) sidesteps git's "branch already checked out in
-    another worktree" guard and leaves nothing to reconcile between runs. The worktree is created
-    off the main repo the first time and reused after.
+    A named branch, not a detached HEAD, sidesteps git's "branch already checked out in another
+    worktree" guard the same way `stand_branch` being distinct from `branch` does, and leaves
+    `git status` on the stand tree reading a real ref instead of a detached commit. The worktree
+    is created off the main repo the first time and reused after; a tree left detached by a run
+    from before this convention existed is folded onto `stand_branch` too, rather than only fixed
+    for brand-new stands.
     """
     log_parts = []
     if not (stand_dir / ".git").exists():
         stand_dir.parent.mkdir(parents=True, exist_ok=True)
-        code, out = _run([GIT, "-C", str(repo_root), "worktree", "add", "--force", "--detach",
+        code, out = _run([GIT, "-C", str(repo_root), "worktree", "add", "-b", stand_branch,
                           str(stand_dir), "HEAD"], timeout=120)
         log_parts.append(out)
         if code != 0:
             raise StandError(f"git worktree add failed:\n{out}")
+    else:
+        code, out = _run([GIT, "-C", str(stand_dir), "checkout", "-B", stand_branch], timeout=30)
+        log_parts.append(out)
+        if code != 0:
+            raise StandError(f"git checkout -B {stand_branch} failed:\n{out}")
     for cmd in (
         [GIT, "-C", str(stand_dir), "fetch", "--force", "origin", branch],
-        [GIT, "-C", str(stand_dir), "checkout", "--force", "--detach", "FETCH_HEAD"],
+        [GIT, "-C", str(stand_dir), "reset", "--hard", "FETCH_HEAD"],
     ):
         code, out = _run(cmd, timeout=120)
         log_parts.append(out)
@@ -179,7 +190,7 @@ def run(project: str, branch: str, cfg: dict, repo_root: Path) -> dict:
         e2e_env[str(k)] = str(v)
 
     try:
-        log.append(_checkout_branch(repo_root, stand_dir, branch))
+        log.append(_checkout_branch(repo_root, stand_dir, branch, naming.stand_branch(project)))
     except StandError as e:
         log.append(str(e))
         return tail("checkout", False)

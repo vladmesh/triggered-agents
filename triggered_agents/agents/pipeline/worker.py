@@ -80,6 +80,26 @@ def _orca_json(args: list[str]) -> dict:
     return data.get("result", data)
 
 
+def _git(cwd: str | Path, args: list[str], timeout: float = ORCA_TIMEOUT_S) -> subprocess.CompletedProcess:
+    """Run `git -C cwd <args>`, bounded the same way `_orca_json` bounds the orca CLI — a hung git
+    (a wedged fsmonitor, a stale lock) must never hang a dispatcher tick forever."""
+    try:
+        return subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, text=True,
+                              timeout=timeout)
+    except subprocess.TimeoutExpired as e:
+        raise WorkspaceError(f"git -C {cwd} {' '.join(args)} timed out after {timeout}s") from e
+
+
+def _git_ok(cwd: str | Path, args: list[str], timeout: float = ORCA_TIMEOUT_S) -> str:
+    """`_git`, raising WorkspaceError on a non-zero exit — the git-hygiene steps below (fetch,
+    branch rename, landing a PR head) have no meaningful degraded path, so a failure here must
+    abort bring-up the same way an orca failure does."""
+    p = _git(cwd, args, timeout)
+    if p.returncode != 0:
+        raise WorkspaceError(f"git -C {cwd} {' '.join(args)} failed: {(p.stderr or p.stdout).strip()}")
+    return p.stdout
+
+
 def project_root(project: str) -> Path:
     """Корень репо проекта: ~/projects/<name>, иначе ~/<name> (там живут control-panel,
     triggered-agents и прочая инфраструктура секретаря)."""
@@ -100,15 +120,19 @@ def read_base_branch(project: str) -> str:
 
 
 def create_workspace(project: str, name: str, base_branch: str) -> str:
-    """Create an Orca worktree off base_branch; return its path. Setup is skipped here — we run
-    the provisioner ourselves next so we own its exit code and log.
+    """Fetch base_branch fresh from origin, then create an Orca worktree off `origin/base_branch`
+    (never the project's own local checkout state — a stale/switched local branch must not leak
+    into a fresh worker/reviewer worktree). Returns the worktree path. Setup is skipped here — we
+    run the provisioner ourselves next so we own its exit code and log.
 
     `--activate` reveals the new worktree in the Orca app. Without it a freshly created worktree
     has no window for the app to adopt a terminal into, so the head `launch_worker` starts next
     falls back to a background handle and the workspace shows empty in the GUI."""
+    root = project_root(project)
+    _git_ok(root, ["fetch", "origin", base_branch])
     data = _orca_json([
-        "worktree", "create", "--repo", f"path:{project_root(project)}",
-        "--name", name, "--base-branch", base_branch, "--setup", "skip", "--no-parent",
+        "worktree", "create", "--repo", f"path:{root}",
+        "--name", name, "--base-branch", f"origin/{base_branch}", "--setup", "skip", "--no-parent",
         "--activate",
     ])
     wt = data.get("worktree", data)
@@ -116,6 +140,59 @@ def create_workspace(project: str, name: str, base_branch: str) -> str:
     if not path:
         raise WorkspaceError(f"orca worktree create returned no path for {name!r}")
     return path
+
+
+def _worktree_holding(repo_workspace: str, branch: str) -> str | None:
+    """Path of another worktree of the same repo currently checked out on `branch`, via `git
+    worktree list --porcelain`, or None if `branch` is free (or held only by `repo_workspace`
+    itself). A stale ref from an earlier bring-up on the same card/PR is otherwise indistinguishable
+    from a live one — this is how `_claim_branch` tells them apart."""
+    out = _git_ok(repo_workspace, ["worktree", "list", "--porcelain"])
+    me = str(Path(repo_workspace).resolve())
+    path = None
+    for line in out.splitlines():
+        if line.startswith("worktree "):
+            path = line[len("worktree "):]
+        elif line == f"branch refs/heads/{branch}" and path and str(Path(path).resolve()) != me:
+            return path
+    return None
+
+
+def _claim_branch(workspace: str, branch: str) -> None:
+    """Make `workspace` the sole holder of `branch` (git branch -M), freeing it first from
+    wherever an earlier bring-up on the same card/PR left it: a Blocked worker's worktree left
+    alive for a human, or a reviewer branch that outlived its own worktree's teardown (worktree
+    removal drops the checkout, not the ref). Origin is the pipeline's sync point — every actor's
+    Done/verdict is already there before this ever runs — so reclaiming a stale local worktree
+    loses nothing the pipeline promises to keep. The stale worktree goes through the normal
+    teardown path (stop terminals, orca rm, rm -rf/sudo fallback), not a raw `git worktree
+    remove`, so orca's own bookkeeping never points at a directory that's quietly gone; `worktree
+    prune` after clears the now-stale administrative entry so the rename below never trips over
+    it. A plain `-m` fails outright the moment `branch` already exists at all (even unheld) — `-M`
+    is what makes the second and later bring-up on the same ref/PR idempotent."""
+    other = _worktree_holding(workspace, branch)
+    if other:
+        teardown(other)
+        _git_ok(workspace, ["worktree", "prune"])
+    _git_ok(workspace, ["branch", "-M", branch])
+
+
+def set_branch(workspace: str, branch: str) -> None:
+    """Land the worktree on `branch` (see `_claim_branch`) before any head starts — every actor
+    gets its own named ref (`pipeline/<ref>`, `review/<ref>`), never whatever name `orca worktree
+    create` happened to pick, so no head ever has to create or rename its own branch."""
+    _claim_branch(workspace, branch)
+
+
+def land_pr_head(workspace: str, pr_branch: str, review_branch: str) -> None:
+    """Fetch `pr_branch` (the worker's own branch, i.e. the PR's head — same-repo, never a fork)
+    from origin into the reviewer's worktree and land it under `review_branch`. This is the
+    fetch-not-checkout the reviewer uses instead of `gh pr checkout`: that command tries to check
+    out the PR's own branch name locally, which collides ('already used by worktree') with the
+    worker's live worktree still sitting on that exact branch."""
+    _git_ok(workspace, ["fetch", "origin", pr_branch])
+    _git_ok(workspace, ["reset", "--hard", "FETCH_HEAD"])
+    _claim_branch(workspace, review_branch)
 
 
 def provision(workspace: str) -> tuple[bool, str]:
@@ -235,14 +312,16 @@ def _reviewer_command(worker_id: str) -> str:
     return f'BOARD_ROLE=reviewer claude --dangerously-skip-permissions{model_flag} {prompt!r}'
 
 
-def spawn_reviewer(project: str, worker_id: str, base_branch: str, review_md: str,
-                   title: str) -> tuple[str, str]:
-    """Bring up the layer-3 reviewer head: a fresh worktree off base_branch (the head checks out
-    the PR itself per REVIEW.md), the REVIEW.md prompt, then the head. No provisioning — the
-    reviewer only reads code and drives gh/board-CLI, so it needs no app deps. Returns
-    (workspace, terminal handle). `title` seeds the tab's display name (see launch_worker)."""
+def spawn_reviewer(project: str, worker_id: str, base_branch: str, review_md: str, title: str,
+                   pr_branch: str, review_branch: str) -> tuple[str, str]:
+    """Bring up the layer-3 reviewer head: a fresh worktree off base_branch, landed on the PR's
+    head content under its own `review_branch` (land_pr_head — fetch, not `gh pr checkout`, so the
+    reviewer never touches the worker's own branch), the REVIEW.md prompt, then the head. No
+    provisioning — the reviewer only reads code and drives gh/board-CLI, so it needs no app deps.
+    Returns (workspace, terminal handle). `title` seeds the tab's display name (see launch_worker)."""
     ws = create_workspace(project, worker_id, base_branch)
     try:
+        land_pr_head(ws, pr_branch, review_branch)
         _write_excluded(ws, "REVIEW.md", review_md)
         ensure_trust(ws)
         ensure_theme()

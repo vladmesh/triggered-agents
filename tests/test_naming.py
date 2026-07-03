@@ -84,6 +84,26 @@ class WorkspaceNameBuildTest(unittest.TestCase):
                          "review 218: Слаги воркспейсов")
 
 
+class BranchNameTest(unittest.TestCase):
+    """One ref per actor (git hygiene): worker/reviewer/stand each get a distinct, deterministic
+    branch name so no two actors ever contend for the same local ref."""
+
+    def test_worker_branch_is_pipeline_prefixed(self):
+        self.assertEqual(naming.worker_branch("triggered-agents-220"),
+                         "pipeline/triggered-agents-220")
+
+    def test_reviewer_branch_is_review_prefixed(self):
+        self.assertEqual(naming.reviewer_branch("triggered-agents-220"),
+                         "review/triggered-agents-220")
+
+    def test_stand_branch_is_per_project(self):
+        self.assertEqual(naming.stand_branch("personal_site"), "stand/personal_site")
+
+    def test_worker_and_reviewer_branches_never_collide(self):
+        ref = "triggered-agents-220"
+        self.assertNotEqual(naming.worker_branch(ref), naming.reviewer_branch(ref))
+
+
 class DedupeTest(unittest.TestCase):
     def test_returns_base_when_free(self):
         self.assertEqual(naming.dedupe("A-x", lambda n: False), "A-x")
