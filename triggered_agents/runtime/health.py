@@ -32,9 +32,14 @@ def _max_age_s(agent: str) -> int:
         return int(_ENV_MAX_AGE)
     try:
         spec = tomllib.loads((_REPO_ROOT / "triggered_agents" / "agents" / agent / "automation.toml").read_text())
-        cadence = spec.get("systemd", {}).get("calendar", "hourly")
     except (OSError, tomllib.TOMLDecodeError):
-        cadence = "hourly"
+        return 3 * 3600
+    # An explicit [health] max_age_s wins — needed for a calendar like pipeline's raw 3-min
+    # OnCalendar expression, which isn't one of the named cadences below.
+    explicit = spec.get("health", {}).get("max_age_s")
+    if explicit is not None:
+        return int(explicit)
+    cadence = spec.get("systemd", {}).get("calendar", "hourly")
     return _CADENCE_MAX_AGE_S.get(cadence, 3 * 3600)
 
 

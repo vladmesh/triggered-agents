@@ -179,10 +179,14 @@ def _service_unit(agent: str, calendar: str, workspace: Path, precheck: str,
         # Change-detection gate. Also NOT Orca's automation --precheck field: `automations run`
         # is trigger=manual and Orca only honors precheck for trigger=scheduled (service.ts),
         # which never ticks headless. So gate here: precheck in the workspace (cwd on sys.path
-        # for `python3 -m`), dispatch only on exit 0, exit 0 either way so a skip isn't a unit
-        # failure.
-        gate = (f"if {precheck}; then exec {dispatch}; "
-                f'else echo "[ta-{agent}] precheck: no change, run skipped"; fi')
+        # for `python3 -m`). Three-way on precheck's own exit code, not just true/false: 0 ->
+        # dispatch, 1 -> nothing to do (still a clean unit run, not a failure), anything else ->
+        # precheck itself broke (Kanboard down, bad env) — propagate that exit code so the unit
+        # is recorded as failed in journalctl, distinguishable there from a plain skip.
+        gate = (f"{precheck}; rc=$?; "
+                f"if [ $rc -eq 0 ]; then exec {dispatch}; "
+                f'elif [ $rc -eq 1 ]; then echo "[ta-{agent}] precheck: no change, run skipped"; '
+                f'else echo "[ta-{agent}] precheck: ERROR (rc=$rc) — see runs.jsonl" >&2; exit $rc; fi')
     else:
         gate = f"exec {dispatch}"
     env_line = f"EnvironmentFile={env_file}\n" if env_file else ""
