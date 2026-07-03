@@ -242,6 +242,98 @@ class TestCreate(PatchedBoardTest):
         self.assertEqual(board.tasks, {})
 
 
+class TestUpdate(PatchedBoardTest):
+    def test_partial_update_touches_only_given_field(self):
+        board = self.make_board()
+        ref = board.add_task("A", "Ready", meta={model.META_TASK_TYPE: "code",
+                                                 model.META_PROJECT: "personal_site",
+                                                 model.META_SLUG: "old-slug",
+                                                 model.META_MODEL: "sonnet"})
+        out = ops.update_card("po", ref, model_name="opus")
+        tid = next(t["id"] for t in board.tasks.values() if t["reference"] == ref)
+        self.assertEqual(board.metadata[tid][model.META_SLUG], "old-slug")
+        self.assertEqual(board.metadata[tid][model.META_MODEL], "opus")
+        self.assertEqual(out, {"action": "updated", "reference": ref,
+                               "slug": "old-slug", "model": "opus", "blocked_by": ""})
+
+    def test_valid_blocked_by_is_stored(self):
+        board = self.make_board()
+        pred = board.add_task("A", "Done", meta={model.META_TASK_TYPE: "code",
+                                                  model.META_PROJECT: "personal_site"})
+        ref = board.add_task("B", "Ready", meta={model.META_TASK_TYPE: "code",
+                                                 model.META_PROJECT: "personal_site"})
+        out = ops.update_card("po", ref, blocked_by=pred)
+        self.assertEqual(out["blocked_by"], pred)
+        tid = next(t["id"] for t in board.tasks.values() if t["reference"] == ref)
+        self.assertEqual(board.metadata[tid][model.META_BLOCKED_BY], pred)
+
+    def test_bad_slug_raises_and_writes_nothing(self):
+        board = self.make_board()
+        ref = board.add_task("A", "Ready", meta={model.META_TASK_TYPE: "code",
+                                                 model.META_PROJECT: "personal_site",
+                                                 model.META_SLUG: "old-slug"})
+        with self.assertRaises(model.GuardError):
+            ops.update_card("po", ref, slug="Not Valid")
+        tid = next(t["id"] for t in board.tasks.values() if t["reference"] == ref)
+        self.assertEqual(board.metadata[tid][model.META_SLUG], "old-slug")
+        self.assertEqual(board.method_calls("saveTaskMetadata"), [])
+
+    def test_nonexistent_blocked_by_raises_and_writes_nothing(self):
+        board = self.make_board()
+        ref = board.add_task("B", "Ready", meta={model.META_TASK_TYPE: "code",
+                                                 model.META_PROJECT: "personal_site"})
+        with self.assertRaises(model.GuardError):
+            ops.update_card("po", ref, blocked_by="ghost")
+        self.assertEqual(board.method_calls("saveTaskMetadata"), [])
+
+    def test_role_other_than_po_raises_and_writes_nothing(self):
+        board = self.make_board()
+        ref = board.add_task("A", "Ready", meta={model.META_TASK_TYPE: "code",
+                                                 model.META_PROJECT: "personal_site"})
+        for role in ("worker", "reviewer", "dispatcher"):
+            with self.assertRaises(model.GuardError):
+                ops.update_card(role, ref, slug="new-slug")
+        self.assertEqual(board.method_calls("saveTaskMetadata"), [])
+
+    def test_column_and_claim_untouched(self):
+        board = self.make_board()
+        ref = board.add_task("A", "In progress", meta={model.META_TASK_TYPE: "code",
+                                                       model.META_PROJECT: "personal_site",
+                                                       model.META_CLAIM: "w1"})
+        ops.update_card("po", ref, model_name="opus", slug="new-slug",
+                        blocked_by=None)
+        tid = next(t["id"] for t in board.tasks.values() if t["reference"] == ref)
+        self.assertEqual(board._column_title_for(tid), "In progress")
+        self.assertEqual(board.metadata[tid][model.META_CLAIM], "w1")
+        self.assertEqual(board.method_calls("moveTaskPosition"), [])
+
+
+class TestCliUpdate(PatchedBoardTest):
+    """--ref/--slug/--model/--blocked-by reach ops through the cli seam; role is enforced in
+    ops (GuardError -> exit 3), not by the cli's own role gate."""
+
+    def setUp(self):
+        from triggered_agents.agents.pipeline import cli
+        self.cli = cli
+
+    def test_po_update_ok(self):
+        board = self.make_board()
+        ref = board.add_task("A", "Ready", meta={model.META_TASK_TYPE: "code",
+                                                 model.META_PROJECT: "personal_site"})
+        rc = self.cli.main(["--role", "po", "update", "--ref", ref, "--slug", "new-slug"])
+        self.assertEqual(rc, 0)
+        tid = next(t["id"] for t in board.tasks.values() if t["reference"] == ref)
+        self.assertEqual(board.metadata[tid][model.META_SLUG], "new-slug")
+
+    def test_worker_update_exits_3(self):
+        board = self.make_board()
+        ref = board.add_task("A", "Ready", meta={model.META_TASK_TYPE: "code",
+                                                 model.META_PROJECT: "personal_site"})
+        rc = self.cli.main(["--role", "worker", "update", "--ref", ref, "--slug", "new-slug"])
+        self.assertEqual(rc, 3)
+        self.assertEqual(board.method_calls("saveTaskMetadata"), [])
+
+
 class TestClaim(PatchedBoardTest):
     def test_happy_path_saves_then_moves(self):
         board = self.make_board()
