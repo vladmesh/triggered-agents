@@ -49,5 +49,44 @@ class BuildTaskTest(unittest.TestCase):
         self.assertIn("не пушить", self._build())
 
 
+class ContribBuildTaskTest(unittest.TestCase):
+    """Contrib (fork) cards have no PR in this pipeline — REVIEW.md points at the reported
+    branch/head sha instead, and must never suggest a gh PR command."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        skill = Path(self.tmp.name) / "SKILL.md"
+        skill.write_text("thermo-nuclear lens body")
+        p = mock.patch.object(reviewer, "THERMO_SKILL", skill)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def _build(self, ref="agent-kanban-9", branch="pipeline/agent-kanban-9", head_sha="abc1234"):
+        card = {"project": "agent-kanban"}
+        return reviewer.build_task(card, ref, None, "spec text", "main",
+                                   branch=branch, head_sha=head_sha)
+
+    def test_never_mentions_a_pr(self):
+        text = self._build()
+        self.assertNotIn("gh pr checkout", text)
+        self.assertNotIn("gh pr diff", text)
+        self.assertNotIn("PR карточки", text)
+
+    def test_states_branch_and_head_sha(self):
+        text = self._build(branch="pipeline/agent-kanban-9", head_sha="abc1234")
+        self.assertIn("pipeline/agent-kanban-9", text)
+        self.assertIn("abc1234", text)
+
+    def test_states_own_review_branch_already_checked_out(self):
+        from triggered_agents.agents.pipeline import naming
+        ref = "agent-kanban-9"
+        text = self._build(ref=ref)
+        self.assertIn(naming.reviewer_branch(ref), text)
+
+    def test_forbids_pushing_the_review_branch(self):
+        self.assertIn("не пушить", self._build())
+
+
 if __name__ == "__main__":
     unittest.main()

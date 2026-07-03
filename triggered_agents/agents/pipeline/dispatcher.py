@@ -73,6 +73,11 @@ _LOG_TAIL_LINES = 40
 # PR link the worker pastes into its report (the done protocol in TASK.md requires it). The last
 # one on the card wins, so a re-opened/re-pushed PR link supersedes an earlier one.
 _PR_URL_RE = re.compile(r"https://github\.com/[\w.-]+/[\w.-]+/pull/\d+")
+# A contrib (fork) card has no PR in this pipeline by definition (a human opens it against
+# upstream from the pushed branch afterward) — its report:done protocol (see _task_md) carries
+# `branch:`/`head:` lines instead, the proof-of-push a PR link supplies on a regular card.
+_CONTRIB_BRANCH_RE = re.compile(r"(?im)^\s*branch\s*:\s*(\S+)\s*$")
+_CONTRIB_HEAD_RE = re.compile(r"(?im)^\s*head\s*:\s*([0-9a-fA-F]{7,40})\s*$")
 
 
 def _lock_stale(lockfile: Path) -> bool:
@@ -374,6 +379,23 @@ def _pr_url(view: dict) -> str | None:
     return url
 
 
+def _contrib_ref(view: dict) -> tuple[str, str] | None:
+    """(branch, head sha) from the worker's report:done protocol lines on a contrib card — the
+    proof-of-push a PR link supplies on a regular card. Scans every comment (last match wins,
+    mirroring _pr_url), so a re-pushed report after rework supersedes an earlier one. None when
+    either line is missing anywhere on the card — nothing to review yet."""
+    branch = sha = None
+    for c in view["comments"]:
+        text = c.get("text", "")
+        m = _CONTRIB_BRANCH_RE.search(text)
+        if m:
+            branch = m.group(1)
+        m = _CONTRIB_HEAD_RE.search(text)
+        if m:
+            sha = m.group(1)
+    return (branch, sha) if branch and sha else None
+
+
 def _has_marker(view: dict, marker: str) -> bool:
     return any(f"[{marker}]" in c.get("text", "") for c in view["comments"])
 
@@ -473,10 +495,15 @@ def _validate(records: dict) -> bool:
 
 def _validate_card(card: dict, records: dict) -> bool:
     """Drive one Validate card by its PR (and, for stand projects, the stand). Returns whether
-    `records` changed. Raises only on an unexpected failure, which _validate localizes."""
+    `records` changed. Raises only on an unexpected failure, which _validate localizes.
+
+    A contrib (fork) card has no PR by definition — routed to _validate_contrib_card before any
+    PR lookup, so it never takes the no-pr-ref stall path a regular card would."""
     ref = card["reference"]
     rec = records.get(ref)
     view = ops.show_card(ref)
+    if worker.is_contrib(card.get("project") or ""):
+        return _validate_contrib_card(ref, card, rec, records, view)
     pr = _pr_url(view)
     if not pr:
         return _validate_stall(ref, "no-pr-ref", rec, records)
@@ -558,22 +585,50 @@ def _validate_card(card: dict, records: dict) -> bool:
     return changed
 
 
+def _validate_contrib_card(ref: str, card: dict, rec: dict | None, records: dict, view: dict) -> bool:
+    """Validate a contrib (fork) card: it has no PR in this pipeline by definition (a human opens
+    it against upstream from the pushed branch afterward, out of scope) — so layer 1 is just the
+    worker's own report (local tests, already in its report:done; no CI to poll — CI-in-fork is
+    also out of scope) and layer 2 (stand) never applies. The report must carry the branch + head
+    sha the worker pushed to their fork's origin (see _task_md/_contrib_ref) — the proof-of-push a
+    PR link supplies on a regular card. Missing it stalls exactly like a missing PR link
+    (_validate_stall, same cap and eventual Blocked), but under its own reason: a contrib card
+    must never take the no-pr-ref path, since it has no PR by definition."""
+    ref_info = _contrib_ref(view)
+    if ref_info is None:
+        return _validate_stall(ref, "no-branch-ref", rec, records)
+    branch, sha = ref_info
+    changed = bool(rec is not None and rec.pop("validate_stall_fails", None) is not None)
+    baseline = int(rec.get("comment_baseline", 0)) if rec is not None else 0
+    if not _has_marker_since(view, model.MARKER_VALIDATE_GREEN, baseline):
+        ops.add_comment("dispatcher", ref,
+                        f"Contrib-карточка: локальные тесты уже в отчёте воркера (слой 1, без "
+                        f"CI-поллинга). Ветка `{branch}` @ `{sha}`. Запускаю независимое ревью "
+                        f"(слой 3).",
+                        marker=model.MARKER_VALIDATE_GREEN)
+        STATE.log_run("validate", reference=ref, result="contrib-report-green", branch=branch, sha=sha)
+        view = ops.show_card(ref)
+    return _review_gate(ref, None, card, records, view, is_stand=False, contrib=(branch, sha)) or changed
+
+
 def _validate_stall(ref: str, reason: str, rec: dict | None, records: dict, **log_fields) -> bool:
-    """no-pr-ref / gh-unavailable: the dispatcher couldn't even poll this card's PR this tick. A
-    one-off is a silent retry (still worth a warn line for the logs); VALIDATE_STALL_ATTEMPTS in a
-    row escalates once to Blocked so a permanently missing PR link or a dead gh integration surfaces
-    to a human instead of warning forever with no signal. An untracked card (no record — a manual
-    move or a lost cards.json) has nowhere to keep the count, so it stays a bare warn, same as
-    _review_gate does for an untracked card."""
+    """no-pr-ref / gh-unavailable / no-branch-ref: the dispatcher couldn't even establish what to
+    validate this tick. A one-off is a silent retry (still worth a warn line for the logs);
+    VALIDATE_STALL_ATTEMPTS in a row escalates once to Blocked so a permanently missing PR link,
+    a dead gh integration, or a contrib report with no branch/head surfaces to a human instead of
+    warning forever with no signal. An untracked card (no record — a manual move or a lost
+    cards.json) has nowhere to keep the count, so it stays a bare warn, same as _review_gate does
+    for an untracked card."""
     STATE.log_run("validate", reference=ref, result=reason, level="warn", **log_fields)
     if rec is None:
         return False
     fails = rec.get("validate_stall_fails", 0) + 1
     if fails >= VALIDATE_STALL_ATTEMPTS:
         ws = rec.get("workspace") or "(неизвестен)"
+        subject = "ветку/head в отчёте" if reason == "no-branch-ref" else "статус PR"
         _clear_review(rec)
         ops.add_comment("dispatcher", ref,
-                        f"Validate не может определить статус PR {fails} тиков подряд ({reason}). "
+                        f"Validate не может определить {subject} {fails} тиков подряд ({reason}). "
                         f"Карточка в Blocked, воркспейс {ws} оставлен для разбора.")
         ops.move_card("dispatcher", ref, "Blocked")
         records.pop(ref, None)
@@ -647,10 +702,12 @@ def _review_verdict(view: dict, baseline: int) -> str | None:
     return verdict
 
 
-def _review_gate(ref: str, pr: str, card: dict, records: dict, view: dict, is_stand: bool) -> bool:
+def _review_gate(ref: str, pr: str | None, card: dict, records: dict, view: dict, is_stand: bool,
+                 contrib: tuple[str, str] | None = None) -> bool:
     """Drive layer 3 for a card whose lower layers are green. Returns whether `records` changed.
     `is_stand` is the caller's already-resolved stand_cfg presence — passed through rather than
-    re-read here, since `_review_green` needs it too."""
+    re-read here, since `_review_green` needs it too. `contrib` is (branch, head sha) for a
+    contrib card (`pr` is then None — see _validate_contrib_card); None for a regular PR card."""
     rec = records.get(ref)
     if rec is None:
         # An untracked Validate card (manual move / adopted without a record): a reviewer head needs
@@ -658,16 +715,17 @@ def _review_gate(ref: str, pr: str, card: dict, records: dict, view: dict, is_st
         STATE.log_run("review", reference=ref, result="untracked", level="warn", pr=pr)
         return False
     if "review_baseline" not in rec:
-        return _spawn_reviewer(ref, pr, card, rec, records)
+        return _spawn_reviewer(ref, pr, card, rec, records, contrib)
     verdict = _review_verdict(view, int(rec["review_baseline"]))
     if verdict is None:
         return _review_watchdog(ref, rec, records)
     if verdict == "green":
-        return _review_green(ref, pr, is_stand, rec, records)
-    return _review_red(ref, pr, rec, records)
+        return _review_green(ref, pr, is_stand, rec, records, contrib)
+    return _review_red(ref, pr, rec, records, contrib)
 
 
-def _spawn_reviewer(ref: str, pr: str, card: dict, rec: dict, records: dict) -> bool:
+def _spawn_reviewer(ref: str, pr: str | None, card: dict, rec: dict, records: dict,
+                    contrib: tuple[str, str] | None = None) -> bool:
     """Bring up the reviewer head for the current code state. On an orca failure, nothing is posted
     and the baseline stays unset, so the spawn is retried next tick (a transient, not a verdict).
     The record is saved as soon as the head is up (like _bring_up), so a crash before the end-of-tick
@@ -675,9 +733,13 @@ def _spawn_reviewer(ref: str, pr: str, card: dict, rec: dict, records: dict) -> 
     project = card.get("project") or ""
     spec = ops.show_card(ref).get("description", "")
     review_title = naming.reviewer_title(naming.card_id(ref), card.get("title") or ref)
+    label = pr if pr else f"ветке `{contrib[0]}` @ `{contrib[1]}`"
+    note = f"PR: {pr}" if pr else f"Ветка: `{contrib[0]}` @ `{contrib[1]}`"
     try:
         base = worker.read_base_branch(project)
-        review_md = reviewer.build_task(card, ref, pr, spec, base)
+        review_md = reviewer.build_task(card, ref, pr, spec, base,
+                                        branch=contrib[0] if contrib else None,
+                                        head_sha=contrib[1] if contrib else None)
         ws, handle = worker.spawn_reviewer(project, _review_id(card), base, review_md, review_title,
                                            naming.worker_branch(ref), naming.reviewer_branch(ref))
     except worker.WorkspaceError as e:
@@ -690,7 +752,7 @@ def _spawn_reviewer(ref: str, pr: str, card: dict, rec: dict, records: dict) -> 
             _clear_review(rec)
             ops.add_comment("dispatcher", ref,
                             f"Не удалось поднять голову-ревьюера (слой 3) {fails} тиков подряд: "
-                            f"{scrubbed}. Карточка в Blocked до vladmesh. PR: {pr}")
+                            f"{scrubbed}. Карточка в Blocked до vladmesh. {note}")
             ops.move_card("dispatcher", ref, "Blocked")
             records.pop(ref, None)
             STATE.log_run("review", reference=ref, to="Blocked", reason="spawn-cap",
@@ -703,7 +765,7 @@ def _spawn_reviewer(ref: str, pr: str, card: dict, rec: dict, records: dict) -> 
         return True
     ops.add_comment("dispatcher", ref,
                     f"Нижние слои валидации зелёные. Запущена независимая голова-ревьюер (слой 3) "
-                    f"по {pr}: вердикт по каждому criterion спеки и находки блокер/замечание "
+                    f"по {label}: вердикт по каждому criterion спеки и находки блокер/замечание "
                     f"появятся в комментарии.")
     rec.pop("review_spawn_fails", None)
     rec["review_ws"] = ws
@@ -741,22 +803,40 @@ def _review_watchdog(ref: str, rec: dict, records: dict) -> bool:
     return True
 
 
-def _review_green(ref: str, pr: str, is_stand: bool, rec: dict, records: dict) -> bool:
-    """Green verdict: all three layers clear. Tear the reviewer worktree down once. A project
-    without a [stand] section still waits for a human merge: log the terminal green exactly once
-    (`review_green_logged`), not on every tick the card idles here waiting — the same one-shot
-    contract this event had before automerge existed. A stand project's e2e run on a live stand is
-    enough assurance (vladmesh, 2026-07-02) that the dispatcher merges the PR itself (squash)
-    instead, once per green verdict: `automerge_done` makes a repeated tick that still sees the
-    same green verdict (gh merge-state lag before `poll_pr` reports merged) a no-op rather than a
-    second `gh pr merge` call. A failed attempt — conflict, stale branch, gh down — is a final
-    outcome here, not a retry: a comment with the reason and straight to Blocked so a human is
-    pulled in instead of the tick hammering `gh pr merge` forever."""
+def _review_green_contrib(ref: str, rec: dict, records: dict) -> bool:
+    """Contrib card, green verdict: there is no PR to wait on in this pipeline — a human opens the
+    upstream PR from the pushed branch afterward (out of scope). All three layers are clear, so
+    the card goes straight to Done, mirroring the merged-PR terminal in _validate_card: worker
+    workspace torn down, record dropped."""
+    ws = rec.get("workspace")
+    ops.move_card("dispatcher", ref, "Done")
+    records.pop(ref, None)
+    if ws:
+        worker.teardown(ws)
+    STATE.log_run("review", reference=ref, to="Done", reason="contrib-green")
+    return True
+
+
+def _review_green(ref: str, pr: str | None, is_stand: bool, rec: dict, records: dict,
+                  contrib: tuple[str, str] | None = None) -> bool:
+    """Green verdict: all three layers clear. Tear the reviewer worktree down once. A contrib card
+    (`contrib` set) has nothing left to wait for — straight to Done (_review_green_contrib). A
+    regular project without a [stand] section still waits for a human merge: log the terminal
+    green exactly once (`review_green_logged`), not on every tick the card idles here waiting —
+    the same one-shot contract this event had before automerge existed. A stand project's e2e run
+    on a live stand is enough assurance (vladmesh, 2026-07-02) that the dispatcher merges the PR
+    itself (squash) instead, once per green verdict: `automerge_done` makes a repeated tick that
+    still sees the same green verdict (gh merge-state lag before `poll_pr` reports merged) a no-op
+    rather than a second `gh pr merge` call. A failed attempt — conflict, stale branch, gh down —
+    is a final outcome here, not a retry: a comment with the reason and straight to Blocked so a
+    human is pulled in instead of the tick hammering `gh pr merge` forever."""
     changed = False
     if rec.get("review_ws"):
         worker.teardown(rec["review_ws"])
         rec["review_ws"] = ""
         changed = True
+    if contrib is not None:
+        return _review_green_contrib(ref, rec, records) or changed
     if not is_stand:
         if rec.get("review_green_logged"):
             return changed
@@ -784,16 +864,21 @@ def _review_green(ref: str, pr: str, is_stand: bool, rec: dict, records: dict) -
     return True
 
 
-def _review_red(ref: str, pr: str, rec: dict, records: dict) -> bool:
+def _review_red(ref: str, pr: str | None, rec: dict, records: dict,
+                contrib: tuple[str, str] | None = None) -> bool:
     """Red verdict (a blocker in some lens). Return the card for rework, or — once the lifetime cap
-    of returns is spent — Block it до vladmesh with the full verdict already on the card."""
+    of returns is spent — Block it до vladmesh with the full verdict already on the card. Same cap
+    and rework path for a contrib card (`contrib` set) as a regular PR card — only the reference
+    label in the comments/nudge differs."""
+    note = f"PR: {pr}" if pr else f"Ветка: `{contrib[0]}` @ `{contrib[1]}`"
+    phrase = pr if pr else f"ветке `{contrib[0]}` @ `{contrib[1]}`"
     prior = rec.get("review_returns", 0)
     if prior >= REVIEW_RETURN_CAP:
         _clear_review(rec)
         ops.add_comment("dispatcher", ref,
                         f"Красный вердикт ревьюера после {prior} доработок — кап возвратов "
                         f"({REVIEW_RETURN_CAP}) исчерпан. Карточка в Blocked до vladmesh; полный "
-                        f"вердикт — в комментарии выше. PR: {pr}")
+                        f"вердикт — в комментарии выше. {note}")
         ops.move_card("dispatcher", ref, "Blocked")
         records.pop(ref, None)
         STATE.log_run("review", reference=ref, to="Blocked", reason="return-cap", returns=prior, pr=pr)
@@ -801,7 +886,7 @@ def _review_red(ref: str, pr: str, rec: dict, records: dict) -> bool:
     ops.add_comment("dispatcher", ref,
                     f"Красный вердикт независимого ревьюера (слой 3): есть блокеры. Карточка "
                     f"возвращена в In progress на доработку (возврат {prior + 1} из "
-                    f"{REVIEW_RETURN_CAP}). Разбор — в вердикте выше. PR: {pr}",
+                    f"{REVIEW_RETURN_CAP}). Разбор — в вердикте выше. {note}",
                     marker=model.MARKER_REVIEW_RETURN)
     ops.move_card("dispatcher", ref, model.IN_PROGRESS)
     _clear_review(rec)                                   # tear down reviewer ws, drop its baseline
@@ -810,7 +895,7 @@ def _review_red(ref: str, pr: str, rec: dict, records: dict) -> bool:
     rec["last_activity"] = time.time()
     rec["stand_fails"] = 0
     worker.notify(rec.get("handle", ""),
-                  f"Ревью по {pr} красное — есть блокеры (слой 3). Карточка вернулась в "
+                  f"Ревью по {phrase} красное — есть блокеры (слой 3). Карточка вернулась в "
                   f"In progress. Разбор в вердикте на карточке, почини и снова report done.")
     STATE.log_run("review", reference=ref, to=model.IN_PROGRESS, reason="review-red",
                   returns=prior + 1, pr=pr)
@@ -865,40 +950,74 @@ def _task_md(card: dict, view: dict) -> str:
     and — when the card has prior comments — its full history. A card claimed for the first time
     has no comments, so it gets exactly the header+metadata+spec that existed before this section
     was added (plus the new always-on protocol lines below). A card returning from Blocked or a
-    dead head carries its history, so the header also warns that a branch/PR may already exist."""
+    dead head carries its history, so the header also warns that a branch/PR may already exist.
+
+    A contrib (fork) project never opens a PR in this pipeline (a human does it against upstream
+    from the pushed branch) — its Done/report protocol replaces the PR-link paragraphs with a
+    push-to-origin-only Done and a report:done that must carry `branch:`/`head:` protocol lines
+    instead of a PR link (parsed back by dispatcher._contrib_ref)."""
     ref = card["reference"]
     branch = naming.worker_branch(ref)
     comments = view.get("comments") or []
-    lines = [
-        f"# Задача {ref} ({card.get('project', '?')})",
-        "",
-        f"Роль на доске — worker. Воркспейс уже стоит на ветке `{branch}` (её завели при подъёме "
-        f"воркспейса) — ветку создавать или переименовывать не нужно, коммить прямо в неё. Done "
-        f"для тебя: код закоммичен туда, локальные тесты зелёные, ветка запушена, PR открыт "
-        f"через `gh` (base — базовая ветка проекта). В коммитах и PR никаких упоминаний AI "
-        f"и Co-Authored-By, стиль — как в git log репо.",
-        "",
-        f"Отчёт по каждому acceptance criterion (сделано/нет и как проверял, плюс ссылка на PR) — "
-        f"через board-CLI: `python3 -m triggered_agents pipeline --role worker report "
-        f"--ref {ref} --kind done|blocked --body-file <файл>`. Несогласие со "
-        f"спекой — `--kind blocked` с обоснованием. Карточку сам не двигаешь. TASK.md в репо "
-        f"не коммить.",
-        "",
-    ]
+    is_contrib = worker.is_contrib(card.get("project") or "")
+    if is_contrib:
+        lines = [
+            f"# Задача {ref} ({card.get('project', '?')})",
+            "",
+            f"Роль на доске — worker. Воркспейс уже стоит на ветке `{branch}` (её завели при подъёме "
+            f"воркспейса) — ветку создавать или переименовывать не нужно, коммить прямо в неё. "
+            f"Контриб-проект (форк): PR в этом пайплайне не открывается — ветку в форк для "
+            f"upstream-автора готовит человек. Done для тебя: код закоммичен туда, локальные тесты "
+            f"зелёные, ветка запушена в `origin` (твой форк). В коммитах никаких упоминаний AI "
+            f"и Co-Authored-By, стиль — как в git log репо.",
+            "",
+            f"Отчёт по каждому acceptance criterion (сделано/нет и как проверял) — через board-CLI: "
+            f"`python3 -m triggered_agents pipeline --role worker report --ref {ref} --kind "
+            f"done|blocked --body-file <файл>`. Вместо ссылки на PR отчёт done обязан нести ветку и "
+            f"head sha пуша, ровно этими протокольными строками в теле:\n"
+            f"```\n"
+            f"branch: {branch}\n"
+            f"head: <sha HEAD после пуша>\n"
+            f"```\n"
+            f"Несогласие со спекой — `--kind blocked` с обоснованием. Карточку сам не двигаешь. "
+            f"TASK.md в репо не коммить.",
+            "",
+        ]
+    else:
+        lines = [
+            f"# Задача {ref} ({card.get('project', '?')})",
+            "",
+            f"Роль на доске — worker. Воркспейс уже стоит на ветке `{branch}` (её завели при подъёме "
+            f"воркспейса) — ветку создавать или переименовывать не нужно, коммить прямо в неё. Done "
+            f"для тебя: код закоммичен туда, локальные тесты зелёные, ветка запушена, PR открыт "
+            f"через `gh` (base — базовая ветка проекта). В коммитах и PR никаких упоминаний AI "
+            f"и Co-Authored-By, стиль — как в git log репо.",
+            "",
+            f"Отчёт по каждому acceptance criterion (сделано/нет и как проверял, плюс ссылка на PR) — "
+            f"через board-CLI: `python3 -m triggered_agents pipeline --role worker report "
+            f"--ref {ref} --kind done|blocked --body-file <файл>`. Несогласие со "
+            f"спекой — `--kind blocked` с обоснованием. Карточку сам не двигаешь. TASK.md в репо "
+            f"не коммить.",
+            "",
+        ]
     if comments:
-        lines += [
+        history_note = (
+            f"У карточки ниже есть история — она уже была в работе раньше (возврат из Blocked, "
+            f"умершая голова или похожий случай). Ветка `{branch}` может уже существовать на "
+            f"origin: начни с `git fetch`, продолжай существующую ветку, не пересоздавай её."
+            if is_contrib else
             f"У карточки ниже есть история — она уже была в работе раньше (возврат из Blocked, "
             f"умершая голова или похожий случай). Ветка `{branch}` может уже существовать на "
             f"origin, PR может быть уже открыт: начни с `git fetch`, продолжай существующие "
-            f"ветку/PR, не пересоздавай их.",
-            "",
-        ]
+            f"ветку/PR, не пересоздавай их."
+        )
+        lines += [history_note, ""]
     lines += [
         f"Всегда (независимо от истории): force-push запрещён; пушь только в репозиторий своего "
         f"проекта и только в свою ветку `{branch}`.",
         "",
     ]
-    if worker.is_contrib(card.get("project") or ""):
+    if is_contrib:
         lines += [
             f"Контриб-проект (форк): пуш только в `origin` (твой форк) — `upstream` (репо "
             f"автора) не трогать, туда не пушить и не мержить.",

@@ -35,11 +35,43 @@ def _quality_lens() -> str:
                 f"(не прочитался при сборке промпта). Загрузи его сам и применяй как есть.")
 
 
-def build_task(card: dict, ref: str, pr: str, spec: str, base_branch: str) -> str:
+def build_task(card: dict, ref: str, pr: str | None, spec: str, base_branch: str,
+              branch: str | None = None, head_sha: str | None = None) -> str:
     """REVIEW.md for the reviewer head: what to review, the three lenses, the blocking semantics,
-    and how to emit the verdict + Идеи cards through board-CLI. `spec` is the card description."""
+    and how to emit the verdict + Идеи cards through board-CLI. `spec` is the card description.
+    `pr` is the card's PR link — or None for a contrib (fork) card, which has no PR in this
+    pipeline by definition (a human opens it against upstream from the pushed branch afterward);
+    `branch`/`head_sha` then point at what to review instead (the worker's own report:done
+    protocol line, dispatcher._contrib_ref)."""
     project = card.get("project", "?")
     review_branch = naming.reviewer_branch(ref)
+    if pr:
+        what_to_read = [
+            f"PR карточки: {pr}",
+            f"База проекта: `{base_branch}`.",
+            f"Воркспейс уже стоит на состоянии PR — своя ветка `{review_branch}` заведена от головы PR "
+            "при подъёме, чекаутить/переключать ветку не нужно. Тебе доступен весь репо и полный PR, "
+            "не только дифф:",
+            "```",
+            f"gh pr diff {pr}       # дифф PR, если нужен именно дифф, а не полный код",
+            "```",
+            f"Читай нужные файлы репо на состоянии PR, а не только строки диффа. Своя ветка "
+            f"`{review_branch}` — только твоя рабочая копия, её (как и любую ветку) не пушить.",
+        ]
+    else:
+        what_to_read = [
+            f"Contrib-карточка (форк): PR в этом пайплайне не открывается — ветку в форк для "
+            f"upstream-автора готовит человек. Ветка воркера: `{branch}`, голова: `{head_sha}`.",
+            f"База проекта: `{base_branch}`.",
+            f"Воркспейс уже стоит на состоянии этой ветки — своя ветка `{review_branch}` заведена от "
+            "той же головы при подъёме, чекаутить/переключать ветку не нужно. Тебе доступен весь "
+            "репо на этом состоянии, не только дифф:",
+            "```",
+            "git log --oneline -20     # история ветки, если нужен только список коммитов",
+            "```",
+            f"Читай нужные файлы репо на этом состоянии, а не только строки диффа. Своя ветка "
+            f"`{review_branch}` — только твоя рабочая копия, её (как и любую ветку) не пушить.",
+        ]
     lines = [
         f"# Ревью задачи {ref} ({project}) — слой 3 валидации",
         "",
@@ -50,16 +82,7 @@ def build_task(card: dict, ref: str, pr: str, spec: str, base_branch: str) -> st
         "",
         "## Что вычитать",
         "",
-        f"PR карточки: {pr}",
-        f"База проекта: `{base_branch}`.",
-        f"Воркспейс уже стоит на состоянии PR — своя ветка `{review_branch}` заведена от головы PR "
-        "при подъёме, чекаутить/переключать ветку не нужно. Тебе доступен весь репо и полный PR, "
-        "не только дифф:",
-        "```",
-        f"gh pr diff {pr}       # дифф PR, если нужен именно дифф, а не полный код",
-        "```",
-        f"Читай нужные файлы репо на состоянии PR, а не только строки диффа. Своя ветка "
-        f"`{review_branch}` — только твоя рабочая копия, её (как и любую ветку) не пушить.",
+        *what_to_read,
         "",
         "## Спека карточки (по ней проверяешь criterion за criterion)",
         "",
