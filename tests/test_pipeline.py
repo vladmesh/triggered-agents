@@ -184,6 +184,16 @@ class TestMatrix(unittest.TestCase):
         with self.assertRaises(model.GuardError):
             model.check_move("dispatcher", "Идеи", "Ready")
 
+    def test_steward_gets_every_po_transition_plus_the_override(self):
+        self.assertEqual(model.TRANSITIONS["steward"],
+                         model.TRANSITIONS["po"] | {model.STEWARD_OVERRIDE})
+
+    def test_only_steward_may_move_blocked_to_done(self):
+        model.check_move("steward", "Blocked", "Done")  # must not raise
+        for role in ("po", "dispatcher", "worker", "reviewer"):
+            with self.assertRaises(model.GuardError):
+                model.check_move(role, "Blocked", "Done")
+
     def test_unknown_role_and_column(self):
         with self.assertRaises(model.GuardError):
             model.check_move("nobody", "Идеи", "Ready")
@@ -559,6 +569,58 @@ class TestRetryState(PatchedBoardTest):
         self.assertEqual(meta[model.META_RETRY_SAME], "1")
 
 
+class TestStewardOverride(PatchedBoardTest):
+    """steward's Blocked -> Done override (model.STEWARD_OVERRIDE): needs a non-empty
+    justification, posted as a [steward:blocked-done] comment in the same ops.move_card call."""
+
+    def test_moves_and_posts_justification_comment(self):
+        board = self.make_board()
+        ref = board.add_task("A", "Blocked", meta={model.META_TASK_TYPE: "code",
+                                                   model.META_PROJECT: "personal_site"})
+        out = ops.move_card("steward", ref, "Done", reason="vladmesh approved skipping review")
+        self.assertEqual(out, {"action": "moved", "reference": ref, "from": "Blocked", "to": "Done"})
+        tid = next(t["id"] for t in board.tasks.values() if t["reference"] == ref)
+        self.assertEqual(board._column_title_for(tid), "Done")
+        posted = board.method_calls("createComment")
+        self.assertEqual(len(posted), 1)
+        self.assertEqual(posted[0]["content"],
+                         f"[{model.MARKER_STEWARD_OVERRIDE}]\nvladmesh approved skipping review")
+
+    def test_empty_reason_raises_and_moves_nothing(self):
+        board = self.make_board()
+        ref = board.add_task("A", "Blocked", meta={model.META_TASK_TYPE: "code",
+                                                   model.META_PROJECT: "personal_site"})
+        with self.assertRaises(model.GuardError):
+            ops.move_card("steward", ref, "Done")
+        tid = next(t["id"] for t in board.tasks.values() if t["reference"] == ref)
+        self.assertEqual(board._column_title_for(tid), "Blocked")
+        self.assertEqual(board.method_calls("createComment"), [])
+
+    def test_whitespace_only_reason_raises(self):
+        board = self.make_board()
+        ref = board.add_task("A", "Blocked", meta={model.META_TASK_TYPE: "code",
+                                                   model.META_PROJECT: "personal_site"})
+        with self.assertRaises(model.GuardError):
+            ops.move_card("steward", ref, "Done", reason="   ")
+
+    def test_other_roles_still_forbidden_even_with_a_reason(self):
+        board = self.make_board()
+        ref = board.add_task("A", "Blocked", meta={model.META_TASK_TYPE: "code",
+                                                   model.META_PROJECT: "personal_site"})
+        for role in ("po", "dispatcher", "worker", "reviewer"):
+            with self.assertRaises(model.GuardError):
+                ops.move_card(role, ref, "Done", reason="whatever")
+
+    def test_reason_ignored_for_ordinary_transitions(self):
+        board = self.make_board()
+        ref = board.add_task("A", "Blocked", meta={model.META_TASK_TYPE: "code",
+                                                   model.META_PROJECT: "personal_site"})
+        ops.move_card("steward", ref, "Ready")  # no reason needed, not the override pair
+        tid = next(t["id"] for t in board.tasks.values() if t["reference"] == ref)
+        self.assertEqual(board._column_title_for(tid), "Ready")
+        self.assertEqual(board.method_calls("createComment"), [])
+
+
 class TestReport(PatchedBoardTest):
     def test_blocked_without_body_raises(self):
         board = self.make_board()
@@ -662,6 +724,49 @@ class TestCliSlug(PatchedBoardTest):
         self.assertEqual(rc, 0)
         (task_id, meta), = [(tid, m) for tid, m in board.metadata.items()]
         self.assertEqual(meta[model.META_SLUG], "found-issue")
+
+
+class TestCliStewardRole(PatchedBoardTest):
+    """Role guards for steward at the CLI seam: same create right as po, plus move --reason for
+    the Blocked->Done override."""
+
+    def setUp(self):
+        from triggered_agents.agents.pipeline import cli
+        self.cli = cli
+
+    def test_steward_create_ok(self):
+        board = self.make_board()
+        rc = self.cli.main(["--role", "steward", "create", "--project", "personal_site",
+                            "--type", "code", "--title", "T"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(board.tasks), 1)
+
+    def test_steward_move_blocked_to_done_with_reason_ok(self):
+        board = self.make_board()
+        ref = board.add_task("A", "Blocked", meta={model.META_TASK_TYPE: "code",
+                                                   model.META_PROJECT: "personal_site"})
+        rc = self.cli.main(["--role", "steward", "move", "--ref", ref, "--to", "Done",
+                            "--reason", "vladmesh approved skipping review"])
+        self.assertEqual(rc, 0)
+        tid = next(t["id"] for t in board.tasks.values() if t["reference"] == ref)
+        self.assertEqual(board._column_title_for(tid), "Done")
+
+    def test_steward_move_blocked_to_done_without_reason_exits_3(self):
+        board = self.make_board()
+        ref = board.add_task("A", "Blocked", meta={model.META_TASK_TYPE: "code",
+                                                   model.META_PROJECT: "personal_site"})
+        rc = self.cli.main(["--role", "steward", "move", "--ref", ref, "--to", "Done"])
+        self.assertEqual(rc, 3)
+        tid = next(t["id"] for t in board.tasks.values() if t["reference"] == ref)
+        self.assertEqual(board._column_title_for(tid), "Blocked")
+
+    def test_worker_move_blocked_to_done_exits_3(self):
+        board = self.make_board()
+        ref = board.add_task("A", "Blocked", meta={model.META_TASK_TYPE: "code",
+                                                   model.META_PROJECT: "personal_site"})
+        rc = self.cli.main(["--role", "worker", "move", "--ref", ref, "--to", "Done",
+                            "--reason", "whatever"])
+        self.assertEqual(rc, 3)
 
 
 class TestReviewerRole(unittest.TestCase):

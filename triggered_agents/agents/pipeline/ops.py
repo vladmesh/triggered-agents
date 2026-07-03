@@ -215,7 +215,7 @@ def _move_position(pid: int, task_id: int, column_id: int, swimlane_id: int) -> 
         raise KanboardError(f"moveTaskPosition failed for task {task_id} -> column {column_id}")
 
 
-def move_card(role: str, reference: str, to_column: str) -> dict:
+def move_card(role: str, reference: str, to_column: str, reason: str = "") -> dict:
     """Move a card per the role/transition matrix (never into In progress; that is claim).
 
     The claim persists across In progress<->Validate rework (the worker session still owns
@@ -226,11 +226,21 @@ def move_card(role: str, reference: str, to_column: str) -> dict:
     full watchdog retry budget again, same as a brand new card; a watchdog requeue's own caller
     (dispatcher._watchdog_retry) restates the real counters (and, on a head switch, the new head)
     right after via set_retry_state, so this reset is never the last write for that path.
+
+    `reason` only matters for model.STEWARD_OVERRIDE (Blocked->Done): it must be non-empty (the
+    justification for skipping review) and is posted as a [steward:blocked-done] comment in this
+    same call, right after the move succeeds — so a card never ends up in Done with the override
+    used and no comment explaining why, and a rejected (empty-reason) call moves nothing.
     """
     pid = board_id()
     task = _get_by_ref(reference)
     cur = _column_title(pid, int(task["column_id"]))
     model.check_move(role, cur, to_column)
+    if (cur, to_column) == model.STEWARD_OVERRIDE and not reason.strip():
+        raise model.GuardError(
+            "Blocked -> Done requires a non-empty justification comment (--reason), "
+            "supplied in the same call"
+        )
     if to_column == "Ready":
         call("saveTaskMetadata", task_id=int(task["id"]), values={
             model.META_CLAIM: "",
@@ -239,6 +249,8 @@ def move_card(role: str, reference: str, to_column: str) -> dict:
             model.META_RETRY_HEADS: "",
         })
     _move_position(pid, int(task["id"]), _column_id(pid, to_column), int(task["swimlane_id"]))
+    if (cur, to_column) == model.STEWARD_OVERRIDE:
+        add_comment(role, reference, reason, marker=model.MARKER_STEWARD_OVERRIDE)
     return {"action": "moved", "reference": reference, "from": cur, "to": to_column}
 
 
