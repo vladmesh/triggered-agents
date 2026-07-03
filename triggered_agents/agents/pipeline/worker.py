@@ -53,15 +53,25 @@ class WorkspaceError(RuntimeError):
 # (no `/`, so filesystem paths survive).
 _ASSIGN_RE = re.compile(r"(?i)\b([A-Z0-9_]*(?:TOKEN|KEY|SECRET|PASSWORD|PASSWD)[A-Z0-9_]*)\s*=\s*\S+")
 _BLOB_RE = re.compile(r"\b[A-Za-z0-9+=_-]{40,}\b")
+_HEX_RE = re.compile(r"^[0-9a-fA-F]{7,40}$")
+
+
+def _is_git_sha(blob: str) -> bool:
+    """A git sha — full (40 hex) or abbreviated (7-40 hex) — is plain hex, no `+`/`=`/mixed-case
+    entropy a real token would carry. Masking it turns a commit reference in a CI-failure comment
+    into noise for no security gain."""
+    return bool(_HEX_RE.match(blob))
 
 
 def scrub_secrets(text: str) -> str:
-    """Mask secret-looking material in `text` before it reaches a board comment."""
+    """Mask secret-looking material in `text` before it reaches a board comment. `_BLOB_RE` casts
+    a wide net over long alnum runs, so a git sha or any other hex-shaped identifier is spared —
+    only the rest (base64/token-looking blobs) gets masked."""
     if not text:
         return text
     text = redact.redact(text)
     text = _ASSIGN_RE.sub(rf"\1={redact.REDACTED}", text)
-    return _BLOB_RE.sub(f"{redact.REDACTED}:blob", text)
+    return _BLOB_RE.sub(lambda m: m.group(0) if _is_git_sha(m.group(0)) else f"{redact.REDACTED}:blob", text)
 
 
 def _orca_json(args: list[str]) -> dict:
@@ -237,11 +247,18 @@ def _git_exclude(workspace: str, name: str) -> None:
             f.write(("" if not existing or existing[-1] == "" else "\n") + name + "\n")
 
 
+def workspace_path(project: str, name: str) -> str:
+    """`<WORKSPACES_ROOT>/<project>/<name>` as a string. `name` is a workspace's base name — the
+    same string stored as a card's claim (naming.worker_workspace_base via dispatcher._worker_id)
+    — so this lets the dispatcher rebuild the path a claim points at without touching disk."""
+    return str(WORKSPACES_ROOT / project / name)
+
+
 def workspace_exists(project: str, name: str) -> bool:
     """Whether `<WORKSPACES_ROOT>/<project>/<name>` already exists on disk — the collision check
     for a workspace name (naming.dedupe): a re-claim while the previous attempt's worktree is
     still alive (e.g. left on Blocked) must not collide with it."""
-    return (WORKSPACES_ROOT / project / name).is_dir()
+    return Path(workspace_path(project, name)).is_dir()
 
 
 def rename_terminal(handle: str, title: str) -> bool:
