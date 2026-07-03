@@ -450,6 +450,17 @@ class CloseOrphanTerminalsTest(unittest.TestCase):
 
         self.assertEqual(calls, ["term-default"])
 
+    def test_empty_keep_handle_closes_nothing_including_the_head_itself(self):
+        # Regression (review verdict, triggered-agents-247): a `terminal create` response with
+        # neither "handle" nor "id" makes launch_worker/spawn_reviewer pass keep_handle="" — an
+        # empty string never equals a real handle in the loop, so without the guard this would
+        # close the just-spawned head along with the orphan shell instead of leaving both alone.
+        def fake_orca_json(args):
+            raise AssertionError(f"must not even list terminals with no keep_handle: {args}")
+
+        with mock.patch.object(worker, "_orca_json", fake_orca_json):
+            worker._close_orphan_terminals("/ws", "")
+
     def test_never_closes_the_kept_handle(self):
         def fake_orca_json(args):
             if args[:2] == ["terminal", "list"]:

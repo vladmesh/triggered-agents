@@ -422,7 +422,16 @@ def _close_orphan_terminals(workspace: str, keep_handle: str) -> None:
     ~/projects/orca/PR-IDEAS.md); the head's own terminal, just created by launch_worker/
     spawn_reviewer, then leaves that shell tab behind as a permanent orphan no head reads or closes
     on its own. A listing/close failure is swallowed, same discipline as stop_terminals — a
-    leftover empty tab is cosmetic, not a bring-up blocker, so it must never fail the caller."""
+    leftover empty tab is cosmetic, not a bring-up blocker, so it must never fail the caller.
+
+    `keep_handle` empty (launch_worker/spawn_reviewer's `term.get("handle") or term.get("id") or
+    ""` fallback, for a create response that carried neither) must never fall through to "close
+    everything" — an empty string cannot equal any real handle in the loop below, so without this
+    guard the just-spawned head itself would be closed alongside the orphan shell (review verdict,
+    triggered-agents-247). Bailing out here is exactly the pre-fix behavior for that same
+    degenerate response: no orphan gets closed, but the head survives."""
+    if not keep_handle:
+        return
     try:
         data = _orca_json(["terminal", "list", "--worktree", f"path:{workspace}", "--limit", "50"])
     except (WorkspaceError, subprocess.TimeoutExpired):
