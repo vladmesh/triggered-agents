@@ -120,13 +120,32 @@ def project_root(project: str) -> Path:
     return home if home.is_dir() else p
 
 
+def _load_manifest(project: str) -> dict:
+    """workspace.toml лукап цепочкой: сначала в самом репо проекта (project_root), иначе
+    центральный манифест контриб-проектов control-panel/pipeline/manifests/<project>.toml —
+    контриб-форк не коммитит workspace.toml в свой репо (agent-kanban-232), декларация живёт в
+    control-panel вместо этого. Ни там, ни там — пустой манифест, вызывающий откатывается на
+    дефолты (base_branch main, не contrib). Зеркало той же цепочки в provision.py
+    (control-panel), кроме финала: там отсутствие манифеста в обоих местах — FAIL, здесь —
+    безопасные дефолты (это read_base_branch/is_contrib, не провижининг)."""
+    local = project_root(project) / "workspace.toml"
+    if local.is_file():
+        return tomllib.loads(local.read_text(encoding="utf-8"))
+    central = CONTROL_PANEL / "pipeline" / "manifests" / f"{project}.toml"
+    if central.is_file():
+        return tomllib.loads(central.read_text(encoding="utf-8"))
+    return {}
+
+
 def read_base_branch(project: str) -> str:
-    """base_branch from the project's committed workspace.toml, default 'main'."""
-    manifest = project_root(project) / "workspace.toml"
-    if not manifest.is_file():
-        return "main"
-    cfg = tomllib.loads(manifest.read_text(encoding="utf-8"))
-    return cfg.get("workspace", {}).get("base_branch", "main")
+    """base_branch from the project's manifest (see _load_manifest), default 'main'."""
+    return _load_manifest(project).get("workspace", {}).get("base_branch", "main")
+
+
+def is_contrib(project: str) -> bool:
+    """Whether the project's manifest declares `[workspace] contrib = true` — a fork whose
+    bring-up must branch off the upstream remote instead of origin (see create_workspace)."""
+    return bool(_load_manifest(project).get("workspace", {}).get("contrib", False))
 
 
 # --- Agent worktrees (board/curator/pipeline/retro's own worktrees, not a task workspace) -----
@@ -171,20 +190,47 @@ def ff_worktree(path: str, base_branch: str) -> dict:
             "after": after.stdout.strip() if after.returncode == 0 else None}
 
 
+def _repo_info(root: Path) -> dict:
+    """`orca repo show`'s repo object for `root` — carries `worktreeBaseRef` (Orca's host-local
+    default base ref) and `gitRemoteIdentity.remoteName` (the git remote pointing at the fork's
+    upstream, e.g. "upstream")."""
+    return _orca_json(["repo", "show", "--repo", f"path:{root}"]).get("repo", {})
+
+
+def ensure_contrib_base_ref(root: Path, base_branch: str) -> str:
+    """Idempotently point `root`'s Orca default base ref at upstream/<base_branch>: the manifest
+    (git) declares contrib, this brings Orca's host-local worktreeBaseRef (the mechanism) into
+    line with it, so a plain `orca worktree create` without an explicit --base-branch also lands
+    right. A no-op when already set — `orca repo set-base-ref` is otherwise a needless host write
+    on every bring-up. Returns the upstream remote's git name for the caller to fetch from."""
+    info = _repo_info(root)
+    remote = (info.get("gitRemoteIdentity") or {}).get("remoteName") or "upstream"
+    want = f"{remote}/{base_branch}"
+    if info.get("worktreeBaseRef") != want:
+        _orca_json(["repo", "set-base-ref", "--repo", f"path:{root}", "--ref", want])
+    return remote
+
+
 def create_workspace(project: str, name: str, base_branch: str) -> str:
-    """Fetch base_branch fresh from origin, then create an Orca worktree off `origin/base_branch`
-    (never the project's own local checkout state — a stale/switched local branch must not leak
-    into a fresh worker/reviewer worktree). Returns the worktree path. Setup is skipped here — we
-    run the provisioner ourselves next so we own its exit code and log.
+    """Fetch base_branch fresh from the right remote, then create an Orca worktree off it (never
+    the project's own local checkout state — a stale/switched local branch must not leak into a
+    fresh worker/reviewer worktree). Returns the worktree path. Setup is skipped here — we run the
+    provisioner ourselves next so we own its exit code and log.
+
+    Contrib forks (manifest `[workspace] contrib = true`, e.g. agent-kanban) branch off the
+    upstream remote instead of origin, so a worker's branch never carries the fork's own history
+    forward from a stale origin/base — PRs stay clean for the upstream author (agent-kanban-232).
+    `ensure_contrib_base_ref` keeps Orca's own default base ref converged to the same declaration.
 
     `--activate` reveals the new worktree in the Orca app. Without it a freshly created worktree
     has no window for the app to adopt a terminal into, so the head `launch_worker` starts next
     falls back to a background handle and the workspace shows empty in the GUI."""
     root = project_root(project)
-    _git_ok(root, ["fetch", "origin", base_branch])
+    remote = ensure_contrib_base_ref(root, base_branch) if is_contrib(project) else "origin"
+    _git_ok(root, ["fetch", remote, base_branch])
     data = _orca_json([
         "worktree", "create", "--repo", f"path:{root}",
-        "--name", name, "--base-branch", f"origin/{base_branch}", "--setup", "skip", "--no-parent",
+        "--name", name, "--base-branch", f"{remote}/{base_branch}", "--setup", "skip", "--no-parent",
         "--activate",
     ])
     wt = data.get("worktree", data)
