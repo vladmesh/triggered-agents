@@ -140,5 +140,27 @@ class DedupeTest(unittest.TestCase):
         self.assertEqual(naming.dedupe("A-x", exists), "A-x-5")
 
 
+class MemoryBlockTest(unittest.TestCase):
+    """Shared TASK.md/REVIEW.md memory block: MCP memory_search, scope order, mandatory caller."""
+
+    def test_names_the_tool_and_mcp(self):
+        text = naming.memory_block("worker", "personal_site")
+        self.assertIn("memory_search", text)
+        self.assertIn("MCP `memory`", text)
+
+    def test_scope_is_project_first_then_bare(self):
+        text = naming.memory_block("worker", "personal_site")
+        self.assertIn('scope="project:personal_site"', text)
+        self.assertIn("без scope", text)
+
+    def test_caller_is_the_given_role(self):
+        self.assertIn('caller="worker"', naming.memory_block("worker", "personal_site"))
+        self.assertIn('caller="reviewer"', naming.memory_block("reviewer", "personal_site"))
+
+    def test_canon_wins_on_conflict_with_personal_memory(self):
+        text = naming.memory_block("worker", "personal_site")
+        self.assertIn("канон", text)
+
+
 if __name__ == "__main__":
     unittest.main()

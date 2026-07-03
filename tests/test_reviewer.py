@@ -61,6 +61,12 @@ class BuildTaskTest(unittest.TestCase):
         text = self._build(ref=ref)
         self.assertIn(f"pipeline show --ref {ref}", text)
 
+    def test_carries_memory_block_scoped_to_project(self):
+        text = self._build()
+        self.assertIn("memory_search", text)
+        self.assertIn('scope="project:personal_site"', text)
+        self.assertIn('caller="reviewer"', text)
+
 
 class ContribBuildTaskTest(unittest.TestCase):
     """Contrib (fork) cards have no PR in this pipeline — REVIEW.md points at the reported

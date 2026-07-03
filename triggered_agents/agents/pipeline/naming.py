@@ -96,3 +96,23 @@ def reviewer_branch(reference: str) -> str:
 
 def stand_branch(project: str) -> str:
     return f"stand/{project}"
+
+
+# --- memory prompt block (design-политика memory-mcp, «приоритет общей памяти чтение личная
+# память») -----------------------------------------------------------------------------------
+# Shared between worker's TASK.md and reviewer's REVIEW.md so the wording/order/caller contract
+# stays one source of truth; the steward skill (static markdown, no per-card project) mirrors it
+# by hand with scope="project:triggered-agents".
+
+
+def memory_block(role: str, project: str) -> str:
+    """Короткий блок про общую память для роли `role` (worker/reviewer), скоуп из карточки
+    (`project`): сначала scope своего проекта, потом без scope; caller обязателен; при
+    конфликте с личной памятью верен канон."""
+    return (
+        "## Память\n\n"
+        "Прежде чем разбираться в устройстве системы с нуля — поищи в общей памяти: MCP "
+        "`memory`, тул `memory_search(query, k, scope, caller)`. Порядок: сначала "
+        f'`scope="project:{project}"`, если пусто — без scope. `caller="{role}"` — передавай '
+        "всегда. При конфликте с личной памятью верен канон (общая память приоритетнее)."
+    )
