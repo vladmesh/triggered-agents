@@ -37,8 +37,10 @@ class MaxAgeTest(unittest.TestCase):
 
 
 class CheckTest(unittest.TestCase):
-    """check() flags an agent red on a stale (or missing) runs.jsonl, independent of event kind —
-    a precheck-nothing-to-do event is just as fresh a proof of life as a dispatched one."""
+    """check() flags an agent red on a stale (or missing) runs.jsonl. A precheck-nothing-to-do
+    event is just as fresh a proof of life as a dispatched one — but a precheck-error is not: a
+    permanently down Kanboard makes precheck log a fresh error every tick forever, so counting
+    those as proof of life would keep a dead dispatcher looking green."""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -71,6 +73,26 @@ class CheckTest(unittest.TestCase):
         self.assertEqual(rc, 1)
 
     def test_no_runs_at_all_is_red(self):
+        rc = health.check(("pipeline",))
+        self.assertEqual(rc, 1)
+
+    def test_only_fresh_error_events_is_red_not_ok(self):
+        # A down Kanboard: precheck errors every tick, so the raw last event is always fresh.
+        # Freshness must be judged on the last non-error event, else this looks perpetually OK.
+        self._write_run("precheck", "nothing-to-do", age_s=901)  # last time it was actually healthy
+        self._write_run("precheck", "error", age_s=60)
+        rc = health.check(("pipeline",))
+        self.assertEqual(rc, 1)
+
+    def test_fresh_error_after_recent_healthy_tick_stays_ok(self):
+        # A single transient error right after a healthy tick must not flip the check red.
+        self._write_run("precheck", "nothing-to-do", age_s=60)
+        self._write_run("precheck", "error", age_s=5)
+        rc = health.check(("pipeline",))
+        self.assertEqual(rc, 0)
+
+    def test_only_ever_error_events_is_red(self):
+        self._write_run("precheck", "error", age_s=5)
         rc = health.check(("pipeline",))
         self.assertEqual(rc, 1)
 

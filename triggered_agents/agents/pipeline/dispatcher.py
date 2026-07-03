@@ -168,9 +168,9 @@ def precheck() -> int:
     try:
         cards = ops.list_cards()
     except Exception as e:  # noqa: BLE001 — any precheck failure must be logged, not just KanboardError
-        STATE.log_run("precheck", result="error", error_class=type(e).__name__,
-                      error=worker.scrub_secrets(str(e)))
-        print(f"pipeline: precheck failed ({type(e).__name__}): {e}", file=sys.stderr)
+        scrubbed = worker.scrub_secrets(str(e))
+        STATE.log_run("precheck", result="error", error_class=type(e).__name__, error=scrubbed)
+        print(f"pipeline: precheck failed ({type(e).__name__}): {scrubbed}", file=sys.stderr)
         return 2
     ready = [c for c in cards if c["column"] == "Ready"]
     inflight = [c for c in cards if c["column"] == model.IN_PROGRESS and c["claim"]]
