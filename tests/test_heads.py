@@ -36,10 +36,11 @@ class RealRegistryTest(unittest.TestCase):
         for pid in ("claude-sonnet", "claude-opus", "claude-fable"):
             self.assertEqual(self.reg.profile(pid)["resource"], "claude-sub")
 
-    def test_claude_fable_falls_back_to_claude_opus(self):
-        # 2026-07-04 design grill: Fable's fallback is for Fable itself leaving the subscription,
-        # so it stays on claude-sub (claude-opus), not the cross-runtime hermes-flash chain.
-        self.assertEqual(self.reg.profile("claude-fable").get("fallback"), ["claude-opus"])
+    def test_claude_fable_falls_back_to_opus_then_hermes(self):
+        # 2026-07-04 (vladmesh): the steward must survive the whole claude-sub resource going red,
+        # so after claude-opus the chain leaves the subscription onto a non-Anthropic runtime.
+        self.assertEqual(self.reg.profile("claude-fable").get("fallback"),
+                         ["claude-opus", "hermes-flash"])
 
     def test_claude_sonnet_falls_back_to_hermes_flash_cross_runtime(self):
         # 2026-07-03 design session: head-technical retries must prove the switch on a genuinely

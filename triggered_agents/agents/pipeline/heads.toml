@@ -42,14 +42,14 @@ model = "opus"
 fallback = []
 
 [profiles.claude-fable]
-# Fable head for the steward agent (triggered-agents-243 design grill, 2026-07-04). Falls back to
-# claude-opus, not hermes-flash: the fallback here is only for Fable itself going away from the
-# subscription, not the cross-runtime proof claude-sonnet's chain exists for — staying on
-# claude-sub keeps the steward on the same account/limits it started with.
+# Fable head for the steward agent (triggered-agents-243 design grill, 2026-07-04). Fallback:
+# claude-opus first (Fable itself leaving the subscription), then hermes-flash on a non-Anthropic
+# model (vladmesh, 2026-07-04) — the steward is the watcher of last resort and must wake even when
+# the whole claude-sub resource is red; a few paid openrouter tokens are the accepted price.
 resource = "claude-sub"
 adapter = "claude"
 model = "fable"
-fallback = ["claude-opus"]
+fallback = ["claude-opus", "hermes-flash"]
 
 [profiles.hermes-flash]
 # Cross-runtime fallback for claude-sonnet (pay-per-token via openrouter): a live head-technical
