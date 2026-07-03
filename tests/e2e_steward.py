@@ -79,10 +79,18 @@ def main() -> int:
         rc, _ = run_board(None, ["setup"])
         check("board setup rc=0", rc == 0)
 
-        # A cold-start scan against the real resource probes always finds a "signal" once — every
-        # currently-green resource has no prior watermark entry yet, so nothing to compare a flip
-        # against. One throwaway scan+advance establishes that baseline before the real assertions
-        # below, the same way a freshly-provisioned steward's very first tick would.
+        # Seed the two files the pipeline dispatcher's own worktree would already have by the time
+        # the steward's first tick runs: an empty, caught-up runs.jsonl (a MISSING one is itself a
+        # warn signal now — see test_steward.py's LogSignalsTest — which would trip the "quiet
+        # board" check below) and a green resource_health.json cache (steward reads the
+        # dispatcher's own cache rather than probing itself, see signals.py's _resource_signals
+        # decision, triggered-agents-253). One throwaway scan+advance then establishes that as the
+        # baseline before the real assertions below, the same way a freshly-provisioned steward's
+        # very first tick would.
+        signals.PIPELINE_RUNS.parent.mkdir(parents=True, exist_ok=True)
+        signals.PIPELINE_RUNS.touch()
+        signals.PIPELINE_RESOURCE_HEALTH.write_text(
+            json.dumps({"claude-sub": {"status": "green", "checked_at": 0}}), encoding="utf-8")
         run_steward(["scan", "--json"])
         run_steward(["advance"])
 
@@ -113,8 +121,11 @@ def main() -> int:
             f.write(json.dumps({"ts": "2026-07-04T00:00:00+00:00", "event": "ff-agents",
                                 "result": "error", "level": "warn", "error": "e2e staged"}) + "\n")
 
-        # 3. anomaly: a resource health flip (claude-sub forced red via heads.toml's own bypass).
-        os.environ["TA_HEALTH_FORCE_RED"] = "claude-sub"
+        # 3. anomaly: a resource health flip — flip the dispatcher's own cache file to red directly
+        #    (a real flip would come from pipeline_health.refresh() during a live dispatcher tick;
+        #    the steward only ever reads this file, never re-probes — see step above).
+        signals.PIPELINE_RESOURCE_HEALTH.write_text(
+            json.dumps({"claude-sub": {"status": "red", "checked_at": 0}}), encoding="utf-8")
 
         # 4. anomaly: an orphan workspace directory nobody's cards.json record points at, and no
         #    active card owns by id either.
@@ -159,13 +170,10 @@ def main() -> int:
         texts = " ".join(c["text"] for c in show["comments"])
         check("override left a paper trail", f"[{model.MARKER_STEWARD_OVERRIDE}]" in texts)
 
-        # 6. clean up the staged anomalies, advance, and confirm the gate goes quiet again. Force-
-        # red already wrote a "red" cache entry (health.refresh's TTL cache, bypassed while forced
-        # but not cleared by unsetting it) — dropping the env var here does not flip the cache back
-        # to green within this run, which is fine: advance() already baselined "red" as the
-        # watermark, so the final precheck below only needs the status to stay unchanged, not turn
-        # green, to see zero flip signal.
-        del os.environ["TA_HEALTH_FORCE_RED"]
+        # 6. clean up the staged anomalies, advance, and confirm the gate goes quiet again. The
+        # resource_health.json cache stays red on disk (nothing here flips it back to green) —
+        # that's fine, advance() already baselined "red" as the watermark, so the final precheck
+        # below only needs the status to stay unchanged, not turn green, to see zero flip signal.
         shutil.rmtree(orphan)
         shutil.rmtree(preserved)
         rc, _ = run_steward(["advance"])
@@ -176,7 +184,6 @@ def main() -> int:
         print("\nALL PASS")
         return 0
     finally:
-        os.environ.pop("TA_HEALTH_FORCE_RED", None)
         try:
             for p in call("getAllProjects") or []:
                 if p["name"] == "__e2e_steward__":
