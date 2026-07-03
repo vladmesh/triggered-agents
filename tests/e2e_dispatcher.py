@@ -44,6 +44,7 @@ from triggered_agents.agents.pipeline import cli, dispatcher, model, ops, worker
 
 _fail = False
 _workspaces: list[str] = []
+_torn_down: list[str] = []
 _notified: list[tuple[str, str]] = []
 # A real merged PR of a vladmesh repo — the Validate poll hits gh against this for real.
 E2E_PR = os.environ.get("TA_E2E_PR", "https://github.com/vladmesh/personal_site/pull/25")
@@ -112,12 +113,20 @@ def _stub_set_branch(workspace, branch):
     pass    # the real git-hygiene rename is exercised in the unit tests, not this e2e
 
 
+def _stub_teardown(workspace):
+    # The real worker.teardown refuses any path outside WORKSPACES_ROOT (a real orca worktree
+    # tree); this e2e's stub workspaces are plain tempdirs, so the watchdog retry cycle (which
+    # tears a dead workspace down before requeuing) needs its own stand-in, same as create/launch.
+    _torn_down.append(workspace)
+
+
 def install_stubs(provision=_stub_provision_ok, activity=lambda ws: None):
     worker.create_workspace = _stub_create_workspace
     worker.set_branch = _stub_set_branch
     worker.provision = provision
     worker.launch_worker = _stub_launch
     worker.activity = activity
+    worker.teardown = _stub_teardown
     worker.notify = _stub_notify        # no live head to nudge; poll_pr stays real (hits gh)
     worker.workspace_exists = _stub_workspace_exists
     worker.rename_terminal = _stub_rename_terminal
@@ -183,19 +192,34 @@ def main() -> int:
         check("smoke-fail card Blocked", _column(ref2) == "Blocked")
         check("smoke-fail card not tracked", ref2 not in dispatcher._load_cards())
 
-        # 8. watchdog path -> Blocked, workspace kept alive
+        # 8. watchdog path: head-technical retry cycle (2026-07-03 design session), not an instant
+        #    Blocked. Same head once first — deterministic, no dependence on which resources are
+        #    actually live on this host. The switch step (the next green head along heads.toml's
+        #    fallback chain) needs a real, currently-green alternate resource to demonstrate live —
+        #    that is tests/e2e_hermes_retry.py's job, not this one — so here the switch budget is
+        #    forced to 0 to reach the terminal Blocked deterministically after just the one retry.
         install_stubs(provision=_stub_provision_ok, activity=lambda ws: None)
         rc = _run_cli("po", ["create", "--project", "personal_site", "--type", "research",
                              "--title", "e2e: watchdog", "--column", "Ready"])
         ref3 = ops.list_cards(column="Ready")[0]["reference"]
         dispatcher.tick()
         check("watchdog card In progress", _column(ref3) == model.IN_PROGRESS)
-        ws_before = set(_workspaces)
         dispatcher.WATCHDOG_SECONDS = -1
-        dispatcher.tick()
-        check("watchdog card Blocked", _column(ref3) == "Blocked")
-        check("watchdog kept workspace", set(_workspaces) == ws_before and
-              all(Path(w).exists() for w in _workspaces))
+        dispatcher.RETRY_SWITCH_BUDGET = 0
+        ws_before = set(_workspaces)
+
+        dispatcher.tick()   # 1st timeout: same-head retry — teardown, Ready, reclaimed same tick
+        check("watchdog same-head retry keeps card In progress", _column(ref3) == model.IN_PROGRESS)
+        check("watchdog retry launched a fresh workspace", set(_workspaces) != ws_before)
+        check("watchdog retry tore the old workspace(s) down", bool(_torn_down))
+        meta = ops.show_card(ref3)["metadata"]
+        check("retry_same counted on the board", meta.get(model.META_RETRY_SAME) == "1")
+
+        dispatcher.tick()   # 2nd timeout: same-head spent, switch budget forced to 0 -> Blocked
+        check("watchdog card Blocked after budget exhausted", _column(ref3) == "Blocked")
+        last_ws = Path(_workspaces[-1])
+        check("watchdog kept the final workspace for a human",
+              _workspaces[-1] not in _torn_down and last_ws.exists())
 
         print("\nALL PASS")
         return 0

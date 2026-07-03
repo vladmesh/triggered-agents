@@ -508,6 +508,57 @@ class TestClaim(PatchedBoardTest):
             ops.claim_card(ref, "w1")
 
 
+class TestRetryState(PatchedBoardTest):
+    """Watchdog retry bookkeeping (model.META_RETRY_*): reset on any arrival in Ready, restated by
+    set_retry_state, readable back via get_metadata."""
+
+    def test_ready_arrival_resets_retry_metadata_from_any_source_column(self):
+        board = self.make_board()
+        ref = board.add_task("A", "In progress",
+                             meta={model.META_TASK_TYPE: "code", model.META_PROJECT: "personal_site",
+                                   model.META_CLAIM: "w1", model.META_RETRY_SAME: "1",
+                                   model.META_RETRY_SWITCH: "1", model.META_RETRY_HEADS: "a,b"})
+        ops.move_card("dispatcher", ref, "Ready")
+        meta = ops.get_metadata(ref)
+        self.assertFalse(meta.get(model.META_CLAIM))
+        self.assertFalse(meta.get(model.META_RETRY_SAME))
+        self.assertFalse(meta.get(model.META_RETRY_SWITCH))
+        self.assertFalse(meta.get(model.META_RETRY_HEADS))
+
+    def test_set_retry_state_stamps_counters_and_history(self):
+        board = self.make_board()
+        ref = board.add_task("A", "Ready", meta={model.META_TASK_TYPE: "code",
+                                                 model.META_PROJECT: "personal_site"})
+        ops.set_retry_state(ref, retry_same=1, retry_switch=0, retry_heads="claude-sonnet")
+        meta = ops.get_metadata(ref)
+        self.assertEqual(meta[model.META_RETRY_SAME], "1")
+        self.assertEqual(meta[model.META_RETRY_SWITCH], "0")
+        self.assertEqual(meta[model.META_RETRY_HEADS], "claude-sonnet")
+        self.assertNotIn(model.META_HEAD, meta)   # head untouched when not passed
+
+    def test_set_retry_state_updates_head_on_switch(self):
+        board = self.make_board()
+        ref = board.add_task("A", "Ready", meta={model.META_TASK_TYPE: "code",
+                                                 model.META_PROJECT: "personal_site",
+                                                 model.META_HEAD: "claude-sonnet"})
+        ops.set_retry_state(ref, retry_same=1, retry_switch=1,
+                            retry_heads="claude-sonnet,hermes-flash", head="hermes-flash")
+        meta = ops.get_metadata(ref)
+        self.assertEqual(meta[model.META_HEAD], "hermes-flash")
+
+    def test_set_retry_state_survives_being_written_right_after_a_ready_reset(self):
+        # Exactly the sequence dispatcher._watchdog_retry runs: move_card(...,'Ready') resets the
+        # fields to defaults, set_retry_state's write right after must be the value that sticks.
+        board = self.make_board()
+        ref = board.add_task("A", "In progress",
+                             meta={model.META_TASK_TYPE: "code", model.META_PROJECT: "personal_site",
+                                   model.META_CLAIM: "w1"})
+        ops.move_card("dispatcher", ref, "Ready")
+        ops.set_retry_state(ref, retry_same=1, retry_switch=0, retry_heads="claude-sonnet")
+        meta = ops.get_metadata(ref)
+        self.assertEqual(meta[model.META_RETRY_SAME], "1")
+
+
 class TestReport(PatchedBoardTest):
     def test_blocked_without_body_raises(self):
         board = self.make_board()

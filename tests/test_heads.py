@@ -31,17 +31,18 @@ class RealRegistryTest(unittest.TestCase):
     def test_starting_profiles_present(self):
         self.assertEqual(set(self.reg.known()), {"claude-sonnet", "claude-opus", "hermes-flash"})
 
-    def test_claude_profiles_share_the_subscription_resource_empty_fallback(self):
+    def test_claude_profiles_share_the_subscription_resource(self):
         for pid in ("claude-sonnet", "claude-opus"):
-            prof = self.reg.profile(pid)
-            self.assertEqual(prof["resource"], "claude-sub")
-            self.assertEqual(prof.get("fallback") or [], [])
+            self.assertEqual(self.reg.profile(pid)["resource"], "claude-sub")
 
-    def test_hermes_flash_is_on_its_own_resource_no_prod_profile_falls_back_to_it(self):
-        prof = self.reg.profile("hermes-flash")
-        self.assertEqual(prof["resource"], "openrouter")
-        for pid in ("claude-sonnet", "claude-opus"):
-            self.assertNotIn("hermes-flash", self.reg.profile(pid).get("fallback") or [])
+    def test_claude_sonnet_falls_back_to_hermes_flash_cross_runtime(self):
+        # 2026-07-03 design session: head-technical retries must prove the switch on a genuinely
+        # different, non-claude runtime — claude-opus is untouched (still claude-sub only).
+        self.assertEqual(self.reg.profile("claude-sonnet").get("fallback"), ["hermes-flash"])
+        self.assertEqual(self.reg.profile("claude-opus").get("fallback") or [], [])
+
+    def test_hermes_flash_is_on_its_own_resource(self):
+        self.assertEqual(self.reg.profile("hermes-flash")["resource"], "openrouter")
 
     def test_unknown_profile_raises_with_known_ids_listed(self):
         with self.assertRaises(heads.HeadRegistryError) as ctx:
