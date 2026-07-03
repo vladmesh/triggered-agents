@@ -152,11 +152,26 @@ class LaunchCmdTest(unittest.TestCase):
     def test_steward_head_falls_back_to_next_profile_when_resource_red(self):
         from triggered_agents.agents.pipeline import health as pipeline_health
 
+        # claude-fable's chain is claude-opus (same claude-sub resource) then hermes-flash (a
+        # different, openrouter resource) — see heads.toml, PR #38: the steward is the watcher of
+        # last resort and must wake even when the whole claude-sub resource is red. With claude-sub
+        # red and openrouter unmentioned (defaults green — heads.health.resolve_head), resolution
+        # walks past claude-opus (same red resource) onto hermes-flash.
         with mock.patch.object(pipeline_health, "refresh", lambda: {"claude-sub": "red"}):
             skill, cmd = dispatch._launch_cmd("steward")
-        # claude-fable's whole fallback chain (claude-opus) also sits on claude-sub, so
-        # resolve_head comes back None and _launch_cmd keeps the originally-named profile
-        # rather than silently downgrading to no model at all.
+        self.assertIn("BOARD_ROLE=steward", cmd)
+        self.assertIn("hermes", cmd)
+        self.assertIn("google/gemini-2.5-flash", cmd)
+
+    def test_steward_head_keeps_original_name_when_the_whole_chain_is_red(self):
+        from triggered_agents.agents.pipeline import health as pipeline_health
+
+        # Every resource claude-fable's chain can reach (claude-sub, openrouter) is red -> nothing
+        # to fall back onto; _launch_cmd must keep the originally-named profile rather than
+        # silently downgrading to no model at all.
+        with mock.patch.object(pipeline_health, "refresh",
+                               lambda: {"claude-sub": "red", "openrouter": "red"}):
+            skill, cmd = dispatch._launch_cmd("steward")
         self.assertIn("--model fable", cmd)
 
 
