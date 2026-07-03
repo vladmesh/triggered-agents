@@ -732,6 +732,17 @@ class TaskMdHistoryTest(_DispatcherBase):
         (_, content), = self.worker.tasks_written
         self.assertNotIn("upstream", content)
 
+    # контриб-карточка: report:done несёт ветку/head sha вместо ссылки на PR --------------------
+    def test_contrib_project_task_md_carries_branch_head_protocol_not_pr(self):
+        self.worker.contrib_projects = {"agent-kanban"}
+        ref = self._ready_card("A", project="agent-kanban")
+        dispatcher.tick()
+        (_, content), = self.worker.tasks_written
+        self.assertIn(f"branch: pipeline/{ref}", content)
+        self.assertIn("head:", content)
+        self.assertNotIn("PR открыт", content)
+        self.assertNotIn("ссылка на PR", content)
+
     def test_metadata_section_has_type_model_slug_blocked_by(self):
         pred = self._ready_card("Pred")
         pred_tid = next(t["id"] for t in self.board.tasks.values() if t["reference"] == pred)
@@ -1416,6 +1427,142 @@ class ValidateReviewTest(_DispatcherBase):
         self.assertEqual(self.worker.reviewer_spawns, [])
         self.assertTrue(any(r["event"] == "review" and r.get("result") == "untracked"
                             for r in self._runs()))
+
+
+class ValidateContribTest(_DispatcherBase):
+    """Validate for a contrib (fork) card: it has no PR in this pipeline by definition (a human
+    opens it against upstream from the pushed branch afterward) — layer 1 is the worker's own
+    report (branch + head sha protocol lines, no CI polling), layer 3 spawns the reviewer straight
+    off the reported branch, and green goes straight to Done (no PR to wait on for a merge)."""
+
+    PROJECT = "agent-kanban"
+    BRANCH_PREFIX = "pipeline"
+    SHA = "abc1234"
+
+    def setUp(self):
+        super().setUp()
+        self.worker.contrib_projects = {self.PROJECT}
+
+    def _markers(self, ref):
+        tid = next(t["id"] for t in self.board.tasks.values() if t["reference"] == ref)
+        return " ".join(c["comment"] for c in self.board.comments.get(tid, []))
+
+    def _claim(self, title="A"):
+        return self._claim_one(title, project=self.PROJECT)
+
+    def _branch(self, ref):
+        return f"{self.BRANCH_PREFIX}/{ref}"
+
+    def _to_validate(self, sha=SHA):
+        ref = self._claim()
+        ops.report(ref, "done", f"готово\nbranch: {self._branch(ref)}\nhead: {sha}")
+        dispatcher.tick()
+        self.assertEqual(self._column(ref), "Validate")
+        return ref
+
+    def test_no_gh_poll_ever_for_a_contrib_card(self):
+        ref = self._to_validate()
+        dispatcher.tick()
+        self.assertEqual(self.worker.polled, [])
+
+    def test_missing_branch_stalls_with_own_reason_not_no_pr_ref(self):
+        ref = self._claim()
+        ops.report(ref, "done", "готово, но забыл протокольные строки")
+        dispatcher.tick()
+        self.assertEqual(self._column(ref), "Validate")
+        self.assertEqual(self.worker.polled, [])
+        runs = self._runs()
+        self.assertTrue(any(r["event"] == "validate" and r.get("result") == "no-branch-ref"
+                            and r.get("level") == "warn" for r in runs))
+        self.assertFalse(any(r.get("result") == "no-pr-ref" for r in runs))
+
+    def test_missing_head_alone_also_stalls(self):
+        ref = self._claim()
+        ops.report(ref, "done", f"готово\nbranch: {self._branch(ref)}")  # no head sha
+        dispatcher.tick()
+        self.assertEqual(self._column(ref), "Validate")
+        self.assertTrue(any(r["event"] == "validate" and r.get("result") == "no-branch-ref"
+                            for r in self._runs()))
+
+    def test_missing_branch_escalates_after_stall_cap_with_own_reason(self):
+        # Same cap/escalation machinery as the PR flow (_validate_stall), but a contrib card must
+        # never surface as a no-pr-ref stall — it has no PR by definition.
+        ref = self._claim()
+        ops.report(ref, "done", "готово, но забыл протокольные строки")
+        dispatcher.tick()
+        for i in range(2, dispatcher.VALIDATE_STALL_ATTEMPTS):
+            dispatcher.tick()
+            self.assertEqual(self._column(ref), "Validate")
+            self.assertEqual(dispatcher._load_cards()[ref]["validate_stall_fails"], i)
+        dispatcher.tick()
+        self.assertEqual(self._column(ref), "Blocked")
+        self.assertNotIn(ref, dispatcher._load_cards())
+        runs = self._runs()
+        stalls = [r for r in runs if r["event"] == "validate" and r.get("reason") == "no-branch-ref-stall"]
+        self.assertEqual(len(stalls), 1)
+        self.assertFalse(any(r.get("reason") == "no-pr-ref-stall" for r in runs))
+
+    def test_report_with_branch_and_sha_greenlights_layer1_once(self):
+        ref = self._to_validate()
+        dispatcher.tick()                            # second green tick must not re-post
+        journal = self._markers(ref)
+        self.assertEqual(journal.count(f"[{model.MARKER_VALIDATE_GREEN}]"), 1)
+        self.assertIn(self._branch(ref), journal)
+        self.assertIn(self.SHA, journal)
+
+    def test_spawns_reviewer_off_reported_branch_without_gh(self):
+        ref = self._to_validate()
+        self.assertEqual(len(self.worker.reviewer_spawns), 1)
+        _, _, _, _, pr_branch, _ = self.worker.reviewer_spawns[0]
+        self.assertEqual(pr_branch, self._branch(ref))     # naming.worker_branch(ref), no gh call
+        self.assertEqual(self.worker.polled, [])
+
+    def test_green_verdict_goes_straight_to_done_and_tears_down(self):
+        ref = self._to_validate()
+        ws = dispatcher._load_cards()[ref]["workspace"]
+        ops.verdict(ref, "green", "каждый criterion реально выполнен")
+        dispatcher.tick()
+        self.assertEqual(self._column(ref), "Done")
+        self.assertNotIn(ref, dispatcher._load_cards())
+        self.assertIn(ws, self.worker.torn_down)
+        self.assertEqual(self.worker.merged, [])            # no PR to merge, ever
+
+    def test_red_verdict_returns_to_in_progress_same_cap_as_pr_flow(self):
+        ref = self._to_validate()
+        ops.verdict(ref, "red", "блокер: X")
+        dispatcher.tick()
+        self.assertEqual(self._column(ref), model.IN_PROGRESS)
+        rec = dispatcher._load_cards()[ref]
+        self.assertEqual(rec["review_returns"], 1)
+        self.assertNotIn("review_baseline", rec)
+
+    def test_return_cap_blocks_after_repeated_red_verdicts(self):
+        ref = self._to_validate()
+        for i in range(dispatcher.REVIEW_RETURN_CAP):
+            ops.verdict(ref, "red", f"блокер {i}")
+            dispatcher.tick()
+            self.assertEqual(self._column(ref), model.IN_PROGRESS)
+            ops.report(ref, "done", f"fix\nbranch: {self._branch(ref)}\nhead: sha{i}")
+            dispatcher.tick()                                # -> Validate
+            dispatcher.tick()                                # -> reviewer up again
+        ops.verdict(ref, "red", "сверх капа")
+        dispatcher.tick()
+        self.assertEqual(self._column(ref), "Blocked")
+        self.assertNotIn(ref, dispatcher._load_cards())
+
+    def test_red_then_fresh_report_reruns_review_then_green_to_done(self):
+        ref = self._to_validate()
+        ops.verdict(ref, "red", "блокер: X")
+        dispatcher.tick()
+        self.assertEqual(self._column(ref), model.IN_PROGRESS)
+        ops.report(ref, "done", f"починил\nbranch: {self._branch(ref)}\nhead: def5678")
+        dispatcher.tick()
+        self.assertEqual(self._column(ref), "Validate")
+        dispatcher.tick()                                    # fresh reviewer off the new head
+        self.assertEqual(len(self.worker.reviewer_spawns), 2)
+        ops.verdict(ref, "green", "теперь всё реально")
+        dispatcher.tick()
+        self.assertEqual(self._column(ref), "Done")
 
 
 class AutomergeTest(_DispatcherBase):

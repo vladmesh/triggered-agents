@@ -574,7 +574,7 @@ def merge_pr(pr_url: str) -> dict:
     """Squash-merge a PR via gh. Returns {"ok": bool, "error": str|None}.
 
     Unlike poll_pr/pr_branch/run_stand, this is never a "retry next tick" call: the dispatcher
-    calls it at most once per green review (see dispatcher._review_green), and any failure here —
+    calls it at most once per green review (see validate._review_green), and any failure here —
     including gh being unavailable — is a final outcome the caller reports and Blocks on, not an
     unknown to poll again."""
     try:
