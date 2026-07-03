@@ -125,8 +125,9 @@ def _load_manifest(project: str) -> dict:
     центральный манифест контриб-проектов control-panel/pipeline/manifests/<project>.toml —
     контриб-форк не коммитит workspace.toml в свой репо (agent-kanban-232), декларация живёт в
     control-panel вместо этого. Ни там, ни там — пустой манифест, вызывающий откатывается на
-    дефолты (base_branch main, не contrib), в отличие от provision.py, для которого отсутствие
-    манифеста в обоих местах остаётся FAIL."""
+    дефолты (base_branch main, не contrib). Зеркало той же цепочки в provision.py
+    (control-panel), кроме финала: там отсутствие манифеста в обоих местах — FAIL, здесь —
+    безопасные дефолты (это read_base_branch/is_contrib, не провижининг)."""
     local = project_root(project) / "workspace.toml"
     if local.is_file():
         return tomllib.loads(local.read_text(encoding="utf-8"))
