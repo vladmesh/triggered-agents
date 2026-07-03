@@ -66,7 +66,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_create.add_argument("--ref")
     p_create.add_argument("--column", default="Идеи")
     p_create.add_argument("--blocked-by", dest="blocked_by")
-    p_create.add_argument("--model", dest="model_name")
+    p_create.add_argument("--head", dest="head")
     p_create.add_argument("--slug")
     p_create.add_argument("--description")
     p_create.add_argument("--description-file")
@@ -74,7 +74,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_update = sub.add_parser("update")
     p_update.add_argument("--ref", required=True)
     p_update.add_argument("--blocked-by", dest="blocked_by")
-    p_update.add_argument("--model", dest="model_name")
+    p_update.add_argument("--head", dest="head")
     p_update.add_argument("--slug")
 
     p_ready = sub.add_parser("ready")
@@ -116,7 +116,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_idea.add_argument("--title", required=True)
     p_idea.add_argument("--type", default="code", dest="task_type")
     p_idea.add_argument("--ref")
-    p_idea.add_argument("--model", dest="model_name")
+    p_idea.add_argument("--head", dest="head")
     p_idea.add_argument("--slug")
     p_idea.add_argument("--description")
     p_idea.add_argument("--description-file")
@@ -163,13 +163,13 @@ def main(argv=None) -> int:
             return _emit(ops.create_card(
                 project=args.project, task_type=args.task_type, title=args.title,
                 description=desc, ref=args.ref, column=args.column,
-                blocked_by=args.blocked_by, model_name=args.model_name, slug=args.slug))
+                blocked_by=args.blocked_by, head=args.head, slug=args.slug))
         if args.cmd == "update":
             if not _need_role(role, ROLES):
                 return 2
             return _emit(ops.update_card(
                 role, args.ref, slug=args.slug,
-                model_name=args.model_name, blocked_by=args.blocked_by))
+                head=args.head, blocked_by=args.blocked_by))
         if args.cmd == "ready":
             if not _need_role(role, ROLES):
                 return 2
@@ -202,7 +202,7 @@ def main(argv=None) -> int:
             desc = _text_arg(args.description, args.description_file)
             return _emit(ops.reviewer_idea(
                 project=args.project, task_type=args.task_type, title=args.title,
-                description=desc, ref=args.ref, model_name=args.model_name, slug=args.slug))
+                description=desc, ref=args.ref, head=args.head, slug=args.slug))
         if args.cmd == "comment":
             if not _need_role(role, ROLES):
                 return 2

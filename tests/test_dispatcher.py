@@ -88,8 +88,8 @@ class FakeWorker:
         self.tasks_written.append((workspace, content))
         return workspace + "/TASK.md"
 
-    def launch_worker(self, workspace, model_name, worker_id, title):
-        self.launched.append({"ws": workspace, "model": model_name, "worker": worker_id, "title": title})
+    def launch_worker(self, workspace, head, worker_id, title):
+        self.launched.append({"ws": workspace, "head": head, "worker": worker_id, "title": title})
         return f"handle-{worker_id}"
 
     def workspace_exists(self, project, name):
@@ -178,10 +178,10 @@ class _DispatcherBase(unittest.TestCase):
         tid = next(t["id"] for t in self.board.tasks.values() if t["reference"] == ref)
         return self.board._column_title_for(tid)
 
-    def _ready_card(self, title, project="personal_site", ttype="code", meta=None, model_name=None):
+    def _ready_card(self, title, project="personal_site", ttype="code", meta=None, head=None):
         m = {model.META_TASK_TYPE: ttype, model.META_PROJECT: project}
-        if model_name:
-            m[model.META_MODEL] = model_name
+        if head:
+            m[model.META_HEAD] = head
         if meta:
             m.update(meta)
         return self.board.add_task(title, "Ready", swimlane=project, meta=m)
@@ -288,11 +288,11 @@ class DispatcherTest(_DispatcherBase):
 
     # claim + bring-up ------------------------------------------------------
     def test_tick_claims_and_launches(self):
-        ref = self._ready_card("A", model_name="opus")
+        ref = self._ready_card("A", head="claude-opus")
         dispatcher.tick()
         self.assertEqual(self._column(ref), model.IN_PROGRESS)
         self.assertEqual(len(self.worker.launched), 1)
-        self.assertEqual(self.worker.launched[0]["model"], "opus")
+        self.assertEqual(self.worker.launched[0]["head"], "claude-opus")
         self.assertEqual(len(self.worker.tasks_written), 1)
         records = dispatcher._load_cards()
         self.assertIn(ref, records)
@@ -743,16 +743,16 @@ class TaskMdHistoryTest(_DispatcherBase):
         self.assertNotIn("PR открыт", content)
         self.assertNotIn("ссылка на PR", content)
 
-    def test_metadata_section_has_type_model_slug_blocked_by(self):
+    def test_metadata_section_has_type_head_slug_blocked_by(self):
         pred = self._ready_card("Pred")
         pred_tid = next(t["id"] for t in self.board.tasks.values() if t["reference"] == pred)
         self.board.tasks[pred_tid]["is_active"] = 0  # counts as Done for the blocked_by guard
-        self._ready_card("B", model_name="opus",
+        self._ready_card("B", head="claude-opus",
                          meta={model.META_SLUG: "my-slug", model.META_BLOCKED_BY: pred})
         dispatcher.tick()
         (_, content), = self.worker.tasks_written
         self.assertIn("тип: code", content)
-        self.assertIn("модель: opus", content)
+        self.assertIn("голова: claude-opus", content)
         self.assertIn("слаг: my-slug", content)
         self.assertIn(f"blocked_by: {pred}", content)
 
