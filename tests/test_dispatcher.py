@@ -58,6 +58,7 @@ class FakeWorker:
         self.ff_calls = []               # (path, base_branch) every ff_worktree call
         self.contrib_projects = set()    # project names is_contrib() should report True for
         self.remote_head_shas = {}       # branch -> sha remote_head_sha returns; missing -> None
+        self.stopped_terminals = []      # workspaces stop_terminals was asked to stop (no rm)
         self._n = 0
 
     def read_base_branch(self, project):
@@ -143,6 +144,9 @@ class FakeWorker:
     def teardown(self, workspace):
         self.torn_down.append(workspace)
 
+    def stop_terminals(self, workspace):
+        self.stopped_terminals.append(workspace)
+
 
 class _DispatcherBase(unittest.TestCase):
     """Board+host fakes and helpers shared by the dispatcher test cases."""
@@ -159,7 +163,7 @@ class _DispatcherBase(unittest.TestCase):
                      "write_task", "launch_worker", "activity", "poll_pr", "notify", "teardown",
                      "read_stand_config", "pr_branch", "run_stand", "spawn_reviewer",
                      "workspace_exists", "workspace_path", "rename_terminal", "merge_pr",
-                     "list_agent_worktrees", "ff_worktree", "remote_head_sha"):
+                     "list_agent_worktrees", "ff_worktree", "remote_head_sha", "stop_terminals"):
             wp = mock.patch(f"triggered_agents.agents.pipeline.worker.{name}",
                             getattr(self.worker, name))
             wp.start()
@@ -908,6 +912,46 @@ class DispatcherTest(_DispatcherBase):
         src = Path(dispatcher.__file__).read_text()
         self.assertNotIn("kanboard", src)
         self.assertNotIn("from ..board", src)
+
+
+class LeftInProgressAnotherWayTest(_DispatcherBase):
+    """2026-07-04 review, triggered-agents-244 blocker B2: a card that leaves In progress by a
+    path other than the worker's own report (steward's escalation move, or a human) must not
+    leave its worker head running unsupervised on a card that is no longer its concern — but the
+    workspace itself stays on disk, same as every other Blocked path (no full teardown)."""
+
+    def test_stops_the_terminal_but_does_not_remove_the_workspace(self):
+        ref = self._claim_one("A")
+        ws = self.worker.launched[-1]["ws"]
+        ops.move_card("steward", ref, "Blocked")   # escalation happens outside a dispatcher tick
+        dispatcher.tick()
+        self.assertIn(ws, self.worker.stopped_terminals)
+        self.assertNotIn(ws, self.worker.torn_down)
+        self.assertTrue(any(r.get("event") == "advance"
+                            and r.get("result") == "left-in-progress-another-way"
+                            and r.get("reference") == ref for r in self._runs()))
+
+    def test_a_worker_self_report_blocked_is_unaffected(self):
+        """The pre-existing intentional-preservation path (worker's own report:blocked) must
+        still never call stop_terminals — it is a different branch entirely."""
+        ref = self._claim_one("A")
+        ws = self.worker.launched[-1]["ws"]
+        ops.report(ref, "blocked", "не смог собрать")
+        dispatcher.tick()
+        self.assertEqual(self._column(ref), "Blocked")
+        self.assertEqual(self.worker.stopped_terminals, [])
+        self.assertEqual(self.worker.torn_down, [])
+
+    def test_also_covers_a_card_that_left_validate(self):
+        ref = self._claim_one("A")
+        ops.report(ref, "done", "shipped")
+        dispatcher.tick()   # -> Validate, record kept
+        ws = self.worker.launched[-1]["ws"]
+        self.assertEqual(self._column(ref), "Validate")
+        ops.move_card("steward", ref, "Blocked")
+        dispatcher.tick()
+        self.assertIn(ws, self.worker.stopped_terminals)
+        self.assertNotIn(ws, self.worker.torn_down)
 
 
 class HeadHealthTest(_DispatcherBase):

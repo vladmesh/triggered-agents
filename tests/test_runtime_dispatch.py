@@ -122,5 +122,58 @@ class DispatchRunTest(_DispatchBase):
         self.assertEqual(len(create_calls), 1)
 
 
+class LaunchCmdTest(unittest.TestCase):
+    """_launch_cmd against the real automation.toml files on disk (no mocked spec) — curator has
+    no `head` field (bare claude), steward names claude-fable and must resolve it through
+    pipeline.health/heads, falling back to the bare invocation if that resolution blows up."""
+
+    def test_agent_without_head_field_gets_bare_claude(self):
+        skill, cmd = dispatch._launch_cmd("curator")
+        self.assertEqual(skill, "/curate")
+        self.assertEqual(cmd, "claude --dangerously-skip-permissions /curate")
+
+    def test_steward_head_resolves_through_pipeline_health_and_heads(self):
+        from triggered_agents.agents.pipeline import health as pipeline_health
+
+        with mock.patch.object(pipeline_health, "refresh", lambda: {"claude-sub": "green"}):
+            skill, cmd = dispatch._launch_cmd("steward")
+        self.assertEqual(skill, "/steward")
+        self.assertIn("BOARD_ROLE=steward", cmd)
+        self.assertIn("--model fable", cmd)
+
+    def test_steward_head_falls_back_to_bare_claude_on_broken_resolution(self):
+        from triggered_agents.agents.pipeline import health as pipeline_health
+
+        with mock.patch.object(pipeline_health, "refresh", side_effect=RuntimeError("boom")):
+            skill, cmd = dispatch._launch_cmd("steward")
+        self.assertEqual(skill, "/steward")
+        self.assertEqual(cmd, "claude --dangerously-skip-permissions /steward")
+
+    def test_steward_head_falls_back_to_next_profile_when_resource_red(self):
+        from triggered_agents.agents.pipeline import health as pipeline_health
+
+        # claude-fable's chain is claude-opus (same claude-sub resource) then hermes-flash (a
+        # different, openrouter resource) — see heads.toml, PR #38: the steward is the watcher of
+        # last resort and must wake even when the whole claude-sub resource is red. With claude-sub
+        # red and openrouter unmentioned (defaults green — heads.health.resolve_head), resolution
+        # walks past claude-opus (same red resource) onto hermes-flash.
+        with mock.patch.object(pipeline_health, "refresh", lambda: {"claude-sub": "red"}):
+            skill, cmd = dispatch._launch_cmd("steward")
+        self.assertIn("BOARD_ROLE=steward", cmd)
+        self.assertIn("hermes", cmd)
+        self.assertIn("google/gemini-2.5-flash", cmd)
+
+    def test_steward_head_keeps_original_name_when_the_whole_chain_is_red(self):
+        from triggered_agents.agents.pipeline import health as pipeline_health
+
+        # Every resource claude-fable's chain can reach (claude-sub, openrouter) is red -> nothing
+        # to fall back onto; _launch_cmd must keep the originally-named profile rather than
+        # silently downgrading to no model at all.
+        with mock.patch.object(pipeline_health, "refresh",
+                               lambda: {"claude-sub": "red", "openrouter": "red"}):
+            skill, cmd = dispatch._launch_cmd("steward")
+        self.assertIn("--model fable", cmd)
+
+
 if __name__ == "__main__":
     unittest.main()

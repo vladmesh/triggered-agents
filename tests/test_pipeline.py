@@ -185,14 +185,27 @@ class TestMatrix(unittest.TestCase):
             model.check_move("dispatcher", "Идеи", "Ready")
 
     def test_steward_gets_every_po_transition_plus_the_override(self):
+        steward_escalations = {
+            ("Идеи", "Blocked"), ("Ready", "Blocked"),
+            ("In progress", "Blocked"), ("Validate", "Blocked"),
+        }
         self.assertEqual(model.TRANSITIONS["steward"],
-                         model.TRANSITIONS["po"] | {model.STEWARD_OVERRIDE})
+                         model.TRANSITIONS["po"] | {model.STEWARD_OVERRIDE} | steward_escalations)
 
     def test_only_steward_may_move_blocked_to_done(self):
         model.check_move("steward", "Blocked", "Done")  # must not raise
         for role in ("po", "dispatcher", "worker", "reviewer"):
             with self.assertRaises(model.GuardError):
                 model.check_move(role, "Blocked", "Done")
+
+    def test_steward_may_escalate_any_active_card_straight_to_blocked(self):
+        for column in ("Идеи", "Ready", "In progress", "Validate"):
+            model.check_move("steward", column, "Blocked")  # must not raise
+        with self.assertRaises(model.GuardError):
+            model.check_move("steward", "Done", "Blocked")
+        for role in ("po", "worker", "reviewer"):
+            with self.assertRaises(model.GuardError):
+                model.check_move(role, "Ready", "Blocked")
 
     def test_unknown_role_and_column(self):
         with self.assertRaises(model.GuardError):
@@ -261,6 +274,32 @@ class TestCreate(PatchedBoardTest):
         with self.assertRaises(model.GuardError):
             ops.create_card("personal_site", "code", "T", head="codex-nope")
         self.assertEqual(board.tasks, {})
+
+    def test_steward_role_scrubs_title_and_description(self):
+        """2026-07-04 review, triggered-agents-244 blocker B1 (third round): SKILL.md sends
+        steward through exactly this path (create in Идеи/Ready, then escalate to Blocked) to
+        write up an anomaly it dug into via transcripts/journalctl/env — same reasoning as the
+        scrub already applied to steward's add_comment."""
+        board = self.make_board()
+        ops.create_card(
+            "triggered-agents", "code", "секрет API_TOKEN=supersecretvalue123 в заголовке",
+            description="тело: KANBOARD_SECRET=anothersecretvalue999", role="steward")
+        created = board.method_calls("createTask")
+        self.assertNotIn("supersecretvalue123", created[0]["title"])
+        self.assertNotIn("anothersecretvalue999", created[0]["description"])
+
+    def test_po_role_is_not_scrubbed(self):
+        board = self.make_board()
+        ops.create_card("personal_site", "code", "token KANBOARD_API_TOKEN=supersecretvalue123",
+                        role="po")
+        created = board.method_calls("createTask")
+        self.assertIn("supersecretvalue123", created[0]["title"])
+
+    def test_no_role_is_not_scrubbed_backward_compatible(self):
+        board = self.make_board()
+        ops.create_card("personal_site", "code", "token KANBOARD_API_TOKEN=supersecretvalue123")
+        created = board.method_calls("createTask")
+        self.assertIn("supersecretvalue123", created[0]["title"])
 
 
 class TestUpdate(PatchedBoardTest):
@@ -621,6 +660,33 @@ class TestStewardOverride(PatchedBoardTest):
         self.assertEqual(board.method_calls("createComment"), [])
 
 
+class TestAddComment(PatchedBoardTest):
+    """2026-07-04 review, triggered-agents-244 remark Z1: steward reads more raw system surface
+    than any other role (transcripts, journalctl, env files) and could quote a secret by
+    accident — its comments get the same scrub_secrets backstop as the reviewer's verdict."""
+
+    def test_steward_comment_is_scrubbed(self):
+        board = self.make_board()
+        ref = board.add_task("A", "Blocked")
+        ops.add_comment("steward", ref, "нашёл в логе KANBOARD_API_TOKEN=supersecretvalue123")
+        posted = board.method_calls("createComment")
+        self.assertNotIn("supersecretvalue123", posted[0]["content"])
+
+    def test_other_roles_are_not_scrubbed(self):
+        board = self.make_board()
+        ref = board.add_task("A", "Blocked")
+        ops.add_comment("dispatcher", ref, "token KANBOARD_API_TOKEN=supersecretvalue123")
+        posted = board.method_calls("createComment")
+        self.assertIn("supersecretvalue123", posted[0]["content"])
+
+    def test_ordinary_steward_comment_text_survives_unchanged(self):
+        board = self.make_board()
+        ref = board.add_task("A", "Blocked")
+        ops.add_comment("steward", ref, "разобрался, ложное срабатывание")
+        posted = board.method_calls("createComment")
+        self.assertEqual(posted[0]["content"], "[steward]\nразобрался, ложное срабатывание")
+
+
 class TestReport(PatchedBoardTest):
     def test_blocked_without_body_raises(self):
         board = self.make_board()
@@ -740,6 +806,17 @@ class TestCliStewardRole(PatchedBoardTest):
                             "--type", "code", "--title", "T"])
         self.assertEqual(rc, 0)
         self.assertEqual(len(board.tasks), 1)
+
+    def test_steward_create_via_cli_is_scrubbed(self):
+        board = self.make_board()
+        rc = self.cli.main(["--role", "steward", "create", "--project", "triggered-agents",
+                            "--type", "code",
+                            "--title", "нашёл KANBOARD_API_TOKEN=supersecretvalue123",
+                            "--description", "AWS_SECRET=anothersecretvalue999"])
+        self.assertEqual(rc, 0)
+        created = board.method_calls("createTask")
+        self.assertNotIn("supersecretvalue123", created[0]["title"])
+        self.assertNotIn("anothersecretvalue999", created[0]["description"])
 
     def test_steward_move_blocked_to_done_with_reason_ok(self):
         board = self.make_board()

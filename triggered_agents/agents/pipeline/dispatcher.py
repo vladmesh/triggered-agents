@@ -322,7 +322,19 @@ def _advance(records: dict, statuses: dict[str, str]) -> bool:
             worker.rename_terminal(rec.get("handle", ""), rec.get("title", ""))
             continue                      # validate.run owns Validate cards
         if card["column"] != model.IN_PROGRESS:
-            # Left In progress by another path (human move, blocked-report already applied) — drop.
+            # Left In progress by another path — a worker's own report:blocked is handled by the
+            # elif below and never reaches here (still IN_PROGRESS in this tick's own by_ref
+            # snapshot when that branch runs). What DOES land here is an external move while the
+            # worker head never got a chance to react: a human's manual move, or steward's own
+            # escalation (model.TRANSITIONS["steward"]'s In progress/Validate -> Blocked escape
+            # hatch, 2026-07-04 review triggered-agents-244 blocker B2) pulling a wedged card out
+            # from under a still-running worker. Stop just the terminal (worker.stop_terminals,
+            # not the full worker.teardown) so that head cannot keep working/spending on a card
+            # that is no longer its concern — the workspace itself is deliberately left alive, same
+            # as every other Blocked path, for a human (or steward) to inspect.
+            _stop_terminal_best_effort(ref, rec.get("workspace"))
+            STATE.log_run("advance", reference=ref, result="left-in-progress-another-way",
+                          to=card["column"])
             records.pop(ref)
             changed = True
             continue
@@ -376,6 +388,21 @@ def _teardown_best_effort(ref: str, ws: str | None) -> None:
         worker.teardown(ws)
     except Exception as e:  # noqa: BLE001 — see docstring
         STATE.log_run("advance", reference=ref, result="teardown-failed", level="warn",
+                      error=worker.scrub_secrets(str(e)))
+
+
+def _stop_terminal_best_effort(ref: str, ws: str | None) -> None:
+    """worker.stop_terminals only — unlike _teardown_best_effort, never removes the workspace
+    directory. Used when a card leaves In progress by a path other than the worker's own report
+    (see the "left another way" branch in _advance): the worker's Claude head may still be
+    running against a card that is no longer its concern, but the workspace itself must stay on
+    disk for a human (or steward) to inspect, same as every other Blocked-path teardown skip."""
+    if not ws:
+        return
+    try:
+        worker.stop_terminals(ws)
+    except Exception as e:  # noqa: BLE001 — best-effort, same rationale as _teardown_best_effort
+        STATE.log_run("advance", reference=ref, result="stop-terminal-failed", level="warn",
                       error=worker.scrub_secrets(str(e)))
 
 

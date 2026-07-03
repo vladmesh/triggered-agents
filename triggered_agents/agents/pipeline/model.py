@@ -16,6 +16,14 @@ replacement for a human editing the board's raw Kanboard API to force a card pas
 what happened on agent-kanban-232/235 and triggered-agents-230. The override still needs a paper
 trail, so ops.move_card requires a non-empty justification comment in the same call before it will
 run it; every other role stays exactly as guarded as before.
+
+steward can also move any active card straight to Blocked (2026-07-04 design grill, memory:
+"стюард присмотр пайплайн дизайн") — the one escalation path its whole mandate rests on ("не
+решается своими силами -> Blocked с разбором и жди человека", no numeric caps). This is a manual
+break-glass action a human would otherwise have to do by hand through the Kanboard UI when the
+dispatcher itself is the thing that broke (a claimed In-progress/Validate card's watchdog never
+fires if the tick that would run it is dead) — the dispatcher's own In progress/Validate -> Blocked
+stays automatic and unaffected; this is steward reaching in from outside that loop.
 """
 from __future__ import annotations
 
@@ -80,7 +88,14 @@ TRANSITIONS: dict[str, set[tuple[str, str]]] = {
     # the raw-API Blocked->Done edits seen on agent-kanban-232/235 and triggered-agents-230. That
     # override is only safe with a paper trail, so check_move alone does not gate it — ops.move_card
     # additionally requires a non-empty justification comment in the same call (see STEWARD_OVERRIDE).
-    "steward": {("Идеи", "Ready"), ("Blocked", "Ready"), ("Blocked", "Done")},
+    # Plus escalation to Blocked from every active column (its "give up, wait for a human" escape
+    # hatch — see module docstring) — Done is deliberately absent as a source, there is nothing
+    # left to escalate on a finished card.
+    "steward": {
+        ("Идеи", "Ready"), ("Blocked", "Ready"), ("Blocked", "Done"),
+        ("Идеи", "Blocked"), ("Ready", "Blocked"),
+        ("In progress", "Blocked"), ("Validate", "Blocked"),
+    },
 }
 
 # The one transition in TRANSITIONS that needs more than a role/column check: a non-empty
