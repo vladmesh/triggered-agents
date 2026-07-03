@@ -1,4 +1,5 @@
-"""Harvest — turn new session lines into a redacted transcript batch for the curator agent.
+"""Harvest — turn new session lines and personal-memory files into a redacted batch for the
+curator agent.
 
 Two-phase by design: `harvest(st)` reads everything new since the watermark and returns a
 batch WITHOUT advancing the watermark. The agent extracts facts and commits the canon,
@@ -8,6 +9,11 @@ the same turns next run (at worst a duplicate the agent dedups), never a silent 
 Signal only: user text + assistant text blocks. Dropped as noise — thinking blocks,
 tool_use/tool_result payloads, meta/sidechain lines, and local-command wrappers (the
 `<local-command-*>` and `<command-*>` scaffolding Claude Code injects, not real turns).
+
+Personal-memory files are a second, independent source: whole-file reads instead of line
+turns, watermarked by (mtime, size) instead of a line count, but sharing the same watermark
+dict and the same two-phase harvest/advance handshake. The curator never edits or deletes
+these files — read-only in, canon out.
 """
 from __future__ import annotations
 
@@ -57,11 +63,35 @@ def parse_claude_lines(lines) -> list[dict]:
     return turns
 
 
-def harvest(st) -> dict:
-    """Read all new turns since the watermark. Does NOT advance the watermark.
+def harvest_memory_files(mark: dict) -> tuple[list[dict], dict]:
+    """Read new/changed personal-memory files since the watermark.
 
-    Returns {"sessions": [...], "pending": {source_path: line_count}} where pending is
-    the watermark to persist via advance() after the canon commit.
+    Watermarked by (mtime, size) per path — files are read whole, there is no line
+    count to resume from. Returns (entries, pending) with the same pending-dict shape
+    `advance()` already merges for sessions.
+    """
+    entries, pending = [], {}
+    for mem in discover.all_memory_files():
+        path = Path(mem["path"])
+        try:
+            stat = path.stat()
+        except FileNotFoundError:
+            continue
+        prev = mark.get(mem["path"], {})
+        if prev.get("mtime") == stat.st_mtime and prev.get("size") == stat.st_size:
+            continue  # unchanged since last run
+        pending[mem["path"]] = {"mtime": stat.st_mtime, "size": stat.st_size}
+        text = path.read_text(encoding="utf-8", errors="replace")
+        entries.append({**mem, "text": redact(text)})
+    return entries, pending
+
+
+def harvest(st) -> dict:
+    """Read all new turns and changed memory files since the watermark. Does NOT advance
+    the watermark.
+
+    Returns {"sessions": [...], "memory": [...], "pending": {source_path: watermark}}
+    where pending is the combined watermark to persist via advance() after the canon commit.
     """
     mark = st.load_watermark()
     sessions_out, pending = [], {}
@@ -85,7 +115,9 @@ def harvest(st) -> dict:
             t["text"] = redact(t["text"])
         if turns:
             sessions_out.append({**sess, "turns": turns})
-    return {"sessions": sessions_out, "pending": pending}
+    memory_out, mem_pending = harvest_memory_files(mark)
+    pending.update(mem_pending)
+    return {"sessions": sessions_out, "memory": memory_out, "pending": pending}
 
 
 def advance(st, pending: dict) -> None:
@@ -96,11 +128,14 @@ def advance(st, pending: dict) -> None:
 
 
 def render_markdown(batch: dict) -> str:
-    """Human/agent-readable transcript batch. Secrets already redacted."""
-    if not batch["sessions"]:
+    """Human/agent-readable batch of transcripts and personal-memory files. Secrets already
+    redacted."""
+    sessions = batch["sessions"]
+    memory = batch.get("memory", [])
+    if not sessions and not memory:
         return "# Нет новых ходов с прошлого прогона.\n"
     lines = ["# Батч транскриптов для куратора", ""]
-    for sess in batch["sessions"]:
+    for sess in sessions:
         lines.append(f"## {sess['head']} · `{sess['cwd']}` · session {sess['session_id'][:8]}")
         lines.append("")
         for t in sess["turns"]:
@@ -108,5 +143,13 @@ def render_markdown(batch: dict) -> str:
             ts = f" _{t['ts']}_" if t.get("ts") else ""
             lines.append(f"{who}{ts}:")
             lines.append(t["text"])
+            lines.append("")
+    if memory:
+        lines.append("# Личная память голов (новое/изменённое)")
+        lines.append("")
+        for m in memory:
+            lines.append(f"## {m['head']} · `{m['cwd']}` · `{Path(m['path']).name}`")
+            lines.append("")
+            lines.append(m["text"])
             lines.append("")
     return "\n".join(lines)

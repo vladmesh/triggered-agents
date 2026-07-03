@@ -1,8 +1,9 @@
 """curator agent — deterministic helpers the curator skill drives via Bash.
 
 Flow the agent follows each run:
-  1. `python3 -m triggered_agents curator harvest`  -> redacted transcript batch (markdown)
-                                     on stdout, and the pending watermark cached on disk.
+  1. `python3 -m triggered_agents curator harvest`  -> redacted batch (markdown) of new
+                                     session turns and changed personal-memory files on
+                                     stdout, and the pending watermark cached on disk.
   2. agent extracts durable facts, dedups via panelmem memory_search, writes .md to
      panelmem-kb, commits+pushes the canon.
   3. `python3 -m triggered_agents curator advance`  -> moves the watermark past step 1.
@@ -50,9 +51,10 @@ def cmd_advance() -> int:
 
 
 def cmd_precheck() -> int:
-    """Exit 0 if there are new turns to curate, non-zero if nothing new (skip the run)."""
+    """Exit 0 if there are new turns or memory files to curate, non-zero if nothing new
+    (skip the run)."""
     batch = harvest.harvest(STATE)
-    if batch["sessions"]:
+    if batch["sessions"] or batch["memory"]:
         STATE.log_run("precheck", result="change")
         return 0
     STATE.log_run("precheck", result="no-change")
@@ -70,7 +72,10 @@ def cmd_status() -> int:
     mark = STATE.load_watermark()
     print(f"watermark: {len(mark)} source(s) tracked; state={STATE.dir}")
     for src, v in mark.items():
-        print(f"  {v.get('lines', 0):>6} lines  {Path(src).name}")
+        if "lines" in v:
+            print(f"  {v['lines']:>6} lines  {Path(src).name}")
+        else:
+            print(f"  {v.get('size', 0):>6} bytes  {Path(src).name}")
     return 0
 
 
