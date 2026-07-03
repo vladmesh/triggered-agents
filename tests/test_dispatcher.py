@@ -1419,6 +1419,41 @@ class ValidateTest(_DispatcherBase):
         self.assertEqual(self._column(ref), model.IN_PROGRESS)
         self.assertNotIn("ci_pending_since", dispatcher._load_cards()[ref])
 
+    def test_ci_success_resets_the_pending_clock(self):
+        # Regression: SUCCESS is a terminal rollup too (symmetric to FAILURE above). A card that
+        # sat on PENDING for a while, then went green, must not carry that stale clock into a LATER
+        # PENDING spell (a post-report push, or a human re-running the workflow) — that would burn
+        # the fresh restart's own budget with old, already-green elapsed time.
+        ref = self._to_validate()
+        self.worker.pr_status = {"merged": False, "state": "OPEN", "rollup": "PENDING",
+                                 "failed_job": None, "failed_log": None}
+        dispatcher.tick()
+        self.assertIn("ci_pending_since", dispatcher._load_cards()[ref])
+        self.worker.pr_status = {"merged": False, "state": "OPEN", "rollup": "SUCCESS",
+                                 "failed_job": None, "failed_log": None}
+        dispatcher.tick()
+        self.assertEqual(self._column(ref), "Validate")
+        self.assertNotIn("ci_pending_since", dispatcher._load_cards()[ref])
+
+    def test_escalation_tears_down_a_review_already_in_flight(self):
+        # Regression: SUCCESS spawns the layer-3 reviewer; if CI then drops back to PENDING (a
+        # post-report push, or a re-run of the workflow) and the pending watchdog later escalates,
+        # the reviewer's throwaway worktree must be torn down same as _validate_stall does — not
+        # leaked because the escalation only knew about the worker's own workspace.
+        ref = self._to_validate()
+        self.worker.pr_status = {"merged": False, "state": "OPEN", "rollup": "SUCCESS",
+                                 "failed_job": None, "failed_log": None}
+        dispatcher.tick()                                        # spawns the reviewer
+        self.assertEqual(len(self.worker.reviewer_spawns), 1)
+        self.assertIn("review_ws", dispatcher._load_cards()[ref])
+        self.worker.pr_status = {"merged": False, "state": "OPEN", "rollup": "PENDING",
+                                 "failed_job": None, "failed_log": None}
+        dispatcher.tick()                                        # starts a fresh pending clock
+        validate.CI_PENDING_STALL_SECONDS = -1
+        dispatcher.tick()                                        # escalates -> must clear_review
+        self.assertEqual(self._column(ref), "Blocked")
+        self.assertTrue(any(w.startswith("/rev/") for w in self.worker.torn_down))
+
 
 class ValidateStandTest(_DispatcherBase):
     """Validate layer 2: for a project with a [stand] manifest section, CI green is not enough —

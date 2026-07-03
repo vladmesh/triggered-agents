@@ -273,6 +273,13 @@ def _validate_card(card: dict, records: dict, watchdog_seconds: int, save_cards)
         STATE.log_run("validate", reference=ref, to=model.IN_PROGRESS, reason="ci-red", job=job, pr=pr)
         return True
     if status["rollup"] == "SUCCESS":
+        # SUCCESS is a terminal rollup too (symmetric to the FAILURE reset above): a card that sat
+        # on PENDING for a while before going green must not carry that stale clock into a LATER
+        # PENDING spell (the worker keeps pushing after report:done, or a human re-runs the
+        # workflow) — that would consume the fresh restart's own budget with old, already-green
+        # elapsed time and trip the watchdog on a CI run that only just started.
+        if rec is not None:
+            rec.pop("ci_pending_since", None)
         # Marker checks are scoped to the card's report baseline (reset on every re-entry to
         # Validate) so a rework re-runs each lower layer instead of skipping it on a stale note.
         baseline = int(rec.get("comment_baseline", 0)) if rec is not None else 0
@@ -403,6 +410,10 @@ def _ci_pending_watchdog(ref: str, rec: dict | None, records: dict, pr: str, rol
     if stalled <= CI_PENDING_STALL_SECONDS:
         return False
     ws = rec.get("workspace") or "(неизвестен)"
+    # A reviewer may already be up (SUCCESS spawned layer 3, then a later push/re-run sent CI back
+    # to PENDING) — tear its throwaway worktree down same as _validate_stall does, so the
+    # escalation never leaks it.
+    clear_review(rec)
     ops.add_comment(
         "dispatcher", ref,
         f"CI по {pr} висит в статусе {rollup} {int(stalled)}s (порог {CI_PENDING_STALL_SECONDS}s) "
