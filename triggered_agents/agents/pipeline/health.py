@@ -39,6 +39,11 @@ HEALTH_FILE = STATE.dir / "resource_health.json"
 # than hanging a tick. Both env-overridable so an e2e/live check can tighten them.
 PROBE_TTL_S = int(os.environ.get("TA_PROBE_TTL_S", "300"))
 PROBE_TIMEOUT_S = int(os.environ.get("TA_PROBE_TIMEOUT_S", "20"))
+# Comma-separated resource ids to report red without running their real probe at all — a live e2e
+# proving the retry-switch/fallback machinery lands on a genuinely different runtime (e.g.
+# hermes-flash) needs to redden claude-sub on demand, without actually touching the shared
+# subscription. Bypasses the TTL cache too, so flipping it takes effect on the very next refresh().
+_FORCE_RED_ENV = "TA_HEALTH_FORCE_RED"
 
 GREEN = "green"
 RED = "red"
@@ -60,6 +65,10 @@ def _save(cache: dict) -> None:
     tmp.replace(HEALTH_FILE)
 
 
+def _forced_red() -> set[str]:
+    return {r for r in os.environ.get(_FORCE_RED_ENV, "").split(",") if r}
+
+
 def _run_probe_cmd(cmd: str) -> bool:
     """True (green) iff `cmd` exits 0 within PROBE_TIMEOUT_S. A timeout, a missing binary, or any
     other OSError all count as red — a probe that can't even run proves nothing about the
@@ -76,18 +85,20 @@ def refresh(registry: heads_mod.Registry | None = None) -> dict[str, str]:
     {resource_id: GREEN/RED} for every resource in the registry (cached entries included). Logs
     one `head-health` runs.jsonl event per resource whose status actually flipped since its last
     cached value — never on a fresh-cache reuse, never on a re-probe that confirms the same
-    status."""
+    status. A resource named in TA_HEALTH_FORCE_RED is always RED here, real probe skipped
+    entirely, TTL cache bypassed — see _FORCE_RED_ENV."""
     reg = registry or heads_mod.load_registry()
     cache = _load()
     now = time.time()
     dirty = False
     statuses: dict[str, str] = {}
+    forced = _forced_red()
     for rid, res in reg.resources.items():
         entry = cache.get(rid)
-        if entry and now - entry.get("checked_at", 0) < PROBE_TTL_S:
+        if rid not in forced and entry and now - entry.get("checked_at", 0) < PROBE_TTL_S:
             statuses[rid] = entry["status"]
             continue
-        new_status = GREEN if _run_probe_cmd(res.get("probe", "true")) else RED
+        new_status = RED if rid in forced else (GREEN if _run_probe_cmd(res.get("probe", "true")) else RED)
         old_status = entry["status"] if entry else None
         cache[rid] = {"status": new_status, "checked_at": now}
         dirty = True
@@ -132,6 +143,46 @@ def resolve_head(preferred: str, statuses: dict[str, str],
             return pid
         queue.extend(prof.get("fallback") or [])
     return None
+
+
+def next_retry_head(current: str, tried: set[str], statuses: dict[str, str],
+                    registry: heads_mod.Registry | None = None) -> tuple[str | None, bool]:
+    """The next profile for a watchdog retry-switch to land `current` on: breadth-first over
+    `current`'s own fallback chain (same walk as resolve_head), skipping anything already in
+    `tried` (every head this card's watchdog has already used this life, `current` included) and
+    any red resource. Returns (head, False) on a hit.
+
+    A miss carries a second flag distinguishing why, so dispatcher._watchdog_retry can tell "spend
+    the switch budget's one shot on nothing" from "there's a real target, just not up right now":
+      (None, True)  nothing untried left to try at all (empty/exhausted chain, or `current` itself
+                    unknown to the registry) — stop retrying, nothing here will ever turn green.
+      (None, False) untried candidates exist but every one sits on a red resource right now —
+                    requeue without spending the budget; the next claim's own red-skip
+                    (_claim_next/resolve_head) picks the card up once a resource recovers."""
+    reg = registry or heads_mod.load_registry()
+    try:
+        queue = list(reg.profile(current).get("fallback") or [])
+    except heads_mod.HeadRegistryError:
+        return None, True
+    visited = {current}   # cycle guard only — a tried-but-not-visited node's OWN fallback is still
+                          # worth walking, it may lead to something genuinely untried further out
+    found_untried = False
+    while queue:
+        pid = queue.pop(0)
+        if pid in visited:
+            continue
+        visited.add(pid)
+        try:
+            prof = reg.profile(pid)
+        except heads_mod.HeadRegistryError:
+            continue
+        queue.extend(prof.get("fallback") or [])
+        if pid in tried:
+            continue
+        found_untried = True
+        if statuses.get(prof["resource"], GREEN) == GREEN:
+            return pid, False
+    return None, not found_untried
 
 
 # Real, cheap probes for the two resources this repo actually names in heads.toml. Deliberately

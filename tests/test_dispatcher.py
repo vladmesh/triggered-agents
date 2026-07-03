@@ -413,16 +413,216 @@ class DispatcherTest(_DispatcherBase):
         dispatcher.tick()  # advance: no NEW report -> stays In progress
         self.assertEqual(self._column(ref), model.IN_PROGRESS)
 
-    def test_watchdog_blocks_but_keeps_workspace(self):
+    def test_watchdog_retries_same_head_first(self):
+        # A single watchdog timeout with a live budget: teardown, Ready, reclaimed same tick
+        # (FakeWorker never fails a claim) — In progress again, not Blocked, workspace torn down.
         ref = self._claim_one()
+        first_ws = dispatcher._load_cards()[ref]["workspace"]
         dispatcher.WATCHDOG_SECONDS = -1        # any silence counts as over-threshold
         self.worker.activity_ts = None          # no fresh output
         dispatcher.tick()
-        self.assertEqual(self._column(ref), "Blocked")
-        self.assertEqual(self.worker.torn_down, [])   # workspace left alive
+        self.assertEqual(self._column(ref), model.IN_PROGRESS)
+        self.assertIn(first_ws, self.worker.torn_down)
+        self.assertEqual(ops.show_card(ref)["metadata"][model.META_RETRY_SAME], "1")
+        self.assertEqual(ops.show_card(ref)["metadata"][model.META_RETRY_SWITCH], "0")
         posted = " ".join(c["comment"] for cl in self.board.comments.values() for c in cl)
         self.assertIn("watchdog", posted)
-        self.assertTrue(any(r.get("reason") == "watchdog" for r in self._runs()))
+        self.assertIn(f"[{model.MARKER_WATCHDOG_RETRY}]", posted)
+        self.assertTrue(any(r.get("reason") == "watchdog-retry-same" for r in self._runs()))
+        # the claim guard was actually re-run (new worker id/claim), not a bare metadata edit
+        self.assertGreaterEqual(len(self.worker.launched), 2)
+
+    def test_watchdog_teardown_failure_does_not_crash_the_tick(self):
+        # _advance has no per-card try/except (unlike validate.run) — a host-side teardown error
+        # on one card's dead workspace must not stop every OTHER In-progress card from advancing
+        # in the same tick, and must not prevent the retry requeue itself either.
+        ref_broken = self._claim_one("A")
+        ref_other = self._claim_one("B", project="other")
+        # ref_other's budget is already exhausted (as if this were its third timeout), so its own
+        # watchdog goes straight to Blocked this tick regardless of what happens to ref_broken.
+        ops.set_retry_state(ref_other, retry_same=1, retry_switch=1, retry_heads="claude-sonnet")
+
+        with mock.patch("triggered_agents.agents.pipeline.worker.teardown",
+                        side_effect=RuntimeError("orca daemon wedged")):
+            dispatcher.WATCHDOG_SECONDS = -1
+            self.worker.activity_ts = None
+            dispatcher.tick()   # must not raise
+        self.assertEqual(self._column(ref_broken), model.IN_PROGRESS)   # retry still happened
+        self.assertEqual(ops.show_card(ref_broken)["metadata"][model.META_RETRY_SAME], "1")
+        self.assertEqual(self._column(ref_other), "Blocked")   # the other card's own watchdog still ran
+        self.assertTrue(any(r.get("event") == "advance" and r.get("result") == "teardown-failed"
+                            for r in self._runs()))
+
+    def test_watchdog_full_cycle_same_then_switch_then_blocked(self):
+        reg = heads.Registry(
+            resources={"res-a": {"probe": "true"}, "res-b": {"probe": "true"}},
+            profiles={
+                "primary": {"resource": "res-a", "adapter": "claude", "fallback": ["secondary"]},
+                "secondary": {"resource": "res-b", "adapter": "claude", "fallback": []},
+            },
+        )
+        with mock.patch.object(heads, "load_registry", return_value=reg):
+            ref = self._claim_one(head="primary")
+            dispatcher.WATCHDOG_SECONDS = -1
+            self.worker.activity_ts = None
+            dispatcher.tick()   # same-head retry: primary -> primary again
+            self.assertEqual(self._column(ref), model.IN_PROGRESS)
+            self.assertEqual(self.worker.launched[-1]["head"], "primary")
+            self.assertEqual(ops.show_card(ref)["metadata"][model.META_RETRY_SAME], "1")
+
+            dispatcher.tick()   # same-head budget spent -> switch: primary -> secondary
+            self.assertEqual(self._column(ref), model.IN_PROGRESS)
+            self.assertEqual(self.worker.launched[-1]["head"], "secondary")
+            meta = ops.show_card(ref)["metadata"]
+            self.assertEqual(meta[model.META_RETRY_SWITCH], "1")
+            self.assertEqual(meta[model.META_HEAD], "secondary")
+            self.assertEqual(meta[model.META_RETRY_HEADS], "primary,secondary")
+
+            dispatcher.tick()   # both budgets spent -> terminal Blocked, workspace kept for a human
+            self.assertEqual(self._column(ref), "Blocked")
+            # exactly the first two bring-ups were torn down (same-head retry, then switch retry);
+            # the third (the one left In progress -> Blocked) is kept alive for a human to inspect.
+            self.assertEqual(len(self.worker.torn_down), 2)
+        posted = " ".join(c["comment"] for cl in self.board.comments.values() for c in cl)
+        self.assertIn("бюджет авторетраев исчерпан", posted)
+        self.assertIn("primary, secondary", posted)
+        self.assertTrue(any(r.get("reason") == "watchdog" and r.get("reference") == ref
+                            for r in self._runs()))
+
+    def test_watchdog_switch_waits_without_burning_budget_when_chain_is_red(self):
+        # Same-head retry already spent; the one switch candidate is red right now. The card must
+        # keep cycling for free (teardown -> Ready -> reclaim on the still-green primary) rather
+        # than either burning the switch budget or going Blocked.
+        reg = heads.Registry(
+            resources={"res-a": {"probe": "true"}, "res-b": {"probe": "true"}},
+            profiles={
+                "primary": {"resource": "res-a", "adapter": "claude", "fallback": ["secondary"]},
+                "secondary": {"resource": "res-b", "adapter": "claude", "fallback": []},
+            },
+        )
+        self.statuses = {"res-a": "green", "res-b": "red"}
+        with mock.patch.object(heads, "load_registry", return_value=reg):
+            ref = self._claim_one(head="primary")
+            dispatcher.WATCHDOG_SECONDS = -1
+            self.worker.activity_ts = None
+            dispatcher.tick()   # same-head retry
+            self.assertEqual(ops.show_card(ref)["metadata"][model.META_RETRY_SAME], "1")
+
+            dispatcher.tick()   # switch candidate (secondary) is red -> wait, no budget spent
+            self.assertEqual(self._column(ref), model.IN_PROGRESS)  # reclaimed on primary again
+            self.assertEqual(self.worker.launched[-1]["head"], "primary")
+            meta = ops.show_card(ref)["metadata"]
+            self.assertEqual(meta[model.META_RETRY_SWITCH], "0")
+            self.assertEqual(meta[model.META_HEAD], "primary")
+
+            dispatcher.tick()   # still red -> still waiting, still not Blocked, still no budget burn
+            self.assertEqual(self._column(ref), model.IN_PROGRESS)
+            self.assertEqual(ops.show_card(ref)["metadata"][model.META_RETRY_SWITCH], "0")
+
+            self.statuses["res-b"] = "green"    # resource recovers
+            dispatcher.tick()   # now the switch actually happens
+            self.assertEqual(self.worker.launched[-1]["head"], "secondary")
+            self.assertEqual(ops.show_card(ref)["metadata"][model.META_RETRY_SWITCH], "1")
+
+    def test_watchdog_switch_goes_straight_to_blocked_when_chain_has_no_candidate_at_all(self):
+        # claude-opus (real registry) has no fallback at all: once the same-head retry is spent,
+        # there is nothing to wait for, so the switch step must not stall forever — straight to
+        # Blocked instead of an infinite free-retry loop.
+        ref = self._claim_one(head="claude-opus")
+        dispatcher.WATCHDOG_SECONDS = -1
+        self.worker.activity_ts = None
+        dispatcher.tick()   # same-head retry
+        self.assertEqual(self._column(ref), model.IN_PROGRESS)
+        dispatcher.tick()   # no fallback at all for claude-opus -> terminal Blocked
+        self.assertEqual(self._column(ref), "Blocked")
+        self.assertEqual(ops.show_card(ref)["metadata"][model.META_RETRY_SWITCH], "0")
+
+    def test_retry_counters_survive_local_state_wipe(self):
+        # A dispatcher redeploy only ever replaces the local cards.json — retry_same/retry_switch/
+        # retry_heads live on the board (model.META_RETRY_*), so a card already one retry deep is
+        # not treated as brand new after cards.json is lost and the card is re-adopted.
+        reg = heads.Registry(
+            resources={"res-a": {"probe": "true"}, "res-b": {"probe": "true"}},
+            profiles={
+                "primary": {"resource": "res-a", "adapter": "claude", "fallback": ["secondary"]},
+                "secondary": {"resource": "res-b", "adapter": "claude", "fallback": []},
+            },
+        )
+        with mock.patch.object(heads, "load_registry", return_value=reg):
+            ref = self._claim_one(head="primary")
+            dispatcher.WATCHDOG_SECONDS = -1
+            self.worker.activity_ts = None
+            dispatcher.tick()   # same-head retry: retry_same -> 1 on the board
+            self.assertEqual(ops.show_card(ref)["metadata"][model.META_RETRY_SAME], "1")
+
+            dispatcher._save_cards({})   # simulate the redeploy: local records gone
+            self.assertEqual(dispatcher._load_cards(), {})
+            self.worker.activity_ts = None
+            # One tick both reconciles (fresh, head-less record) and fires the watchdog on it
+            # (WATCHDOG_SECONDS=-1: any elapsed time trips it) — must read retry_same=1 off the
+            # board, not a fresh 0, and go straight to switch instead of granting another same-head
+            # retry the local state no longer remembers was already spent.
+            dispatcher.tick()
+        self.assertEqual(self.worker.launched[-1]["head"], "secondary")
+        self.assertEqual(ops.show_card(ref)["metadata"][model.META_RETRY_SWITCH], "1")
+
+    def test_env_technical_smoke_fail_is_never_retried(self):
+        # Provision/smoke failure is env-technical, not head-technical: still a straight Blocked,
+        # no retry budget, no retry_* metadata touched — the watchdog retry cycle must not blur
+        # this line.
+        self.worker.provision_ok = False
+        self.worker.provision_log = "[provision] FAIL: smoke command failed (exit 1)\n"
+        ref = self._ready_card("A")
+        dispatcher.tick()
+        self.assertEqual(self._column(ref), "Blocked")
+        meta = ops.show_card(ref)["metadata"]
+        self.assertFalse(meta.get(model.META_RETRY_SAME))
+        self.assertFalse(meta.get(model.META_RETRY_SWITCH))
+
+    def test_semantic_report_blocked_is_never_retried(self):
+        # A worker's own [report:blocked] is semantic, not head-technical: straight to Blocked,
+        # no watchdog retry involved at all.
+        ref = self._claim_one()
+        ops.report(ref, "blocked", "spec disagreement")
+        dispatcher.tick()
+        self.assertEqual(self._column(ref), "Blocked")
+        meta = ops.show_card(ref)["metadata"]
+        self.assertFalse(meta.get(model.META_RETRY_SAME))
+        self.assertFalse(meta.get(model.META_RETRY_SWITCH))
+
+    def test_human_recovery_from_blocked_resets_retry_budget(self):
+        # po moving a Blocked card back to Ready is a fresh start: the retry budget already spent
+        # in a prior life must not carry over and short-circuit the next watchdog cycle.
+        reg = heads.Registry(
+            resources={"res-a": {"probe": "true"}, "res-b": {"probe": "true"}},
+            profiles={
+                "primary": {"resource": "res-a", "adapter": "claude", "fallback": ["secondary"]},
+                "secondary": {"resource": "res-b", "adapter": "claude", "fallback": []},
+            },
+        )
+        with mock.patch.object(heads, "load_registry", return_value=reg):
+            ref = self._claim_one(head="primary")
+            dispatcher.WATCHDOG_SECONDS = -1
+            self.worker.activity_ts = None
+            dispatcher.tick()   # same-head retry -> retry_same=1
+            self.assertEqual(ops.show_card(ref)["metadata"][model.META_RETRY_SAME], "1")
+            dispatcher.tick()   # switch -> retry_switch=1
+            self.assertEqual(ops.show_card(ref)["metadata"][model.META_RETRY_SWITCH], "1")
+            dispatcher.tick()   # budgets spent -> terminal Blocked
+            self.assertEqual(self._column(ref), "Blocked")
+
+            ops.move_card("po", ref, "Ready")
+            meta = ops.show_card(ref)["metadata"]
+            self.assertFalse(meta.get(model.META_RETRY_SAME))
+            self.assertFalse(meta.get(model.META_RETRY_SWITCH))
+            self.assertFalse(meta.get(model.META_CLAIM))
+
+            self.worker.activity_ts = None
+            dispatcher.tick()   # re-claims; a fresh watchdog cycle gets the full budget again
+            self.assertEqual(self._column(ref), model.IN_PROGRESS)
+            dispatcher.tick()
+            self.assertEqual(self._column(ref), model.IN_PROGRESS)   # same-head retry, not Blocked
+            self.assertEqual(ops.show_card(ref)["metadata"][model.META_RETRY_SAME], "1")
 
     def test_watchdog_holds_when_worker_active(self):
         import time
@@ -470,9 +670,10 @@ class DispatcherTest(_DispatcherBase):
         ops.claim_card(ref, "w-crash")
         dispatcher.tick()  # adopt
         dispatcher.WATCHDOG_SECONDS = -1
-        dispatcher.tick()
-        self.assertEqual(self._column(ref), "Blocked")
-        self.assertEqual(self.worker.torn_down, [])
+        dispatcher.tick()  # live budget -> same-head retry, not a terminal Blocked
+        self.assertEqual(self._column(ref), model.IN_PROGRESS)
+        self.assertIn("/ws/w-crash", self.worker.torn_down)
+        self.assertEqual(ops.show_card(ref)["metadata"][model.META_RETRY_SAME], "1")
 
     def test_reconcile_restores_workspace_from_claim(self):
         # The claim IS the card's workspace base name (naming._worker_id) — reconcile must rebuild
@@ -798,9 +999,12 @@ class HeadHealthTest(_DispatcherBase):
         dispatcher.tick()
         self.assertEqual(self._column(ref), model.IN_PROGRESS)   # still frozen
         self.statuses["claude-sub"] = "green"
-        dispatcher.tick()   # clock resumes counting from "now" (the last frozen tick), still silent
-        self.assertEqual(self._column(ref), "Blocked")
-        runs = [r for r in self._runs() if r["event"] == "advance" and r.get("reason") == "watchdog"]
+        dispatcher.tick()   # clock resumes counting from "now" (the last frozen tick), still
+                            # silent -> the watchdog actually fires (live budget: same-head retry)
+        self.assertEqual(self._column(ref), model.IN_PROGRESS)   # reclaimed, not Blocked
+        self.assertEqual(ops.show_card(ref)["metadata"][model.META_RETRY_SAME], "1")
+        runs = [r for r in self._runs()
+               if r["event"] == "advance" and r.get("reason") == "watchdog-retry-same"]
         self.assertTrue(any(r.get("reference") == ref for r in runs))
 
     def test_unfrozen_watchdog_still_holds_when_worker_is_actually_active(self):

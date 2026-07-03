@@ -161,6 +161,115 @@ class ResolveHeadTest(unittest.TestCase):
         self.assertEqual(health.resolve_head("primary", {}, reg), "primary")
 
 
+class NextRetryHeadTest(unittest.TestCase):
+    """Watchdog retry-switch target selection — breadth-first over `current`'s own fallback chain,
+    skipping tried heads and red resources, with the exhausted-vs-waiting distinction
+    dispatcher._watchdog_retry needs (spend the switch budget's one shot vs wait for free)."""
+
+    def _reg(self):
+        return _registry(
+            resources={"res-a": {"probe": "true"}, "res-b": {"probe": "true"}, "res-c": {"probe": "true"}},
+            profiles={
+                "primary": {"resource": "res-a", "adapter": "claude", "fallback": ["secondary"]},
+                "secondary": {"resource": "res-b", "adapter": "claude", "fallback": ["tertiary"]},
+                "tertiary": {"resource": "res-c", "adapter": "claude", "fallback": []},
+            },
+        )
+
+    def test_first_untried_green_wins(self):
+        reg = self._reg()
+        statuses = {"res-a": "green", "res-b": "green", "res-c": "green"}
+        self.assertEqual(health.next_retry_head("primary", {"primary"}, statuses, reg),
+                         ("secondary", False))
+
+    def test_skips_already_tried_heads_even_if_green(self):
+        reg = self._reg()
+        statuses = {"res-a": "green", "res-b": "green", "res-c": "green"}
+        self.assertEqual(health.next_retry_head("primary", {"primary", "secondary"}, statuses, reg),
+                         ("tertiary", False))
+
+    def test_skips_red_candidates_for_a_later_green_one(self):
+        reg = self._reg()
+        statuses = {"res-a": "green", "res-b": "red", "res-c": "green"}
+        self.assertEqual(health.next_retry_head("primary", {"primary"}, statuses, reg),
+                         ("tertiary", False))
+
+    def test_untried_candidates_all_red_waits_not_exhausted(self):
+        reg = self._reg()
+        statuses = {"res-a": "green", "res-b": "red", "res-c": "red"}
+        resolved, exhausted = health.next_retry_head("primary", {"primary"}, statuses, reg)
+        self.assertIsNone(resolved)
+        self.assertFalse(exhausted)
+
+    def test_no_untried_candidates_left_is_exhausted(self):
+        reg = self._reg()
+        statuses = {"res-a": "green", "res-b": "green", "res-c": "green"}
+        resolved, exhausted = health.next_retry_head(
+            "primary", {"primary", "secondary", "tertiary"}, statuses, reg)
+        self.assertIsNone(resolved)
+        self.assertTrue(exhausted)
+
+    def test_empty_fallback_chain_is_exhausted(self):
+        reg = self._reg()
+        resolved, exhausted = health.next_retry_head("tertiary", {"tertiary"}, {}, reg)
+        self.assertIsNone(resolved)
+        self.assertTrue(exhausted)
+
+    def test_unknown_current_head_is_exhausted_not_a_crash(self):
+        reg = self._reg()
+        resolved, exhausted = health.next_retry_head("nope", set(), {}, reg)
+        self.assertIsNone(resolved)
+        self.assertTrue(exhausted)
+
+    def test_resource_with_no_recorded_status_defaults_green(self):
+        reg = self._reg()
+        self.assertEqual(health.next_retry_head("primary", {"primary"}, {}, reg), ("secondary", False))
+
+
+class ForceRedTest(unittest.TestCase):
+    """TA_HEALTH_FORCE_RED: a live e2e's way to redden a resource without running its real probe
+    or touching the shared credential."""
+
+    def setUp(self):
+        health.STATE.ensure_dir()
+        for f in (health.STATE.dir / "runs.jsonl", health.HEALTH_FILE):
+            if f.exists():
+                f.unlink()
+
+    def test_forced_resource_is_red_without_running_the_real_probe(self):
+        reg = _registry({"claude-sub": {"probe": "true"}})
+        with mock.patch.dict(os.environ, {"TA_HEALTH_FORCE_RED": "claude-sub"}):
+            with mock.patch.object(health, "_run_probe_cmd") as probe:
+                statuses = health.refresh(reg)
+        self.assertEqual(statuses, {"claude-sub": "red"})
+        probe.assert_not_called()
+
+    def test_unforced_resource_probes_normally(self):
+        reg = _registry({"claude-sub": {"probe": "true"}, "openrouter": {"probe": "true"}})
+        with mock.patch.dict(os.environ, {"TA_HEALTH_FORCE_RED": "claude-sub"}):
+            with mock.patch.object(health, "_run_probe_cmd", return_value=True) as probe:
+                statuses = health.refresh(reg)
+        self.assertEqual(statuses, {"claude-sub": "red", "openrouter": "green"})
+        probe.assert_called_once()
+
+    def test_force_red_bypasses_the_ttl_cache(self):
+        reg = _registry({"claude-sub": {"probe": "true"}})
+        with mock.patch.object(health, "_run_probe_cmd", return_value=True):
+            health.refresh(reg)   # cached green
+        with mock.patch.dict(os.environ, {"TA_HEALTH_FORCE_RED": "claude-sub"}):
+            statuses = health.refresh(reg)   # must not reuse the still-fresh cached green
+        self.assertEqual(statuses, {"claude-sub": "red"})
+
+    def test_clearing_the_override_lets_the_real_probe_answer_again(self):
+        reg = _registry({"claude-sub": {"probe": "true"}})
+        with mock.patch.dict(os.environ, {"TA_HEALTH_FORCE_RED": "claude-sub"}):
+            health.refresh(reg)
+        with mock.patch.object(health, "_run_probe_cmd", return_value=True), \
+             mock.patch.object(health, "PROBE_TTL_S", 0):
+            statuses = health.refresh(reg)
+        self.assertEqual(statuses, {"claude-sub": "green"})
+
+
 class ResourceOfTest(unittest.TestCase):
     def test_known_profile_returns_its_resource(self):
         reg = _registry({"res-a": {"probe": "true"}},

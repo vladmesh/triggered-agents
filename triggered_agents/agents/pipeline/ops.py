@@ -219,18 +219,53 @@ def move_card(role: str, reference: str, to_column: str) -> dict:
     """Move a card per the role/transition matrix (never into In progress; that is claim).
 
     The claim persists across In progress<->Validate rework (the worker session still owns
-    the card) and resets on return to Ready: Blocked->Ready clears the metadata (empty
-    string; the claim guard checks truthiness, so empty means unclaimed) so the next claim
-    can hand the card to a fresh worker.
+    the card) and resets on arrival in Ready — from Blocked (a human's manual recovery) or from
+    In progress (the dispatcher's own watchdog auto-retry requeue, model TRANSITIONS["dispatcher"])
+    — to the unclaimed/fresh-retry-budget defaults (empty string; every guard that reads these
+    checks truthiness, so empty means "unset"). A human recovering a Blocked card this way gets a
+    full watchdog retry budget again, same as a brand new card; a watchdog requeue's own caller
+    (dispatcher._watchdog_retry) restates the real counters (and, on a head switch, the new head)
+    right after via set_retry_state, so this reset is never the last write for that path.
     """
     pid = board_id()
     task = _get_by_ref(reference)
     cur = _column_title(pid, int(task["column_id"]))
     model.check_move(role, cur, to_column)
-    if (cur, to_column) == ("Blocked", "Ready"):
-        call("saveTaskMetadata", task_id=int(task["id"]), values={model.META_CLAIM: ""})
+    if to_column == "Ready":
+        call("saveTaskMetadata", task_id=int(task["id"]), values={
+            model.META_CLAIM: "",
+            model.META_RETRY_SAME: "",
+            model.META_RETRY_SWITCH: "",
+            model.META_RETRY_HEADS: "",
+        })
     _move_position(pid, int(task["id"]), _column_id(pid, to_column), int(task["swimlane_id"]))
     return {"action": "moved", "reference": reference, "from": cur, "to": to_column}
+
+
+def get_metadata(reference: str) -> dict:
+    """Raw metadata dict for `reference` — used by the watchdog retry path (dispatcher.
+    _watchdog_retry) to read retry_same/retry_switch/retry_heads without show_card's extra
+    getAllComments fetch."""
+    task = _get_by_ref(reference)
+    return call("getTaskMetadata", task_id=int(task["id"])) or {}
+
+
+def set_retry_state(reference: str, *, retry_same: int, retry_switch: int, retry_heads: str,
+                    head: str | None = None) -> dict:
+    """Dispatcher-only: stamp the watchdog retry counters (model.META_RETRY_*) on a card, and its
+    head too when a switch just picked a new one. Always called right after move_card(..., 'Ready')
+    during a watchdog retry — that move already reset these fields to defaults; this restates the
+    real values on top, in the same tick, so the reset is never the last write."""
+    task = _get_by_ref(reference)
+    values = {
+        model.META_RETRY_SAME: str(retry_same),
+        model.META_RETRY_SWITCH: str(retry_switch),
+        model.META_RETRY_HEADS: retry_heads,
+    }
+    if head is not None:
+        values[model.META_HEAD] = head
+    call("saveTaskMetadata", task_id=int(task["id"]), values=values)
+    return {"action": "retry-state", "reference": reference, **values}
 
 
 def claim_card(reference: str, worker: str, cap: int = 3) -> dict:

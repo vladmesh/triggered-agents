@@ -25,19 +25,32 @@ ROLES = ("po", "dispatcher", "worker", "reviewer")
 TASK_TYPES = ("code", "research", "debug")
 
 # Metadata keys (flat str->str dict on the Kanboard card):
-#   task_type  one of TASK_TYPES
-#   project    source project name (also the swimlane)
-#   blocked_by reference of a predecessor card that must be Done before claim
-#   head       worker head profile id (heads.toml [profiles.*]); empty -> heads.DEFAULT_PROFILE
-#   claim      worker/workspace id, set by the claim command
-#   slug       short [a-z0-9-]{1,30} tag naming the card's worker/reviewer workspace; a card
-#              without one (old/manual) falls back to a transliterated slug of its title
+#   task_type    one of TASK_TYPES
+#   project      source project name (also the swimlane)
+#   blocked_by   reference of a predecessor card that must be Done before claim
+#   head         worker head profile id (heads.toml [profiles.*]); empty -> heads.DEFAULT_PROFILE.
+#                On a watchdog retry-switch this is overwritten with the head actually launched,
+#                so a later reclaim keeps using it instead of bouncing back to the original.
+#   claim        worker/workspace id, set by the claim command
+#   slug         short [a-z0-9-]{1,30} tag naming the card's worker/reviewer workspace; a card
+#                without one (old/manual) falls back to a transliterated slug of its title
+#   retry_same   watchdog same-head auto-retries already used on this card's current life (int,
+#                as a string); reset to "" on every arrival in Ready (move_card)
+#   retry_switch watchdog head-switch auto-retries already used (int, as a string); same reset
+#   retry_heads  comma-joined heads this card's watchdog has already used (this life), so a
+#                retry-switch never re-picks one it already tried; same reset
+# retry_* live on the card, not in the dispatcher's local cards.json record: they must survive a
+# dispatcher redeploy (which only ever replaces the local state), and a human moving a card
+# Blocked->Ready is exactly the "fresh start" the Ready-reset gives them for free.
 META_TASK_TYPE = "task_type"
 META_PROJECT = "project"
 META_BLOCKED_BY = "blocked_by"
 META_HEAD = "head"
 META_CLAIM = "claim"
 META_SLUG = "slug"
+META_RETRY_SAME = "retry_same"
+META_RETRY_SWITCH = "retry_switch"
+META_RETRY_HEADS = "retry_heads"
 
 IN_PROGRESS = "In progress"
 
@@ -48,6 +61,7 @@ TRANSITIONS: dict[str, set[tuple[str, str]]] = {
     "dispatcher": {
         ("In progress", "Validate"),
         ("In progress", "Blocked"),
+        ("In progress", "Ready"),   # watchdog auto-retry requeue (teardown -> Ready -> reclaim)
         ("Validate", "In progress"),
         ("Validate", "Blocked"),
         ("Validate", "Done"),
@@ -95,6 +109,10 @@ MARKER_REVIEW_RETURN = "validate:review-return"
 # Posted once when validating a single card blows up unexpectedly (e.g. a base workspace.toml that
 # won't parse). The failure is localized to that card — the tick keeps going for the others.
 MARKER_VALIDATE_ERROR = "validate:error"
+# A watchdog auto-retry requeue (same head or a head switch) on an In-progress card — see
+# dispatcher._watchdog_retry. Never posted on the terminal Blocked (budget exhausted): that one
+# stays a plain [dispatcher] comment, same as before this marker existed.
+MARKER_WATCHDOG_RETRY = "watchdog:retry"
 
 
 class GuardError(RuntimeError):

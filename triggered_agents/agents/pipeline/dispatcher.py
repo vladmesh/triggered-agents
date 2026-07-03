@@ -9,9 +9,12 @@ Per-tick order:
   0. reconcile — adopt In-progress cards with a claim but no local record (a tick killed
                 between claim and save), so no claimed card is ever invisible to the watchdog.
   1. advance  — for each In-progress card we track: [report:done] -> Validate,
-                [report:blocked] -> Blocked, else watchdog (silent past the threshold -> Blocked,
-                workspace left alive for a human/provision-agent). A card moved to Validate keeps
-                its record: the worker session lives on for CI rework.
+                [report:blocked] -> Blocked, else watchdog: silent past the threshold is a
+                head-technical failure (the resource-red freeze above already ruled out "the
+                account/subscription is down"), retried by budget — same head once, the next green
+                head along its heads.toml fallback chain once (_watchdog_retry) — before a
+                terminal Blocked with the full retry history. A card moved to Validate keeps its
+                record: the worker session lives on for CI rework.
   2. validate — for each Validate card, drive layers 1-3 (validate.run — PR/gh mechanics, the
                 stand, the independent layer-3 reviewer; a contrib fork card without a PR skips
                 straight to its own report + layer 3). See validate.py's module docstring for the
@@ -51,6 +54,13 @@ STATE = AgentState("pipeline")
 CARDS_FILE = STATE.dir / "cards.json"
 WATCHDOG_SECONDS = int(os.environ.get("TA_WATCHDOG_SECONDS", "1200"))
 WORKER_CAP = int(os.environ.get("TA_WORKER_CAP", "3"))
+# Head-technical watchdog retry budget (_watchdog_retry): a card's In-progress silence gets this
+# many free requeues before a terminal Blocked — first the same head again, then the next green
+# head along its heads.toml fallback chain. Env-technical (provision/smoke) and semantic (report
+# blocked, red review, rework cap) failures are untouched by this — see validate.py and
+# _bring_up's own smoke-fail path, still a straight Blocked, no retry.
+RETRY_SAME_BUDGET = int(os.environ.get("TA_RETRY_SAME_BUDGET", "1"))
+RETRY_SWITCH_BUDGET = int(os.environ.get("TA_RETRY_SWITCH_BUDGET", "1"))
 _LOG_TAIL_LINES = 40
 
 
@@ -345,16 +355,123 @@ def _advance(records: dict, statuses: dict[str, str]) -> bool:
                 continue
             silent = time.time() - rec.get("last_activity", rec.get("claimed_at", time.time()))
             if silent > WATCHDOG_SECONDS:
-                ws_note = (f"воркспейс {rec['workspace']} оставлен для разбора"
-                           if rec.get("workspace") else "воркспейс неизвестен (подобрана после сбоя)")
-                ops.add_comment("dispatcher", ref,
-                                f"watchdog: воркер молчит {int(silent)}s (порог {WATCHDOG_SECONDS}s). "
-                                f"Карточка в Blocked, {ws_note}.")
-                ops.move_card("dispatcher", ref, "Blocked")
-                STATE.log_run("advance", reference=ref, to="Blocked", reason="watchdog", silent=int(silent))
+                _watchdog_retry(ref, card, rec, statuses, silent)
                 records.pop(ref)
                 changed = True
     return changed
+
+
+def _teardown_best_effort(ref: str, ws: str | None) -> None:
+    """worker.teardown, but never let a bad path (or any other host hiccup) crash the whole tick
+    over one card's dead workspace — unlike validate.py's per-card loop, _advance has no outer
+    try/except, so a raise here would also stop every OTHER In-progress card from being advanced
+    this tick. A failure here just means the workspace is orphaned for manual cleanup; the retry
+    itself (teardown is a courtesy, not a precondition for the Ready requeue) still proceeds."""
+    if not ws:
+        return
+    try:
+        worker.teardown(ws)
+    except Exception as e:  # noqa: BLE001 — see docstring
+        STATE.log_run("advance", reference=ref, result="teardown-failed", level="warn",
+                      error=worker.scrub_secrets(str(e)))
+
+
+def _watchdog_retry(ref: str, card: dict, rec: dict, statuses: dict[str, str], silent: float) -> None:
+    """A watchdog timeout on an In-progress card is a head-technical failure — the resource-red
+    freeze just above already ruled out "the account is down", so this is the head process itself
+    gone silent/dead. Retried by budget (RETRY_SAME_BUDGET same head, RETRY_SWITCH_BUDGET the next
+    green head along heads.toml's fallback chain) before a terminal Blocked with the full retry
+    history. Counters and the tried-heads history live in card METADATA (model.META_RETRY_*), not
+    in `records` — they must survive a dispatcher redeploy, which only ever replaces the local
+    cards.json, never the board.
+
+    A switch attempt with no green, not-yet-tried candidate right now (the rest of the chain is
+    red) requeues to Ready without spending the switch budget: the card just waits on the existing
+    claim-time red-skip (_claim_next/health.resolve_head) to let it through once a resource
+    recovers — the same "resource down, not head dead" distinction the freeze check above already
+    makes for a still-running head, just reached by a different road. Only a chain with genuinely
+    nothing left to try at all (health.next_retry_head's `exhausted` flag) counts as unusable and
+    falls through to Blocked instead of waiting forever for something that can't happen.
+
+    Every branch either requeues to Ready (tearing the dead workspace down first) or Blocks
+    (workspace left alive for a human, same as before this retry cycle existed); the caller always
+    drops `rec` from `records` right after, so nothing here needs to hand anything back."""
+    ws = rec.get("workspace")
+    # rec["head"] is the head actually launched, set by _bring_up — the authoritative source. A
+    # record adopted by _reconcile after a lost cards.json has no such key; the card's own board
+    # metadata (kept current by every switch via set_retry_state) is the next best source, so a
+    # redeploy losing local state still resumes on the right head instead of silently defaulting.
+    current_head = rec.get("head") or card.get("head") or heads.DEFAULT_PROFILE
+    meta = ops.get_metadata(ref)
+    retry_same = int(meta.get(model.META_RETRY_SAME) or 0)
+    retry_switch = int(meta.get(model.META_RETRY_SWITCH) or 0)
+    tried = [h for h in (meta.get(model.META_RETRY_HEADS) or "").split(",") if h]
+    if current_head not in tried:
+        tried.append(current_head)
+
+    if retry_same < RETRY_SAME_BUDGET:
+        retry_same += 1
+        _teardown_best_effort(ref, ws)
+        ops.move_card("dispatcher", ref, "Ready")
+        ops.set_retry_state(ref, retry_same=retry_same, retry_switch=retry_switch,
+                            retry_heads=",".join(tried))
+        ops.add_comment(
+            "dispatcher", ref,
+            f"watchdog: голова {current_head} молчала {int(silent)}s (порог {WATCHDOG_SECONDS}s). "
+            f"Авторетрай той же головой (попытка {retry_same}/{RETRY_SAME_BUDGET}), воркспейс "
+            f"{ws or '(неизвестен)'} снесён, карточка в Ready на переклейм.",
+            marker=model.MARKER_WATCHDOG_RETRY)
+        STATE.log_run("advance", reference=ref, to="Ready", reason="watchdog-retry-same",
+                      silent=int(silent), head=current_head, retry_same=retry_same)
+        return
+
+    if retry_switch < RETRY_SWITCH_BUDGET:
+        resolved, exhausted = health.next_retry_head(current_head, set(tried), statuses)
+        if resolved is not None:
+            retry_switch += 1
+            tried.append(resolved)
+            _teardown_best_effort(ref, ws)
+            ops.move_card("dispatcher", ref, "Ready")
+            ops.set_retry_state(ref, retry_same=retry_same, retry_switch=retry_switch,
+                                retry_heads=",".join(tried), head=resolved)
+            ops.add_comment(
+                "dispatcher", ref,
+                f"watchdog: голова {current_head} молчала {int(silent)}s, ретрай той же головой "
+                f"исчерпан. Авторетрай сменой головы на {resolved} (попытка {retry_switch}/"
+                f"{RETRY_SWITCH_BUDGET} по цепочке heads.toml), воркспейс снесён, карточка в "
+                f"Ready на переклейм.",
+                marker=model.MARKER_WATCHDOG_RETRY)
+            STATE.log_run("advance", reference=ref, to="Ready", reason="watchdog-retry-switch",
+                          silent=int(silent), head=current_head, switched_to=resolved,
+                          retry_switch=retry_switch)
+            return
+        if not exhausted:
+            _teardown_best_effort(ref, ws)
+            ops.move_card("dispatcher", ref, "Ready")
+            ops.set_retry_state(ref, retry_same=retry_same, retry_switch=retry_switch,
+                                retry_heads=",".join(tried))
+            ops.add_comment(
+                "dispatcher", ref,
+                f"watchdog: голова {current_head} молчала {int(silent)}s, ретрай той же головой "
+                f"исчерпан, а вся оставшаяся цепочка heads.toml сейчас красная. Бюджет смены не "
+                f"тратится, карточка в Ready ждёт зелёного ресурса.",
+                marker=model.MARKER_WATCHDOG_RETRY)
+            STATE.log_run("advance", reference=ref, to="Ready", reason="watchdog-retry-wait",
+                          silent=int(silent), head=current_head)
+            return
+
+    ws_note = (f"воркспейс {ws} оставлен для разбора" if ws
+               else "воркспейс неизвестен (подобрана после сбоя)")
+    ops.add_comment(
+        "dispatcher", ref,
+        f"watchdog: бюджет авторетраев исчерпан ({RETRY_SAME_BUDGET} той же головой + "
+        f"{RETRY_SWITCH_BUDGET} сменой). Попытки: {', '.join(tried)}. Последняя голова "
+        f"{current_head} молчала {int(silent)}s (порог {WATCHDOG_SECONDS}s). Карточка в Blocked, "
+        f"{ws_note}.")
+    ops.move_card("dispatcher", ref, "Blocked")
+    STATE.log_run("advance", reference=ref, to="Blocked", reason="watchdog", silent=int(silent),
+                  head=current_head, retry_same=retry_same, retry_switch=retry_switch,
+                  tried_heads=tried)
 
 
 def _format_comment_ts(ts) -> str:
