@@ -24,7 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))       # repo root
 
 from test_pipeline import FakeBoard  # noqa: E402
 
-from triggered_agents.agents.pipeline import dispatcher, health, heads, model, ops, worker  # noqa: E402
+from triggered_agents.agents.pipeline import dispatcher, health, heads, model, ops, validate, worker  # noqa: E402
 
 
 class FakeWorker:
@@ -172,6 +172,7 @@ class _DispatcherBase(unittest.TestCase):
             if f.exists():
                 f.unlink()
         self._orig_watchdog = dispatcher.WATCHDOG_SECONDS
+        self._orig_ci_pending_stall = validate.CI_PENDING_STALL_SECONDS
 
         # Resource health defaults to all-green (regular behavior, untouched by this card) unless
         # a test mutates self.statuses — real probing (subprocess/network) never runs in a unit
@@ -184,6 +185,7 @@ class _DispatcherBase(unittest.TestCase):
 
     def tearDown(self):
         dispatcher.WATCHDOG_SECONDS = self._orig_watchdog
+        validate.CI_PENDING_STALL_SECONDS = self._orig_ci_pending_stall
 
     # helpers ---------------------------------------------------------------
     def _ref_of(self, title):
@@ -1363,6 +1365,59 @@ class ValidateTest(_DispatcherBase):
                                  "failed_job": None, "failed_log": None}
         dispatcher.tick()                                        # gh answers again -> counter drops
         self.assertNotIn("validate_stall_fails", dispatcher._load_cards()[ref])
+
+    def test_ci_pending_starts_stall_clock_without_escalating(self):
+        # gh answers fine (unlike gh-unavailable above) but CI hasn't reached a terminal rollup —
+        # the first such tick just starts the clock, no escalation.
+        ref = self._to_validate()
+        self.worker.pr_status = {"merged": False, "state": "OPEN", "rollup": "PENDING",
+                                 "failed_job": None, "failed_log": None}
+        dispatcher.tick()
+        self.assertEqual(self._column(ref), "Validate")
+        self.assertIn("ci_pending_since", dispatcher._load_cards()[ref])
+        self.assertTrue(any(r["event"] == "validate" and r.get("result") == "ci-pending"
+                            for r in self._runs()))
+
+    def test_ci_none_within_budget_stays_in_validate(self):
+        # NONE (no checks configured at all) is the same non-terminal case as PENDING; several
+        # ticks under the (generous default) budget must not touch the card.
+        ref = self._to_validate()
+        self.worker.pr_status = {"merged": False, "state": "OPEN", "rollup": "NONE",
+                                 "failed_job": None, "failed_log": None}
+        for _ in range(3):
+            dispatcher.tick()
+        self.assertEqual(self._column(ref), "Validate")
+        self.assertIn(ref, dispatcher._load_cards())
+
+    def test_ci_pending_escalates_once_past_stall_budget(self):
+        ref = self._to_validate()
+        self.worker.pr_status = {"merged": False, "state": "OPEN", "rollup": "PENDING",
+                                 "failed_job": None, "failed_log": None}
+        dispatcher.tick()                                        # starts the clock
+        validate.CI_PENDING_STALL_SECONDS = -1                   # any elapsed time counts as over
+        dispatcher.tick()
+        self.assertEqual(self._column(ref), "Blocked")
+        self.assertNotIn(ref, dispatcher._load_cards())
+        self.assertIn("висит в статусе PENDING", self._markers(ref))
+        stalls = [r for r in self._runs()
+                  if r["event"] == "validate" and r.get("reason") == "ci-pending-stall"]
+        self.assertEqual(len(stalls), 1)                          # escalation logged exactly once
+        dispatcher.tick()                                        # card left Validate -> no polling
+        self.assertEqual(self._column(ref), "Blocked")
+
+    def test_ci_red_after_pending_resets_the_stall_clock(self):
+        # A red CI result is a fresh code state (the card returns to In progress for rework) — the
+        # pending clock from the previous, stuck attempt must not carry over to the next one.
+        ref = self._to_validate()
+        self.worker.pr_status = {"merged": False, "state": "OPEN", "rollup": "PENDING",
+                                 "failed_job": None, "failed_log": None}
+        dispatcher.tick()
+        self.assertIn("ci_pending_since", dispatcher._load_cards()[ref])
+        self.worker.pr_status = {"merged": False, "state": "OPEN", "rollup": "FAILURE",
+                                 "failed_job": "CI", "failed_log": "boom"}
+        dispatcher.tick()
+        self.assertEqual(self._column(ref), model.IN_PROGRESS)
+        self.assertNotIn("ci_pending_since", dispatcher._load_cards()[ref])
 
 
 class ValidateStandTest(_DispatcherBase):

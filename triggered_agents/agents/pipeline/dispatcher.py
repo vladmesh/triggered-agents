@@ -48,7 +48,9 @@ from ...runtime.state import AgentState
 from . import health, heads, model, naming, ops, validate, worker
 # Re-exported so dispatcher.<NAME> keeps resolving for existing callers/tests — validate.py owns
 # these now (its layer-3 rework/spawn/stall caps), dispatcher just orchestrates the tick.
-from .validate import REVIEW_RETURN_CAP, REVIEW_SPAWN_ATTEMPTS, VALIDATE_STALL_ATTEMPTS  # noqa: F401
+from .validate import (  # noqa: F401
+    CI_PENDING_STALL_SECONDS, REVIEW_RETURN_CAP, REVIEW_SPAWN_ATTEMPTS, VALIDATE_STALL_ATTEMPTS,
+)
 
 STATE = AgentState("pipeline")
 CARDS_FILE = STATE.dir / "cards.json"
@@ -336,6 +338,7 @@ def _advance(records: dict, statuses: dict[str, str]) -> bool:
             validate.clear_review(rec)
             rec["comment_baseline"] = len(ops.show_card(ref)["comments"])
             rec["stand_fails"] = 0
+            rec.pop("ci_pending_since", None)
             STATE.log_run("advance", reference=ref, to="Validate", reason="report:done")
             changed = True
         elif verdict == "blocked":
