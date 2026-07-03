@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -156,7 +157,8 @@ class _DispatcherBase(unittest.TestCase):
 
         dispatcher.STATE.ensure_dir()
         for f in (dispatcher.CARDS_FILE, dispatcher.STATE.dir / "runs.jsonl",
-                  dispatcher.STATE.dir / "dispatch.lock", dispatcher.STATE.dir / "lock"):
+                  dispatcher.STATE.dir / "dispatch.lock", dispatcher.STATE.dir / "dispatch.lock.mutex",
+                  dispatcher.STATE.dir / "lock"):
             if f.exists():
                 f.unlink()
         self._orig_watchdog = dispatcher.WATCHDOG_SECONDS
@@ -537,6 +539,127 @@ class DispatcherTest(_DispatcherBase):
             dispatcher.tick()
         self.assertEqual(cm.exception.code, 0)
         lockfile.unlink()
+
+    # tick-lock TOCTOU (triggered-agents-229) ----------------------------------
+    def test_concurrent_stale_reclaim_only_one_wins(self):
+        # Two ticks racing over the same stale lock must not both conclude "stale" and both
+        # reclaim it: exactly one wins, the other sees a live lock and skips without acting.
+        import subprocess
+        import threading
+
+        p = subprocess.Popen(["true"])
+        p.wait()
+        lockfile = dispatcher.STATE.dir / "dispatch.lock"
+        lockfile.write_text(str(p.pid))
+
+        orig_stale = dispatcher._lock_stale
+
+        def slow_stale(path):
+            # Widen the stale-check window so a would-be racer has time to interleave while this
+            # is mid-decision — the mutex around the whole decide-and-reclaim span must block it.
+            result = orig_stale(path)
+            time.sleep(0.1)
+            return result
+
+        results = []
+        results_lock = threading.Lock()
+        resolved = threading.Semaphore(0)  # released once per thread, after its outcome is final
+        release = threading.Event()
+
+        def contend():
+            try:
+                with dispatcher._tick_lock():
+                    with results_lock:
+                        results.append("entered")
+                        hold = len(results) == 1  # the first to enter is the winner
+                    resolved.release()
+                    if hold:
+                        # Keep the reclaimed lock visibly live until BOTH sides have resolved,
+                        # instead of racing to unlink it the instant we're done — otherwise the
+                        # loser might not even get a chance to observe it as live.
+                        release.wait(timeout=5)
+            except SystemExit:
+                with results_lock:
+                    results.append("skipped")
+                resolved.release()
+
+        with mock.patch.object(dispatcher, "_lock_stale", slow_stale):
+            t1 = threading.Thread(target=contend)
+            t2 = threading.Thread(target=contend)
+            t1.start()
+            t2.start()
+            self.assertTrue(resolved.acquire(timeout=5))
+            self.assertTrue(resolved.acquire(timeout=5))
+            release.set()
+            t1.join(timeout=5)
+            t2.join(timeout=5)
+
+        self.assertEqual(sorted(results), ["entered", "skipped"])
+        reclaimed = [r for r in self._runs() if r["event"] == "lock-reclaimed"]
+        self.assertEqual(len(reclaimed), 1)
+
+    def test_concurrent_lock_creation_window_blocks_reader(self):
+        # A lock file that exists but has no pid written yet (the O_EXCL-create-then-write gap)
+        # must not be observable by a concurrent tick as stale/garbled — the writer holds the
+        # decide-and-create span exclusively until the pid is in place.
+        import threading
+
+        orig_write = os.write
+        write_started = threading.Event()
+        release_write = threading.Event()
+        paused = {"done": False}
+
+        def paused_write(fd, data):
+            if not paused["done"]:
+                paused["done"] = True
+                write_started.set()
+                release_write.wait(timeout=5)
+            return orig_write(fd, data)
+
+        entered = []
+        holder_ready = threading.Event()
+        release_holder = threading.Event()
+
+        def holder():
+            with mock.patch.object(dispatcher.os, "write", paused_write):
+                with dispatcher._tick_lock():
+                    entered.append("holder")
+                    holder_ready.set()
+                    # Keep holding the now fully-written lock live until the contender has
+                    # resolved, instead of racing to unlink it the instant we're done.
+                    release_holder.wait(timeout=5)
+
+        t1 = threading.Thread(target=holder)
+        t1.start()
+        self.assertTrue(write_started.wait(timeout=5))  # lockfile created, pid not written yet
+
+        contender_done = threading.Event()
+        contender_outcome = []
+
+        def contender():
+            try:
+                with dispatcher._tick_lock():
+                    entered.append("contender")
+                    contender_outcome.append("entered")
+            except SystemExit:
+                contender_outcome.append("skipped")
+            contender_done.set()
+
+        t2 = threading.Thread(target=contender)
+        t2.start()
+        self.assertFalse(contender_done.wait(timeout=0.2))  # blocked behind the mutex, not racing in
+
+        release_write.set()  # holder finishes writing its pid and enters its body
+        self.assertTrue(holder_ready.wait(timeout=5))
+        # The contender must now observe holder's fully-written, still-live lock (never the
+        # empty pre-write file) and skip — never barge in and clobber it.
+        self.assertTrue(contender_done.wait(timeout=5))
+        release_holder.set()
+        t1.join(timeout=5)
+        t2.join(timeout=5)
+
+        self.assertEqual(contender_outcome, ["skipped"])
+        self.assertEqual(entered, ["holder"])
 
     # secret scrubbing before board comments (review #3) ----------------------
     def test_smoke_fail_comment_is_scrubbed(self):
