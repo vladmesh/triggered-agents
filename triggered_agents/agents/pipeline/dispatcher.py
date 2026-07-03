@@ -43,6 +43,7 @@ tick holds its own lockfile, separate from the claim's lock in ops, so the two n
 """
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import re
@@ -94,32 +95,48 @@ def _lock_stale(lockfile: Path) -> bool:
 def _tick_lock():
     """One dispatcher tick at a time. Separate file from ops' claim lock (dir/lock), so a tick
     can call ops.claim_card — which takes that lock — without deadlocking on itself. A lock left
-    by a killed tick is reclaimed by pid liveness, not honored forever."""
+    by a killed tick is reclaimed by pid liveness, not honored forever.
+
+    Two manual ticks racing on top of the timer could both see the same lock as stale and both
+    unlink+recreate it (systemd only serializes its own runs, not a concurrent manual invocation).
+    A companion mutex file, held via flock only for the decide-and-(re)create span, makes that
+    span exclusive across processes: whoever gets the flock first either creates the lock fresh,
+    reclaims it, or observes the other's already-live lock and skips — no two ticks ever both
+    conclude "stale" against the same generation of the file. Holding the flock through the pid
+    write also closes the create-without-pid-yet window: no other process can read the lockfile
+    while it's between O_EXCL create and the pid write, since that whole span is behind the flock."""
     STATE.ensure_dir()
     lockfile = STATE.dir / "dispatch.lock"
-    fd = None
-    for attempt in (1, 2):  # second attempt only after unlinking a stale lock
-        try:
-            fd = os.open(lockfile, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            break
-        except FileExistsError:
-            if attempt == 2 or not _lock_stale(lockfile):
-                holder = lockfile.read_text(encoding="utf-8", errors="replace").strip() if lockfile.is_file() else "?"
-                # A busy lock is a normal skip, not a failure: a long stand run holds the tick for
-                # minutes while the 3-min systemd timer keeps firing. Exit 0 so systemd doesn't log
-                # a run of unit failures for expected overlap.
-                print(f"pipeline: another dispatcher tick holds the lock ({lockfile}, pid {holder}) — SKIP",
-                      file=sys.stderr)
-                raise SystemExit(0)
-            STATE.log_run("lock-reclaimed", stale_holder=lockfile.read_text(encoding="utf-8", errors="replace").strip()
-                          if lockfile.is_file() else "?")
-            try:
-                lockfile.unlink()
-            except FileNotFoundError:
-                pass
+    mutexfile = STATE.dir / "dispatch.lock.mutex"
+    mfd = os.open(mutexfile, os.O_CREAT | os.O_RDWR)
     try:
+        fcntl.flock(mfd, fcntl.LOCK_EX)
+        fd = None
+        for attempt in (1, 2):  # second attempt only after unlinking a stale lock
+            try:
+                fd = os.open(lockfile, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                break
+            except FileExistsError:
+                if attempt == 2 or not _lock_stale(lockfile):
+                    holder = lockfile.read_text(encoding="utf-8", errors="replace").strip() if lockfile.is_file() else "?"
+                    # A busy lock is a normal skip, not a failure: a long stand run holds the tick
+                    # for minutes while the 3-min systemd timer keeps firing. Exit 0 so systemd
+                    # doesn't log a run of unit failures for expected overlap.
+                    print(f"pipeline: another dispatcher tick holds the lock ({lockfile}, pid {holder}) — SKIP",
+                          file=sys.stderr)
+                    raise SystemExit(0)
+                STATE.log_run("lock-reclaimed", stale_holder=lockfile.read_text(encoding="utf-8", errors="replace").strip()
+                              if lockfile.is_file() else "?")
+                try:
+                    lockfile.unlink()
+                except FileNotFoundError:
+                    pass
         os.write(fd, str(os.getpid()).encode())
         os.close(fd)
+    finally:
+        fcntl.flock(mfd, fcntl.LOCK_UN)
+        os.close(mfd)
+    try:
         yield
     finally:
         try:
