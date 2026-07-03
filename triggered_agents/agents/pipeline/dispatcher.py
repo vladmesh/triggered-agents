@@ -188,15 +188,29 @@ def _report_verdict(reference: str, baseline: int) -> str | None:
     return verdict
 
 
+def _restore_workspace(claim: str, project: str) -> str:
+    """The workspace path a claim points at: `claim` already IS a card's workspace base name
+    (naming.worker_workspace_base, stamped verbatim as the claim by ops.claim_card/_worker_id), so
+    the full path worker.py needs for activity polling/teardown is rebuildable without touching
+    disk. An empty claim leaves nothing to rebuild from — warn instead of adopting the card with a
+    workspace nobody can identify (a silent adoption here is exactly the bug this fixes)."""
+    if not claim:
+        STATE.log_run("reconcile", result="workspace-unknown", level="warn", reason="empty-claim")
+        return ""
+    return worker.workspace_path(project, claim)
+
+
 def _reconcile(records: dict) -> bool:
     """Adopt In-progress AND Validate cards that carry a claim but have no record — the tick died
     between claim and _save_cards, the card re-entered In progress by a rework move, or the whole
     cards.json was lost (a dispatcher redeploy). Without this such a card hangs forever: an
     In-progress one is invisible to _advance and the watchdog, and a Validate one would never get
-    its layer-3 review while precheck keeps reporting work. Adopted with an unknown workspace and a
-    fresh comment baseline, so from here a report advances an In-progress card normally, a Validate
-    card is driven by _validate (fresh review, lower layers re-checked past the new baseline), and
-    pure silence ends in the watchdog -> Blocked."""
+    its layer-3 review while precheck keeps reporting work. The claim already names the card's
+    workspace (_restore_workspace), so activity polling keeps working right after adoption instead
+    of the watchdog firing on a workspace it can no longer see. Adopted with a fresh comment
+    baseline, so from here a report advances an In-progress card normally, a Validate card is
+    driven by _validate (fresh review, lower layers re-checked past the new baseline), and pure
+    silence ends in the watchdog -> Blocked."""
     changed = False
     for column in (model.IN_PROGRESS, "Validate"):
         for c in ops.list_cards(column=column):
@@ -205,7 +219,7 @@ def _reconcile(records: dict) -> bool:
                 continue
             now = time.time()
             records[ref] = {
-                "workspace": "",   # the claim survived the crash, the bookkeeping did not
+                "workspace": _restore_workspace(c["claim"], c.get("project") or ""),
                 "worker": c["claim"],
                 "handle": "",
                 "claimed_at": now,

@@ -172,5 +172,37 @@ class GitHygieneTest(unittest.TestCase):
         self.assertNotEqual(_current_branch(worker_ws), _current_branch(review_ws))
 
 
+class ScrubSecretsTest(unittest.TestCase):
+    """worker.scrub_secrets' generic blob backstop must spare git shas and other hex-shaped
+    identifiers while still catching base64/token-looking blobs — a comment full of
+    «REDACTED»:blob is useless for debugging a CI failure."""
+
+    def test_full_git_sha_survives(self):
+        sha = "a" * 40
+        text = f"fix landed in commit {sha}, see the diff"
+        self.assertIn(sha, worker.scrub_secrets(text))
+
+    def test_abbreviated_git_sha_survives(self):
+        text = "bisected to 1a2b3c4"
+        self.assertIn("1a2b3c4", worker.scrub_secrets(text))
+
+    def test_hex_blob_past_git_sha_length_is_still_masked(self):
+        # A sha256-shaped hex digest (64 chars) is past the git-sha bound (7-40) — the exemption
+        # must not silently widen into "any hex, any length".
+        digest = "a" * 64
+        text = f"image digest sha256:{digest} pulled"
+        out = worker.scrub_secrets(text)
+        self.assertNotIn(digest, out)
+        self.assertIn("blob", out)
+
+    def test_token_like_blob_is_masked(self):
+        # Mixed-case + digits, no known key prefix, not pure hex — the shape _BLOB_RE exists for.
+        token = "Zk9mQwErTy1234567890AbCdEfGhIjKlMnOpQrSt"
+        text = f"leaked token {token} in the log"
+        out = worker.scrub_secrets(text)
+        self.assertNotIn(token, out)
+        self.assertIn("blob", out)
+
+
 if __name__ == "__main__":
     unittest.main()

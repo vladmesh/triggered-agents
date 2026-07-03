@@ -34,6 +34,7 @@ class FakeWorker:
         self.provision_log = "[provision] done\n"
         self.create_raises = None
         self.activity_ts = None          # None -> dispatcher falls back to stored last_activity
+        self.activity_polled = []        # every workspace worker.activity() was asked about
         self.launched = []
         self.tasks_written = []
         self.torn_down = []
@@ -79,11 +80,15 @@ class FakeWorker:
     def workspace_exists(self, project, name):
         return (project, name) in self.existing_workspaces
 
+    def workspace_path(self, project, name):
+        return f"/ws/{name}"
+
     def rename_terminal(self, handle, title):
         self.renamed.append((handle, title))
         return bool(handle)
 
     def activity(self, workspace):
+        self.activity_polled.append(workspace)
         return self.activity_ts
 
     def poll_pr(self, pr_url):
@@ -132,7 +137,7 @@ class _DispatcherBase(unittest.TestCase):
         for name in ("read_base_branch", "create_workspace", "set_branch", "provision", "write_task",
                      "launch_worker", "activity", "poll_pr", "notify", "teardown",
                      "read_stand_config", "pr_branch", "run_stand", "spawn_reviewer",
-                     "workspace_exists", "rename_terminal", "merge_pr"):
+                     "workspace_exists", "workspace_path", "rename_terminal", "merge_pr"):
             wp = mock.patch(f"triggered_agents.agents.pipeline.worker.{name}",
                             getattr(self.worker, name))
             wp.start()
@@ -378,6 +383,41 @@ class DispatcherTest(_DispatcherBase):
         dispatcher.tick()
         self.assertEqual(self._column(ref), "Blocked")
         self.assertEqual(self.worker.torn_down, [])
+
+    def test_reconcile_restores_workspace_from_claim(self):
+        # The claim IS the card's workspace base name (naming._worker_id) — reconcile must rebuild
+        # the full path from it, not leave "workspace" empty and blind the activity watchdog.
+        ref = self._ready_card("A")
+        ops.claim_card(ref, "w-crash")
+        dispatcher.tick()
+        records = dispatcher._load_cards()
+        self.assertEqual(records[ref]["workspace"], "/ws/w-crash")
+        dispatcher.WATCHDOG_SECONDS = 600
+        self.worker.activity_ts = None
+        dispatcher.tick()  # advance polls activity for the watchdog clock
+        self.assertIn("/ws/w-crash", self.worker.activity_polled)
+
+    def test_restore_workspace_warns_on_empty_claim(self):
+        # Nothing to rebuild a workspace name from — an explicit warn, not a silent "" adoption.
+        self.assertEqual(dispatcher._restore_workspace("", "personal_site"), "")
+        self.assertTrue(any(r["event"] == "reconcile" and r.get("result") == "workspace-unknown"
+                            for r in self._runs()))
+
+    def test_reconcile_restores_workspace_across_validate_rework(self):
+        # A Validate card adopted after a lost cards.json, then bounced back to In progress by a
+        # CI-red poll (the rework path) — the workspace reconcile just restored must survive it.
+        self.board.add_task("V", "Validate", swimlane="personal_site",
+                            meta={model.META_TASK_TYPE: "code", model.META_PROJECT: "personal_site",
+                                  model.META_CLAIM: "w-old"})
+        ref = self._ref_of("V")
+        ops.add_comment("po", ref, "PR: https://github.com/vladmesh/personal_site/pull/9")
+        self.worker.pr_status = {"merged": False, "state": "OPEN", "rollup": "FAILURE",
+                                 "failed_job": "CI", "failed_log": "boom"}
+        dispatcher.tick()  # reconcile adopts the Validate card, then _validate sees CI red
+        self.assertEqual(self._column(ref), model.IN_PROGRESS)
+        records = dispatcher._load_cards()
+        self.assertIn(ref, records)
+        self.assertEqual(records[ref]["workspace"], "/ws/w-old")
 
     def test_bringup_saves_records_before_tick_ends(self):
         # _save_cards runs inside _bring_up: a crash right after the head is up must still
