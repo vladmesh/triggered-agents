@@ -1786,11 +1786,23 @@ class ValidateContribTest(_DispatcherBase):
     def _branch(self, ref):
         return f"{self.BRANCH_PREFIX}/{ref}"
 
+    @staticmethod
+    def _full(sha):
+        """Pad an abbreviated test sha into a realistic 40-char lowercase hex string — the shape
+        `git ls-remote` (worker.remote_head_sha) always returns in production, never the bare
+        7-char abbreviation a report may carry. A "match" test that fed the fake the exact reported
+        string back would pass on plain string equality even with the pre-fix bug (a real
+        full-vs-abbreviated/mixed-case comparison falsely mismatched — triggered-agents-240
+        review); using this for the remote side forces the case-insensitive prefix comparison in
+        validate._validate_contrib_card to actually run."""
+        return (sha.lower() + "0" * 40)[:40]
+
     def _to_validate(self, sha=SHA):
         ref = self._claim()
         # remote_head_sha() mirrors this fork's real origin — a fresh push means the branch head
-        # actually is the reported sha, same as a real `git push` would leave it.
-        self.worker.remote_head_shas[self._branch(ref)] = sha
+        # actually is the reported sha (padded to a realistic full sha), same as a real `git push`
+        # would leave it.
+        self.worker.remote_head_shas[self._branch(ref)] = self._full(sha)
         ops.report(ref, "done", f"готово\nbranch: {self._branch(ref)}\nhead: {sha}")
         dispatcher.tick()
         self.assertEqual(self._column(ref), "Validate")
@@ -1865,7 +1877,7 @@ class ValidateContribTest(_DispatcherBase):
         ops.report(ref, "done", f"готово\nbranch: {branch}\nhead: {self.SHA}")
         dispatcher.tick()
         self.assertEqual(self.worker.reviewer_spawns, [])
-        self.worker.remote_head_shas[branch] = self.SHA        # origin now matches the report
+        self.worker.remote_head_shas[branch] = self._full(self.SHA)   # origin now matches the report
         dispatcher.tick()
         self.assertEqual(self._column(ref), "Validate")
         self.assertEqual(len(self.worker.reviewer_spawns), 1)
@@ -1899,6 +1911,23 @@ class ValidateContribTest(_DispatcherBase):
         self.assertEqual(self.worker.reviewer_spawns, [])
         stalls = [r for r in self._runs() if r["event"] == "validate" and r.get("reason") == "sha-mismatch-stall"]
         self.assertEqual(len(stalls), 1)
+
+    def test_abbreviated_and_mixed_case_reported_sha_still_matches(self):
+        # triggered-agents-240 review finding: `git ls-remote` (worker.remote_head_sha) always
+        # answers with the full 40-char lowercase object name, while a real worker's report may
+        # legitimately carry an abbreviated and/or mixed-case sha (`git rev-parse --short`, `git
+        # push`'s own summary line — `_CONTRIB_HEAD_RE` explicitly accepts both). A plain
+        # string-equality check would flag this honestly-matching state as a mismatch and escalate
+        # a good report to Blocked.
+        ref = self._claim()
+        branch = self._branch(ref)
+        reported = "ABC1234"                                  # abbreviated, mixed-case
+        self.worker.remote_head_shas[branch] = self._full(reported)   # full, lowercase — real shape
+        ops.report(ref, "done", f"готово\nbranch: {branch}\nhead: {reported}")
+        dispatcher.tick()
+        self.assertEqual(self._column(ref), "Validate")
+        self.assertEqual(len(self.worker.reviewer_spawns), 1)
+        self.assertFalse(any(r.get("result") == "sha-mismatch" for r in self._runs()))
 
     def test_sha_check_skipped_once_reviewer_already_spawned(self):
         # The gate applies only before a fresh spawn — once the reviewer is up for this code state,
@@ -1952,7 +1981,7 @@ class ValidateContribTest(_DispatcherBase):
             dispatcher.tick()
             self.assertEqual(self._column(ref), model.IN_PROGRESS)
             sha = f"aaaaaa{i}"                                # valid hex, distinct each rework
-            self.worker.remote_head_shas[self._branch(ref)] = sha
+            self.worker.remote_head_shas[self._branch(ref)] = self._full(sha)
             ops.report(ref, "done", f"fix\nbranch: {self._branch(ref)}\nhead: {sha}")
             dispatcher.tick()                                # -> Validate
             dispatcher.tick()                                # -> reviewer up again
@@ -1966,7 +1995,7 @@ class ValidateContribTest(_DispatcherBase):
         ops.verdict(ref, "red", "блокер: X")
         dispatcher.tick()
         self.assertEqual(self._column(ref), model.IN_PROGRESS)
-        self.worker.remote_head_shas[self._branch(ref)] = "def5678"
+        self.worker.remote_head_shas[self._branch(ref)] = self._full("def5678")
         ops.report(ref, "done", f"починил\nbranch: {self._branch(ref)}\nhead: def5678")
         dispatcher.tick()
         self.assertEqual(self._column(ref), "Validate")

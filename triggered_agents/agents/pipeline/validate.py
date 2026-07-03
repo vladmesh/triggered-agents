@@ -299,7 +299,14 @@ def _validate_contrib_card(ref: str, card: dict, rec: dict | None, records: dict
     not every tick a reviewer is already up and being watched/verdict-read); a mismatch (or a
     branch gh/git can't currently resolve) is not a review outcome — it stalls the same way a
     missing branch/sha does, giving the worker a chance to push a matching sha and re-report rather
-    than reviewing a state it never claimed."""
+    than reviewing a state it never claimed.
+
+    The comparison is a case-insensitive prefix match, not equality: `_CONTRIB_HEAD_RE` (and real
+    workers via `git rev-parse --short`/`git push`'s own output) allows an abbreviated and/or
+    mixed-case sha, while `git ls-remote` (remote_head_sha) always answers with the full 40-char
+    lowercase object name. A plain `!=` would flag an honestly-matching short/mixed-case sha as a
+    mismatch and escalate a perfectly good report to Blocked — the exact false-positive this gate
+    must not produce (triggered-agents-240 review)."""
     ref_info = _contrib_ref(view)
     if ref_info is None:
         return _validate_stall(ref, "no-branch-ref", rec, records)
@@ -308,7 +315,7 @@ def _validate_contrib_card(ref: str, card: dict, rec: dict | None, records: dict
         actual = worker.remote_head_sha(card.get("project") or "", branch)
         if actual is None:
             return _validate_stall(ref, "branch-unavailable", rec, records, branch=branch)
-        if actual != sha:
+        if not actual.lower().startswith(sha.lower()):
             return _validate_stall(ref, "sha-mismatch", rec, records, branch=branch,
                                    reported=sha, actual=actual)
     changed = bool(rec is not None and rec.pop("validate_stall_fails", None) is not None)
