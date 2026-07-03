@@ -88,6 +88,8 @@ def build_task(card: dict, ref: str, pr: str | None, spec: str, base_branch: str
         "необходимости, карточки-идеи. Нижние слои валидации (CI, для стенд-проектов ещё стенд+e2e) "
         "уже зелёные — твоя работа поверх них.",
         "",
+        naming.memory_block("reviewer", project),
+        "",
         "## Что вычитать",
         "",
         *what_to_read,

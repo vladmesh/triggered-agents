@@ -623,6 +623,10 @@ def _task_md(card: dict, view: dict) -> str:
         ]
     lines += _task_md_metadata(card)
     lines += [
+        naming.memory_block("worker", card.get("project") or "?"),
+        "",
+    ]
+    lines += [
         "## Спека",
         "",
         view.get("description") or "(описание карточки пустое)",

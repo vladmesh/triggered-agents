@@ -907,6 +907,15 @@ class DispatcherTest(_DispatcherBase):
         self.assertIn("PR открыт", content)
         self.assertIn("ссылка на PR", content)
 
+    # TASK.md carries the shared memory block, scoped to the card's own project -------------
+    def test_task_md_carries_memory_block(self):
+        ref = self._ready_card("A", project="personal_site")
+        dispatcher.tick()
+        (_, content), = self.worker.tasks_written
+        self.assertIn("memory_search", content)
+        self.assertIn('scope="project:personal_site"', content)
+        self.assertIn('caller="worker"', content)
+
     # criterion 2: no direct Kanboard API from the dispatcher ----------------
     def test_dispatcher_does_not_touch_kanboard_directly(self):
         src = Path(dispatcher.__file__).read_text()
