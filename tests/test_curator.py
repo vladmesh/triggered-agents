@@ -28,11 +28,21 @@ def _write(path: Path, text: str) -> None:
 
 
 class DiscoverMemoryFilesTest(unittest.TestCase):
-    """claude_memory_files(): finds new markdown facts, skips MEMORY.md, skips excluded cwds."""
+    """claude_memory_files(): finds new markdown facts, skips MEMORY.md, skips excluded cwds.
+
+    EXCLUDE_CWDS/_EXCLUDE_DIRNAME_PREFIXES are pinned to fixed /home/dev/... paths rather
+    than left derived from the real $HOME — CI runs as a different user (e.g. /home/runner),
+    so leaving them derived would silently stop matching the "-home-dev-..." fixture
+    dirnames below and the exclusion tests would false-pass on a dev box, false-fail on CI.
+    """
 
     def setUp(self):
         self.projects = Path(tempfile.mkdtemp(prefix="ta-curator-projects-case-"))
         self._patch(discover, "CLAUDE_PROJECTS", self.projects)
+        exclude = ["/home/dev/triggered-agents", "/home/dev/orca/workspaces/triggered-agents"]
+        self._patch(discover, "EXCLUDE_CWDS", exclude)
+        self._patch(discover, "_EXCLUDE_DIRNAME_PREFIXES",
+                    [discover._dirname_for_cwd(p) for p in exclude])
 
     def _patch(self, target, attr, value):
         from unittest import mock
