@@ -406,6 +406,10 @@ def feedback(reference: str, body: str) -> dict:
 
 def _card_view(pid: int, task: dict, cols: dict, lanes: dict) -> dict:
     meta = call("getTaskMetadata", task_id=int(task["id"])) or {}
+    try:
+        date_moved = int(task["date_moved"]) or None
+    except (KeyError, TypeError, ValueError):
+        date_moved = None
     return {
         "id": int(task["id"]),
         "reference": task.get("reference") or "",
@@ -413,6 +417,9 @@ def _card_view(pid: int, task: dict, cols: dict, lanes: dict) -> dict:
         "column": cols.get(int(task["column_id"]), ""),
         "swimlane": lanes.get(int(task["swimlane_id"]), ""),
         "position": int(task.get("position", 0) or 0),
+        # Kanboard's own "last column move" unix timestamp — steward's staleness signal reads
+        # this to age a card in its current column without keeping a parallel cursor of its own.
+        "date_moved": date_moved,
         "task_type": meta.get(model.META_TASK_TYPE, ""),
         "project": meta.get(model.META_PROJECT, ""),
         "blocked_by": meta.get(model.META_BLOCKED_BY, ""),

@@ -70,10 +70,29 @@ def _workspace(agent: str) -> str:
 
 
 def _launch_cmd(agent: str) -> tuple[str, str]:
-    """(skill, full claude launch command) from the agent's automation.toml."""
+    """(skill, full claude launch command) from the agent's automation.toml.
+
+    A spec naming a `head` (a profile id in pipeline/heads.toml, e.g. the steward's claude-fable)
+    launches through that registry: same adapter/model/fallback machinery a worker/reviewer head
+    gets, resolved against this run's live resource health so a red claude-sub falls back to
+    claude-opus instead of launching on a rate-limited account. curator/retro/board name no head
+    and keep the bare default-model `claude` invocation they always had. Any failure to resolve
+    (a broken heads.toml is itself the kind of anomaly the steward exists to catch) falls back to
+    the same bare invocation rather than leaving the agent undispatched for the whole tick.
+    """
     spec = tomllib.loads((_REPO_ROOT / "triggered_agents" / "agents" / agent / "automation.toml").read_text())
     skill = spec["skill"]
-    return skill, f"claude --dangerously-skip-permissions {skill}"
+    head = spec.get("head")
+    if not head:
+        return skill, f"claude --dangerously-skip-permissions {skill}"
+    try:
+        from ..agents.pipeline import health as pipeline_health
+        from ..agents.pipeline import heads as pipeline_heads
+        statuses = pipeline_health.refresh()
+        resolved = pipeline_health.resolve_head(head, statuses) or head
+        return skill, pipeline_heads.render_command(resolved, role=agent, prompt=skill)
+    except Exception:
+        return skill, f"claude --dangerously-skip-permissions {skill}"
 
 
 def _ensure_claude_ready(ws: str) -> None:

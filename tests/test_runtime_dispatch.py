@@ -122,5 +122,43 @@ class DispatchRunTest(_DispatchBase):
         self.assertEqual(len(create_calls), 1)
 
 
+class LaunchCmdTest(unittest.TestCase):
+    """_launch_cmd against the real automation.toml files on disk (no mocked spec) — curator has
+    no `head` field (bare claude), steward names claude-fable and must resolve it through
+    pipeline.health/heads, falling back to the bare invocation if that resolution blows up."""
+
+    def test_agent_without_head_field_gets_bare_claude(self):
+        skill, cmd = dispatch._launch_cmd("curator")
+        self.assertEqual(skill, "/curate")
+        self.assertEqual(cmd, "claude --dangerously-skip-permissions /curate")
+
+    def test_steward_head_resolves_through_pipeline_health_and_heads(self):
+        from triggered_agents.agents.pipeline import health as pipeline_health
+
+        with mock.patch.object(pipeline_health, "refresh", lambda: {"claude-sub": "green"}):
+            skill, cmd = dispatch._launch_cmd("steward")
+        self.assertEqual(skill, "/steward")
+        self.assertIn("BOARD_ROLE=steward", cmd)
+        self.assertIn("--model fable", cmd)
+
+    def test_steward_head_falls_back_to_bare_claude_on_broken_resolution(self):
+        from triggered_agents.agents.pipeline import health as pipeline_health
+
+        with mock.patch.object(pipeline_health, "refresh", side_effect=RuntimeError("boom")):
+            skill, cmd = dispatch._launch_cmd("steward")
+        self.assertEqual(skill, "/steward")
+        self.assertEqual(cmd, "claude --dangerously-skip-permissions /steward")
+
+    def test_steward_head_falls_back_to_next_profile_when_resource_red(self):
+        from triggered_agents.agents.pipeline import health as pipeline_health
+
+        with mock.patch.object(pipeline_health, "refresh", lambda: {"claude-sub": "red"}):
+            skill, cmd = dispatch._launch_cmd("steward")
+        # claude-fable's whole fallback chain (claude-opus) also sits on claude-sub, so
+        # resolve_head comes back None and _launch_cmd keeps the originally-named profile
+        # rather than silently downgrading to no model at all.
+        self.assertIn("--model fable", cmd)
+
+
 if __name__ == "__main__":
     unittest.main()

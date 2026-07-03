@@ -1,0 +1,34 @@
+# Portable automation spec for the steward triggered-agent.
+#
+# Canon for HOW the steward is scheduled and dispatched. Host bindings Orca generates (workspace
+# path, repo/automation UUIDs) are NOT here — deploy/provision.py resolves them on the host and
+# applies this spec idempotently (match Orca automation by `name`, edit in place so the
+# automation id — and thus the systemd unit — stays stable).
+
+name = "steward"          # Orca automation name; the match key across re-provisions
+skill = "/steward"        # automation prompt = skill invocation (skill lives in .claude/skills/steward)
+provider = "claude"
+reuse_session = true
+# heads.toml profile (triggered_agents/agents/pipeline/heads.toml): claude-fable, falling back to
+# claude-opus on the same claude-sub resource — the 2026-07-04 design grill's pick for the
+# steward's own head (memory: "стюард присмотр пайплайн дизайн"). runtime/dispatch.py resolves
+# this through pipeline.health/heads the same way a worker/reviewer head is resolved at claim
+# time, so a red claude-sub still lands the steward on a live profile instead of a doomed launch.
+head = "claude-fable"
+# Skip the run unless the deterministic scan finds a real anomaly signal (new Blocked card,
+# warn/error/head-health-flip line in the pipeline's own runs.jsonl, a card stuck past the
+# staleness threshold, a resource health flip, a worker/reviewer workspace on disk with no
+# in-flight card). Gated in the systemd unit, not Orca's field (manual `automations run` ignores
+# --precheck; see provision.py). The steward's whole reason to exist is post-merge self-
+# modification safety-netting, not an hourly LLM-cost sweep — a quiet hour costs nothing.
+precheck = "python3 -m triggered_agents steward precheck"
+
+[trigger]
+# Orca's own rrule does not tick in headless `orca serve`; kept for correctness but the real
+# clock is the systemd timer below.
+orca = "hourly"
+
+[systemd]
+# The actual scheduler on this headless box. Unit name is derived as ta-<name>.
+calendar = "hourly"
+randomized_delay_sec = 150   # jitter so the hourly sweep never races curator/board at :00-:03

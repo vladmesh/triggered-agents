@@ -185,14 +185,27 @@ class TestMatrix(unittest.TestCase):
             model.check_move("dispatcher", "Идеи", "Ready")
 
     def test_steward_gets_every_po_transition_plus_the_override(self):
+        steward_escalations = {
+            ("Идеи", "Blocked"), ("Ready", "Blocked"),
+            ("In progress", "Blocked"), ("Validate", "Blocked"),
+        }
         self.assertEqual(model.TRANSITIONS["steward"],
-                         model.TRANSITIONS["po"] | {model.STEWARD_OVERRIDE})
+                         model.TRANSITIONS["po"] | {model.STEWARD_OVERRIDE} | steward_escalations)
 
     def test_only_steward_may_move_blocked_to_done(self):
         model.check_move("steward", "Blocked", "Done")  # must not raise
         for role in ("po", "dispatcher", "worker", "reviewer"):
             with self.assertRaises(model.GuardError):
                 model.check_move(role, "Blocked", "Done")
+
+    def test_steward_may_escalate_any_active_card_straight_to_blocked(self):
+        for column in ("Идеи", "Ready", "In progress", "Validate"):
+            model.check_move("steward", column, "Blocked")  # must not raise
+        with self.assertRaises(model.GuardError):
+            model.check_move("steward", "Done", "Blocked")
+        for role in ("po", "worker", "reviewer"):
+            with self.assertRaises(model.GuardError):
+                model.check_move(role, "Ready", "Blocked")
 
     def test_unknown_role_and_column(self):
         with self.assertRaises(model.GuardError):
