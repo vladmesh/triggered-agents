@@ -20,7 +20,7 @@ import os
 
 from ...runtime.state import AgentState
 from ..board.kanboard import KanboardError, call
-from . import model, naming, worker
+from . import heads, model, naming, worker
 
 STATE = AgentState("pipeline")
 
@@ -103,6 +103,17 @@ def ensure_structure() -> dict:
     return {"board_id": pid, "columns": model.COLUMNS, "admin_member_added": admin_added}
 
 
+def _check_head(head: str) -> None:
+    """Raise GuardError (not HeadRegistryError — everything a role sees from ops is a GuardError)
+    unless `head` names a real profile in heads.toml. Shared by create/update (reject a bad head
+    before anything is written) and claim (a card's stored head may have gone stale since it was
+    set, e.g. the profile was later removed from the registry)."""
+    try:
+        heads.load_registry().profile(head)
+    except heads.HeadRegistryError as e:
+        raise model.GuardError(str(e)) from e
+
+
 def _get_by_ref(reference: str) -> dict:
     """Task dict for `reference` on the board, or GuardError if there is no such card."""
     pid = board_id()
@@ -122,19 +133,23 @@ def _is_done(task: dict, pid: int) -> bool:
 
 def create_card(project: str, task_type: str, title: str, description: str = "",
                 ref: str | None = None, column: str = "Идеи",
-                blocked_by: str | None = None, model_name: str | None = None,
+                blocked_by: str | None = None, head: str | None = None,
                 slug: str | None = None) -> dict:
     """PO-only: create a spec card in Идеи or Ready, keyed by reference, with metadata.
 
     `slug` names the card's future worker/reviewer workspace (`<reference>-<slug>`); when
     omitted, claim falls back to a transliterated slug of the title (naming.fallback_slug) so an
-    old/manual card without one still claims fine."""
+    old/manual card without one still claims fine. `head`, when given, must name a profile in
+    heads.toml (checked before anything is written); omitted, the card gets heads.DEFAULT_PROFILE
+    at bring-up."""
     if task_type not in model.TASK_TYPES:
         raise model.GuardError(f"unknown task_type {task_type!r} (types: {', '.join(model.TASK_TYPES)})")
     if column not in ("Идеи", "Ready"):
         raise model.GuardError(f"cards are created only in 'Идеи' or 'Ready', not {column!r}")
     if slug is not None and not naming.SLUG_RE.match(slug):
         raise model.GuardError(f"slug {slug!r} must match [a-z0-9-]{{1,30}}")
+    if head:
+        _check_head(head)
     pid = board_id()
     col_id = _column_id(pid, column)
     sw_id = _ensure_swimlane(pid, project)
@@ -147,8 +162,8 @@ def create_card(project: str, task_type: str, title: str, description: str = "",
     values = {model.META_TASK_TYPE: task_type, model.META_PROJECT: project}
     if blocked_by:
         values[model.META_BLOCKED_BY] = blocked_by
-    if model_name:
-        values[model.META_MODEL] = model_name
+    if head:
+        values[model.META_HEAD] = head
     if slug:
         values[model.META_SLUG] = slug
     call("saveTaskMetadata", task_id=task_id, values=values)
@@ -156,15 +171,18 @@ def create_card(project: str, task_type: str, title: str, description: str = "",
 
 
 def update_card(role: str, reference: str, slug: str | None = None,
-                model_name: str | None = None, blocked_by: str | None = None) -> dict:
-    """PO-only: patch slug/model/blocked_by metadata on an existing card. Only the fields
+                head: str | None = None, blocked_by: str | None = None) -> dict:
+    """PO-only: patch slug/head/blocked_by metadata on an existing card. Only the fields
     passed (not None) change; column and claim are never touched. Same validation as
-    create_card (slug SLUG_RE, blocked_by pointing at an existing card), all checked before
-    anything is written so a rejected update leaves metadata untouched."""
+    create_card (slug SLUG_RE, head against heads.toml, blocked_by pointing at an existing
+    card), all checked before anything is written so a rejected update leaves metadata
+    untouched."""
     if role != "po":
         raise model.GuardError(f"role {role!r} may not update card metadata (po only)")
     if slug is not None and not naming.SLUG_RE.match(slug):
         raise model.GuardError(f"slug {slug!r} must match [a-z0-9-]{{1,30}}")
+    if head:
+        _check_head(head)
     pid = board_id()
     task = _get_by_ref(reference)
     if blocked_by is not None and not call("getTaskByReference", project_id=pid, reference=blocked_by):
@@ -172,8 +190,8 @@ def update_card(role: str, reference: str, slug: str | None = None,
     values = {}
     if slug is not None:
         values[model.META_SLUG] = slug
-    if model_name is not None:
-        values[model.META_MODEL] = model_name
+    if head is not None:
+        values[model.META_HEAD] = head
     if blocked_by is not None:
         values[model.META_BLOCKED_BY] = blocked_by
     if values:
@@ -183,7 +201,7 @@ def update_card(role: str, reference: str, slug: str | None = None,
         "action": "updated",
         "reference": reference,
         "slug": meta.get(model.META_SLUG, ""),
-        "model": meta.get(model.META_MODEL, ""),
+        "head": meta.get(model.META_HEAD, ""),
         "blocked_by": meta.get(model.META_BLOCKED_BY, ""),
     }
 
@@ -218,7 +236,9 @@ def move_card(role: str, reference: str, to_column: str) -> dict:
 def claim_card(reference: str, worker: str, cap: int = 3) -> dict:
     """Dispatcher-only entry into In progress: guard, stamp claim, then move.
 
-    Guards (each its own message): the card is Ready; it is unclaimed; its blocked_by
+    Guards (each its own message): the card is Ready; it is unclaimed; its head, if set, names a
+    real profile in heads.toml (a stale reference — the profile was renamed/removed after the
+    card was created — must GuardError here, not blow up bring-up mid-tick); its blocked_by
     predecessor, if any, is Done; if it is a code card, no other active code card for the
     same project sits in In progress or Validate (a Validate card still owns its worker
     session for rework, so it counts); and fewer than `cap` cards sit in In progress or
@@ -238,6 +258,10 @@ def claim_card(reference: str, worker: str, cap: int = 3) -> dict:
         meta = call("getTaskMetadata", task_id=tid) or {}
         if meta.get(model.META_CLAIM):
             raise model.GuardError(f"{reference!r} already claimed by {meta[model.META_CLAIM]!r}")
+
+        head = meta.get(model.META_HEAD)
+        if head:
+            _check_head(head)
 
         blocked_by = meta.get(model.META_BLOCKED_BY)
         if blocked_by:
@@ -314,14 +338,14 @@ def verdict(reference: str, kind: str, body: str = "") -> dict:
 
 
 def reviewer_idea(project: str, title: str, description: str = "", task_type: str = "code",
-                  ref: str | None = None, model_name: str | None = None,
+                  ref: str | None = None, head: str | None = None,
                   slug: str | None = None) -> dict:
     """Reviewer-only: file an out-of-scope finding as an Идеи card (the reviewer's single
     code-creation exception). Title and description are scrubbed for the same reason as a verdict."""
     return create_card(project=project, task_type=task_type,
                        title=worker.scrub_secrets(title),
                        description=worker.scrub_secrets(description),
-                       ref=ref, column="Идеи", model_name=model_name, slug=slug)
+                       ref=ref, column="Идеи", head=head, slug=slug)
 
 
 def feedback(reference: str, body: str) -> dict:
@@ -345,7 +369,7 @@ def _card_view(pid: int, task: dict, cols: dict, lanes: dict) -> dict:
         "task_type": meta.get(model.META_TASK_TYPE, ""),
         "project": meta.get(model.META_PROJECT, ""),
         "blocked_by": meta.get(model.META_BLOCKED_BY, ""),
-        "model": meta.get(model.META_MODEL, ""),
+        "head": meta.get(model.META_HEAD, ""),
         "claim": meta.get(model.META_CLAIM, ""),
         "slug": meta.get(model.META_SLUG, ""),
     }

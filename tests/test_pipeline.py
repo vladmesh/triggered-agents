@@ -241,6 +241,17 @@ class TestCreate(PatchedBoardTest):
                 ops.create_card("personal_site", "code", "T", slug=bad)
         self.assertEqual(board.tasks, {})
 
+    def test_head_is_stored_in_metadata(self):
+        board = self.make_board()
+        out = ops.create_card("personal_site", "code", "T", head="claude-opus")
+        self.assertEqual(board.metadata[out["id"]][model.META_HEAD], "claude-opus")
+
+    def test_unknown_head_raises_and_creates_nothing(self):
+        board = self.make_board()
+        with self.assertRaises(model.GuardError):
+            ops.create_card("personal_site", "code", "T", head="codex-nope")
+        self.assertEqual(board.tasks, {})
+
 
 class TestUpdate(PatchedBoardTest):
     def test_partial_update_touches_only_given_field(self):
@@ -248,13 +259,21 @@ class TestUpdate(PatchedBoardTest):
         ref = board.add_task("A", "Ready", meta={model.META_TASK_TYPE: "code",
                                                  model.META_PROJECT: "personal_site",
                                                  model.META_SLUG: "old-slug",
-                                                 model.META_MODEL: "sonnet"})
-        out = ops.update_card("po", ref, model_name="opus")
+                                                 model.META_HEAD: "claude-sonnet"})
+        out = ops.update_card("po", ref, head="claude-opus")
         tid = next(t["id"] for t in board.tasks.values() if t["reference"] == ref)
         self.assertEqual(board.metadata[tid][model.META_SLUG], "old-slug")
-        self.assertEqual(board.metadata[tid][model.META_MODEL], "opus")
+        self.assertEqual(board.metadata[tid][model.META_HEAD], "claude-opus")
         self.assertEqual(out, {"action": "updated", "reference": ref,
-                               "slug": "old-slug", "model": "opus", "blocked_by": ""})
+                               "slug": "old-slug", "head": "claude-opus", "blocked_by": ""})
+
+    def test_unknown_head_raises_and_writes_nothing(self):
+        board = self.make_board()
+        ref = board.add_task("A", "Ready", meta={model.META_TASK_TYPE: "code",
+                                                 model.META_PROJECT: "personal_site"})
+        with self.assertRaises(model.GuardError):
+            ops.update_card("po", ref, head="nope-not-a-profile")
+        self.assertEqual(board.method_calls("saveTaskMetadata"), [])
 
     def test_valid_blocked_by_is_stored(self):
         board = self.make_board()
@@ -300,7 +319,7 @@ class TestUpdate(PatchedBoardTest):
         ref = board.add_task("A", "In progress", meta={model.META_TASK_TYPE: "code",
                                                        model.META_PROJECT: "personal_site",
                                                        model.META_CLAIM: "w1"})
-        ops.update_card("po", ref, model_name="opus", slug="new-slug",
+        ops.update_card("po", ref, head="claude-opus", slug="new-slug",
                         blocked_by=None)
         tid = next(t["id"] for t in board.tasks.values() if t["reference"] == ref)
         self.assertEqual(board._column_title_for(tid), "In progress")
@@ -309,7 +328,7 @@ class TestUpdate(PatchedBoardTest):
 
 
 class TestCliUpdate(PatchedBoardTest):
-    """--ref/--slug/--model/--blocked-by reach ops through the cli seam; role is enforced in
+    """--ref/--slug/--head/--blocked-by reach ops through the cli seam; role is enforced in
     ops (GuardError -> exit 3), not by the cli's own role gate."""
 
     def setUp(self):
@@ -346,6 +365,24 @@ class TestClaim(PatchedBoardTest):
         # In progress now, and metadata was saved before the move.
         self.assertEqual(board._column_title_for(tid), model.IN_PROGRESS)
         self.assertLess(board.call_index("saveTaskMetadata"), board.call_index("moveTaskPosition"))
+
+    def test_known_head_claims_fine(self):
+        board = self.make_board()
+        ref = board.add_task("A", "Ready", meta={model.META_TASK_TYPE: "code",
+                                                 model.META_PROJECT: "personal_site",
+                                                 model.META_HEAD: "hermes-flash"})
+        ops.claim_card(ref, "w1")  # must not raise
+
+    def test_refuses_unknown_head_with_clear_message(self):
+        board = self.make_board()
+        ref = board.add_task("A", "Ready", meta={model.META_TASK_TYPE: "code",
+                                                 model.META_PROJECT: "personal_site",
+                                                 model.META_HEAD: "codex-nope"})
+        with self.assertRaises(model.GuardError) as ctx:
+            ops.claim_card(ref, "w1")
+        self.assertIn("codex-nope", str(ctx.exception))
+        tid = next(t["id"] for t in board.tasks.values() if t["reference"] == ref)
+        self.assertEqual(board._column_title_for(tid), "Ready")  # claim never touched the card
 
     def test_refuses_when_not_ready(self):
         board = self.make_board()

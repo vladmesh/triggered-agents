@@ -348,13 +348,13 @@ def _format_comment_ts(ts) -> str:
 
 
 def _task_md_metadata(card: dict) -> list[str]:
-    """Metadata block: type, model, slug (always resolved — a card may rely on the fallback),
+    """Metadata block: type, head, slug (always resolved — a card may rely on the fallback),
     blocked_by only when the card actually has a predecessor."""
     lines = [
         "## Метаданные",
         "",
         f"- тип: {card.get('task_type') or '?'}",
-        f"- модель: {card.get('model') or '(не задана — дефолт)'}",
+        f"- голова: {card.get('head') or '(не задана — дефолт)'}",
         f"- слаг: {naming.card_slug(card)}",
     ]
     if card.get("blocked_by"):
@@ -493,7 +493,7 @@ def _bring_up(card: dict, worker_id: str, records: dict) -> None:
         view = ops.show_card(ref)
         worker.write_task(ws, _task_md(card, view))
         title = naming.worker_title(naming.card_id(ref), card.get("title") or ref)
-        handle = worker.launch_worker(ws, card.get("model") or None, worker_id, title)
+        handle = worker.launch_worker(ws, card.get("head") or None, worker_id, title)
     except Exception as e:
         stage = "workspace-create" if ws is None else "launch"
         _block(ref, stage, f"bring-up упал ({stage}): {e}" + (f"\nВоркспейс {ws} оставлен." if ws else ""),
@@ -511,7 +511,7 @@ def _bring_up(card: dict, worker_id: str, records: dict) -> None:
     }
     _save_cards(records)
     STATE.log_run("bringup", reference=ref, to="In progress", workspace=ws,
-                  model=card.get("model") or "default")
+                  head=card.get("head") or "default")
 
 
 def _claim_next(records: dict) -> None:

@@ -28,14 +28,14 @@ TASK_TYPES = ("code", "research", "debug")
 #   task_type  one of TASK_TYPES
 #   project    source project name (also the swimlane)
 #   blocked_by reference of a predecessor card that must be Done before claim
-#   model      recommended model for the worker
+#   head       worker head profile id (heads.toml [profiles.*]); empty -> heads.DEFAULT_PROFILE
 #   claim      worker/workspace id, set by the claim command
 #   slug       short [a-z0-9-]{1,30} tag naming the card's worker/reviewer workspace; a card
 #              without one (old/manual) falls back to a transliterated slug of its title
 META_TASK_TYPE = "task_type"
 META_PROJECT = "project"
 META_BLOCKED_BY = "blocked_by"
-META_MODEL = "model"
+META_HEAD = "head"
 META_CLAIM = "claim"
 META_SLUG = "slug"
 

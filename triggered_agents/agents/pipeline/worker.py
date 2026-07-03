@@ -21,7 +21,7 @@ from pathlib import Path
 
 from ...runtime import claude_env, redact
 from ...runtime.state import AgentState
-from . import stand
+from . import heads, stand
 
 ORCA = os.environ.get("ORCA_BIN") or shutil.which("orca") or str(Path.home() / ".local/bin/orca")
 GH = os.environ.get("GH_BIN") or shutil.which("gh") or "gh"
@@ -38,9 +38,10 @@ ORCA_TIMEOUT_S = 120       # worktree create runs repo git; give it room, but ne
 PROVISION_TIMEOUT_S = int(os.environ.get("TA_PROVISION_TIMEOUT_S", "900"))
 GH_TIMEOUT_S = 60          # a gh call may hit the network; bounded so a tick never hangs on it
 _GH_LOG_TAIL_LINES = 40
-# Model for the layer-3 reviewer head. A plain config knob (not a per-card choice): the reviewer is
-# independent of the worker, so the card's `model` field is not reused here. Empty -> claude default.
-REVIEWER_MODEL = os.environ.get("TA_REVIEWER_MODEL", "opus")
+# Head profile for the layer-3 reviewer. A plain config knob (not a per-card choice): the reviewer
+# is independent of the worker, so the card's `head` field is not reused here — this names a
+# profile in heads.toml, same registry every worker head resolves against.
+REVIEWER_HEAD = os.environ.get("TA_REVIEWER_HEAD", "claude-opus")
 
 
 class WorkspaceError(RuntimeError):
@@ -364,14 +365,13 @@ def rename_terminal(handle: str, title: str) -> bool:
     return p.returncode == 0
 
 
-def _launch_command(model: str | None, worker_id: str) -> str:
-    model_flag = f" --model {model}" if model else ""
+def _launch_command(head: str | None, worker_id: str) -> str:
     prompt = (
         "Ты — воркер task-пайплайна. Твоя задача целиком в TASK.md в корне воркспейса — прочти "
         "его первым и следуй ему. Роль на доске — worker (BOARD_ROLE уже выставлен): карточку сам "
         "не двигаешь, только report/comment/feedback через board-CLI. TASK.md в репо не коммить."
     )
-    return f'BOARD_ROLE=worker claude --dangerously-skip-permissions{model_flag} {prompt!r}'
+    return heads.render_command(head or heads.DEFAULT_PROFILE, role="worker", prompt=prompt)
 
 
 def ensure_trust(workspace: str) -> None:
@@ -393,7 +393,7 @@ def ensure_theme() -> None:
         raise WorkspaceError(str(e)) from e
 
 
-def launch_worker(workspace: str, model: str | None, worker_id: str, title: str) -> str:
+def launch_worker(workspace: str, head: str | None, worker_id: str, title: str) -> str:
     """Spawn the worker head in the workspace; return the terminal handle. `title` seeds the
     tab's display name; the caller (dispatcher) pins it back every tick via rename_terminal since
     Claude Code overwrites it once the head starts working."""
@@ -401,20 +401,19 @@ def launch_worker(workspace: str, model: str | None, worker_id: str, title: str)
     ensure_theme()
     data = _orca_json(["terminal", "create", "--worktree", f"path:{workspace}",
                        "--title", title,
-                       "--command", _launch_command(model, worker_id)])
+                       "--command", _launch_command(head, worker_id)])
     term = data.get("terminal", data)
     return term.get("handle") or term.get("id") or ""
 
 
 def _reviewer_command(worker_id: str) -> str:
-    model_flag = f" --model {REVIEWER_MODEL}" if REVIEWER_MODEL else ""
     prompt = (
         "Ты — независимая голова-ревьюер task-пайплайна (слой 3 валидации). Твоя работа целиком в "
         "REVIEW.md в корне воркспейса — прочти его первым и следуй ему. Роль на доске — reviewer "
         "(BOARD_ROLE уже выставлен): прав на код нет, не коммить и не пушь; артефакты — один "
         "вердикт-коммент и, при необходимости, карточки-идеи через board-CLI."
     )
-    return f'BOARD_ROLE=reviewer claude --dangerously-skip-permissions{model_flag} {prompt!r}'
+    return heads.render_command(REVIEWER_HEAD, role="reviewer", prompt=prompt)
 
 
 def spawn_reviewer(project: str, worker_id: str, base_branch: str, review_md: str, title: str,
