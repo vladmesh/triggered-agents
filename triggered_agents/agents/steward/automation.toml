@@ -10,7 +10,7 @@ skill = "/steward"        # automation prompt = skill invocation (skill lives in
 provider = "claude"
 reuse_session = true
 # heads.toml profile (triggered_agents/agents/pipeline/heads.toml): claude-fable, falling back to
-# claude-opus on the same claude-sub resource — the 2026-07-04 design grill's pick for the
+# claude-opus, then hermes-flash off-subscription (PR #38) — the 2026-07-04 design grill's pick for the
 # steward's own head (memory: "стюард присмотр пайплайн дизайн"). runtime/dispatch.py resolves
 # this through pipeline.health/heads the same way a worker/reviewer head is resolved at claim
 # time, so a red claude-sub still lands the steward on a live profile instead of a doomed launch.
