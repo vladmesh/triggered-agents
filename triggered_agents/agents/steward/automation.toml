@@ -32,3 +32,6 @@ orca = "hourly"
 # The actual scheduler on this headless box. Unit name is derived as ta-<name>.
 calendar = "hourly"
 randomized_delay_sec = 150   # jitter so the hourly sweep never races curator/board at :00-:03
+# precheck hits Kanboard directly (signals.py), before any claude head is up to source .env
+# itself — same reason the pipeline dispatcher's unit needs this (see pipeline/automation.toml).
+env_file = "/home/dev/control-panel/.env"

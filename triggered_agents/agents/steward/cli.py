@@ -22,6 +22,7 @@ import json
 import sys
 
 from . import signals
+from ..pipeline import worker as pipeline_worker
 
 STATE = signals.STATE
 
@@ -59,8 +60,17 @@ def cmd_advance() -> int:
 
 
 def cmd_precheck() -> int:
-    """Exit 0 if any anomaly signal is present, non-zero to skip the run untouched."""
-    batch = signals.scan()
+    """Exit 0 if any anomaly signal is present, 1 to skip a clean run, 2 when precheck itself
+    broke (Kanboard unreachable, bad env, any other exception) — a distinct outcome from a plain
+    skip, so the systemd gate's rc>=2 branch (see deploy/provision.py) can tell a dead precheck
+    from a quiet hour in journalctl/runs.jsonl instead of both looking like rc=1."""
+    try:
+        batch = signals.scan()
+    except Exception as e:  # noqa: BLE001 — any precheck failure must be logged, not just KanboardError
+        scrubbed = pipeline_worker.scrub_secrets(str(e))
+        STATE.log_run("precheck", result="error", error_class=type(e).__name__, error=scrubbed)
+        print(f"steward: precheck failed ({type(e).__name__}): {scrubbed}", file=sys.stderr)
+        return 2
     if signals.has_signal(batch):
         counts = {k: (len(v) if isinstance(v, (list, dict)) else v)
                  for k, v in batch["signals"].items()}
