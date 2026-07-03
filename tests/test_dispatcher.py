@@ -647,6 +647,19 @@ class ValidateTest(_DispatcherBase):
         dispatcher.tick()
         self.assertEqual(self.worker.torn_down, [ws])
 
+    def test_closed_pr_without_merge_moves_to_blocked(self):
+        # A PR closed by a human (or gone stale) without a merge must not hang the card in
+        # Validate forever waiting for a merge that will never come.
+        ref = self._to_validate()
+        self.worker.pr_status = {"merged": False, "state": "CLOSED", "rollup": "SUCCESS",
+                                 "failed_job": None, "failed_log": None}
+        dispatcher.tick()
+        self.assertEqual(self._column(ref), "Blocked")
+        self.assertNotIn(ref, dispatcher._load_cards())
+        self.assertIn("закрыт без мержа", self._markers(ref))
+        self.assertTrue(any(r["event"] == "validate" and r.get("reason") == "pr-closed"
+                            for r in self._runs()))
+
     def test_red_ci_returns_to_in_progress_notifies_and_scrubs(self):
         ref = self._to_validate()
         self.worker.pr_status = {
@@ -705,6 +718,50 @@ class ValidateTest(_DispatcherBase):
         self.assertIn(ref, dispatcher._load_cards())
         self.assertTrue(any(r["event"] == "validate" and r.get("result") == "gh-unavailable"
                             and r.get("level") == "warn" for r in self._runs()))
+
+    def test_no_pr_ref_escalates_once_after_stall_cap(self):
+        # A worker that never posts a PR link must not warn forever with no signal: past the cap,
+        # a single Blocked escalation, not a repeated warn.
+        ref = self._claim_one()
+        ops.report(ref, "done", "готово, но ссылку на PR забыл")
+        dispatcher.tick()                                        # -> Validate, no PR -> stall 1
+        for i in range(2, dispatcher.VALIDATE_STALL_ATTEMPTS):
+            dispatcher.tick()
+            self.assertEqual(self._column(ref), "Validate")
+            self.assertEqual(dispatcher._load_cards()[ref]["validate_stall_fails"], i)
+        dispatcher.tick()                                        # cap reached -> escalate
+        self.assertEqual(self._column(ref), "Blocked")
+        self.assertNotIn(ref, dispatcher._load_cards())
+        self.assertIn("не может определить статус", self._markers(ref))
+        stalls = [r for r in self._runs() if r["event"] == "validate" and r.get("reason") == "no-pr-ref-stall"]
+        self.assertEqual(len(stalls), 1)                          # escalation logged exactly once
+        dispatcher.tick()                                        # card left Validate -> no more polling
+        self.assertEqual(self._column(ref), "Blocked")
+
+    def test_gh_unavailable_escalates_once_after_stall_cap(self):
+        # _to_validate()'s own landing tick already polls once with gh down, so the counter starts
+        # at 1 the moment the card settles in Validate.
+        ref = self._to_validate()
+        self.assertEqual(dispatcher._load_cards()[ref]["validate_stall_fails"], 1)
+        self.worker.pr_status = None                              # gh stays down every tick
+        for i in range(2, dispatcher.VALIDATE_STALL_ATTEMPTS):
+            dispatcher.tick()
+            self.assertEqual(dispatcher._load_cards()[ref]["validate_stall_fails"], i)
+        dispatcher.tick()
+        self.assertEqual(self._column(ref), "Blocked")
+        self.assertNotIn(ref, dispatcher._load_cards())
+        self.assertTrue(any(r["event"] == "validate" and r.get("reason") == "gh-unavailable-stall"
+                            for r in self._runs()))
+
+    def test_recovered_poll_resets_the_stall_counter(self):
+        ref = self._to_validate()                                 # stall already 1 from landing
+        self.worker.pr_status = None
+        dispatcher.tick()
+        self.assertEqual(dispatcher._load_cards()[ref]["validate_stall_fails"], 2)
+        self.worker.pr_status = {"merged": False, "state": "OPEN", "rollup": "PENDING",
+                                 "failed_job": None, "failed_log": None}
+        dispatcher.tick()                                        # gh answers again -> counter drops
+        self.assertNotIn("validate_stall_fails", dispatcher._load_cards()[ref])
 
 
 class ValidateStandTest(_DispatcherBase):
@@ -962,6 +1019,28 @@ class ValidateReviewTest(_DispatcherBase):
         ops.verdict(ref, "green", "теперь всё реально")
         dispatcher.tick()
         self.assertEqual(self._column(ref), "Validate")          # green -> waits for merge
+
+    def test_stale_green_from_prior_cycle_not_reused_after_ci_regression(self):
+        # A green verdict lives for its cycle, not the card's whole life: once a settled green
+        # verdict is followed by a real CI regression (bounce back to In progress, rework), the next
+        # trip through Validate must wait for a fresh review, not treat the old green as still good.
+        ref = self._spawned()
+        ops.verdict(ref, "green", "ок первый цикл")
+        dispatcher.tick()
+        self.assertEqual(self._column(ref), "Validate")          # waits for merge
+        self.worker.pr_status = {"merged": False, "state": "OPEN", "rollup": "FAILURE",
+                                 "failed_job": "CI", "failed_log": "regression"}
+        dispatcher.tick()                                        # CI regresses -> back to rework
+        self.assertEqual(self._column(ref), model.IN_PROGRESS)
+        self.assertNotIn("review_baseline", dispatcher._load_cards()[ref])
+        ops.report(ref, "done", "починил")
+        self.worker.pr_status = None
+        dispatcher.tick()
+        self.assertEqual(self._column(ref), "Validate")
+        self._ci_green()
+        dispatcher.tick()                                        # CI green again -> a fresh reviewer
+        self.assertEqual(len(self.worker.reviewer_spawns), 2)
+        self.assertEqual(self._column(ref), "Validate")          # waits for the new cycle's verdict
 
     def test_return_cap_blocks_after_three_returns(self):
         ref = self._spawned()
@@ -1371,6 +1450,40 @@ class WorkerHostCallsTest(unittest.TestCase):
         self.assertIn(["fetch", "origin", "pipeline/proj-1"], [a for _, a in self.git_calls])
         self.assertIn(["reset", "--hard", "FETCH_HEAD"], [a for _, a in self.git_calls])
         self.assertFalse(any("push" in args for _, args in self.git_calls))
+
+
+class RollupTest(unittest.TestCase):
+    """worker._rollup(): the pure function that folds a PR's statusCheckRollup into one verdict.
+    Must wait for every job to reach a terminal state before calling FAILURE — an early failed job
+    next to a still-running one is a flaky-looking early return, not a settled verdict."""
+
+    def _run(self, name, status, conclusion=None):
+        return {"__typename": "CheckRun", "name": name, "status": status, "conclusion": conclusion}
+
+    def test_all_success_is_success(self):
+        items = [self._run("lint", "COMPLETED", "SUCCESS"), self._run("test", "COMPLETED", "SUCCESS")]
+        self.assertEqual(worker._rollup(items), ("SUCCESS", None))
+
+    def test_one_failed_all_terminal_is_failure(self):
+        items = [self._run("lint", "COMPLETED", "SUCCESS"), self._run("test", "COMPLETED", "FAILURE")]
+        rollup, failed = worker._rollup(items)
+        self.assertEqual(rollup, "FAILURE")
+        self.assertEqual(failed["name"], "test")
+
+    def test_failed_job_next_to_running_job_stays_pending(self):
+        # One job failed, the other is still running: the rollup must not call FAILURE before the
+        # running job finishes.
+        items = [self._run("test", "COMPLETED", "FAILURE"), self._run("e2e", "IN_PROGRESS")]
+        self.assertEqual(worker._rollup(items), ("PENDING", None))
+
+    def test_becomes_failure_once_the_running_job_finishes(self):
+        items = [self._run("test", "COMPLETED", "FAILURE"), self._run("e2e", "COMPLETED", "SUCCESS")]
+        rollup, failed = worker._rollup(items)
+        self.assertEqual(rollup, "FAILURE")
+        self.assertEqual(failed["name"], "test")
+
+    def test_no_checks_is_none(self):
+        self.assertEqual(worker._rollup([]), ("NONE", None))
 
 
 class TeardownTest(unittest.TestCase):

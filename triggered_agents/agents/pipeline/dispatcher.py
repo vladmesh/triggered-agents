@@ -24,7 +24,9 @@ Per-tick order:
                 through gh, once — a merge failure is a final Blocked with the reason, never a
                 retry loop). PR merged (by a human or the dispatcher's own automerge) -> worker
                 workspace torn down (terminals stopped, worktree removed), Done, record dropped.
-                gh unavailable or no PR link -> card untouched, a warn line.
+                PR closed without a merge -> Blocked with the reason. gh unavailable or no PR link
+                -> a warn line; past a fixed number of ticks in a row, a one-time Blocked escalation
+                instead of warning forever.
   3. claim    — top Ready card by position; claim through ops (its guards run), create the Orca
                 worktree off base_branch, run setup+smoke; smoke fail -> Blocked with the log and
                 no head; success -> drop TASK.md and launch the worker head. One claim per tick.
@@ -57,6 +59,9 @@ REVIEW_RETURN_CAP = int(os.environ.get("TA_REVIEW_RETURN_CAP", "3"))
 # How many consecutive orca failures to bring up the reviewer head we tolerate before Blocking the
 # card до vladmesh — a persistent failure must escalate, not retry (and leak a worktree) forever.
 REVIEW_SPAWN_ATTEMPTS = int(os.environ.get("TA_REVIEW_SPAWN_ATTEMPTS", "3"))
+# How many consecutive ticks a Validate card may go without a PR link or with gh unreachable before
+# escalating once to Blocked — a stuck card must eventually surface to a human, not warn forever.
+VALIDATE_STALL_ATTEMPTS = int(os.environ.get("TA_VALIDATE_STALL_ATTEMPTS", "5"))
 _LOG_TAIL_LINES = 40
 # PR link the worker pastes into its report (the done protocol in TASK.md requires it). The last
 # one on the card wins, so a re-opened/re-pushed PR link supersedes an earlier one.
@@ -356,14 +361,17 @@ def _validate(records: dict) -> bool:
     """Drive each Validate card by its PR (zero LLM). Merge stays a human action; the dispatcher
     only reacts to what gh and the stand report:
       merged  -> worker workspace torn down, Done, record dropped (the worker session is over);
+      closed without a merge -> Blocked with the reason, record dropped (a human closed it, or it
+        went stale — the card must not sit in Validate forever waiting for a merge that won't come);
       CI red  -> back to In progress with a scrubbed comment + a nudge to the live worker;
       CI green (layer 1):
         - project without a [stand] section: a one-time verdict comment, waiting for merge;
         - project with a stand: run layer 2 (_stand_gate) — deploy the PR branch to the stand and
           run e2e; only a green stand run posts the pre-merge verdict, a red one retries once then
           Blocks;
-      no PR link in the report / gh down -> card untouched, a warn line in runs.jsonl (a flaky
-      gh must not bounce a card or ping a human).
+      no PR link in the report / gh down -> a warn line in runs.jsonl (a flaky gh must not bounce a
+        card or ping a human on one bad tick); past VALIDATE_STALL_ATTEMPTS ticks in a row, a
+        one-time escalation to Blocked instead of warning forever with no signal.
     Only Validate cards are looked at, so a tick with none never calls gh or the stand. Each card
     is driven in its own try/except (like _bring_up): a failure on one card — an unparseable base
     workspace.toml, a stand host crash — is localized to a warn + a one-time comment, so the tick
@@ -385,12 +393,13 @@ def _validate_card(card: dict, records: dict) -> bool:
     view = ops.show_card(ref)
     pr = _pr_url(view)
     if not pr:
-        STATE.log_run("validate", reference=ref, result="no-pr-ref", level="warn")
-        return False
+        return _validate_stall(ref, "no-pr-ref", rec, records)
     status = worker.poll_pr(pr)
     if status is None:
-        STATE.log_run("validate", reference=ref, result="gh-unavailable", pr=pr, level="warn")
-        return False
+        return _validate_stall(ref, "gh-unavailable", rec, records, pr=pr)
+    # A poll that actually answered ends any stall in progress — reset the counter regardless of
+    # which branch below fires next.
+    changed = bool(rec is not None and rec.pop("validate_stall_fails", None) is not None)
 
     if status["merged"]:
         ws = rec.get("workspace") if rec is not None else None
@@ -404,6 +413,19 @@ def _validate_card(card: dict, records: dict) -> bool:
         if ws:
             worker.teardown(ws)             # stop its terminals, remove the worktree
         STATE.log_run("validate", reference=ref, to="Done", pr=pr)
+        return True
+    if status.get("state", "").upper() == "CLOSED":
+        # Closed without a merge (a human closed it, or gh considers it stale) — the mechanical/
+        # review layers below have nothing left to poll for, so waiting here would hang the card in
+        # Validate forever. The worker workspace is left alive for a human to inspect, same as every
+        # other Blocked-from-Validate path.
+        if rec is not None:
+            _clear_review(rec)
+        ops.add_comment("dispatcher", ref,
+                        f"PR {pr} закрыт без мержа. Карточка в Blocked, нужна ручная разборка.")
+        ops.move_card("dispatcher", ref, "Blocked")
+        records.pop(ref, None)
+        STATE.log_run("validate", reference=ref, to="Blocked", reason="pr-closed", pr=pr)
         return True
     if status["rollup"] == "FAILURE":
         job = status.get("failed_job") or "?"
@@ -441,13 +463,38 @@ def _validate_card(card: dict, records: dict) -> bool:
         elif not _has_marker_since(view, model.MARKER_STAND_GREEN, baseline):
             # Stand project: layer 2 not passed for this code state yet — gate on the stand first.
             # Next tick, with stand-green noted, this falls through to the review gate.
-            return _stand_gate(ref, pr, card, stand_cfg, records, view)
+            return _stand_gate(ref, pr, card, stand_cfg, records, view) or changed
         # Lower layers green (CI for no-stand, stand for stand projects) -> layer 3 review.
         # stand_cfg was already resolved above — pass its presence down instead of re-reading the
         # manifest a second time in the green-review path.
-        return _review_gate(ref, pr, card, records, view, stand_cfg is not None)
+        return _review_gate(ref, pr, card, records, view, stand_cfg is not None) or changed
     STATE.log_run("validate", reference=ref, result=f"ci-{status['rollup'].lower()}", pr=pr)
-    return False
+    return changed
+
+
+def _validate_stall(ref: str, reason: str, rec: dict | None, records: dict, **log_fields) -> bool:
+    """no-pr-ref / gh-unavailable: the dispatcher couldn't even poll this card's PR this tick. A
+    one-off is a silent retry (still worth a warn line for the logs); VALIDATE_STALL_ATTEMPTS in a
+    row escalates once to Blocked so a permanently missing PR link or a dead gh integration surfaces
+    to a human instead of warning forever with no signal. An untracked card (no record — a manual
+    move or a lost cards.json) has nowhere to keep the count, so it stays a bare warn, same as
+    _review_gate does for an untracked card."""
+    STATE.log_run("validate", reference=ref, result=reason, level="warn", **log_fields)
+    if rec is None:
+        return False
+    fails = rec.get("validate_stall_fails", 0) + 1
+    if fails >= VALIDATE_STALL_ATTEMPTS:
+        ws = rec.get("workspace") or "(неизвестен)"
+        _clear_review(rec)
+        ops.add_comment("dispatcher", ref,
+                        f"Validate не может определить статус PR {fails} тиков подряд ({reason}). "
+                        f"Карточка в Blocked, воркспейс {ws} оставлен для разбора.")
+        ops.move_card("dispatcher", ref, "Blocked")
+        records.pop(ref, None)
+        STATE.log_run("validate", reference=ref, to="Blocked", reason=f"{reason}-stall", fails=fails)
+        return True
+    rec["validate_stall_fails"] = fails
+    return True
 
 
 def _validate_error(ref: str, exc: Exception) -> None:

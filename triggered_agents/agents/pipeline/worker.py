@@ -403,8 +403,10 @@ def _check_result(item: dict) -> str:
 
 
 def _rollup(items: list[dict]) -> tuple[str, dict | None]:
-    """Overall CI state from the rollup: 'FAILURE' (with the first failing entry), 'PENDING',
-    'SUCCESS', or 'NONE' when the PR has no checks at all."""
+    """Overall CI state from the rollup: 'PENDING' while any job is still running (even next to an
+    already-failed one — a flaky-looking early failure must not bounce the card before the rest of
+    the suite finishes), then 'FAILURE' (with the first failing entry) once every job is terminal,
+    'SUCCESS' if none failed, or 'NONE' when the PR has no checks at all."""
     if not items:
         return "NONE", None
     first_fail = None
@@ -415,9 +417,11 @@ def _rollup(items: list[dict]) -> tuple[str, dict | None]:
             first_fail = it
         elif r == "pending":
             pending = True
+    if pending:
+        return "PENDING", None
     if first_fail is not None:
         return "FAILURE", first_fail
-    return ("PENDING" if pending else "SUCCESS"), None
+    return "SUCCESS", None
 
 
 def _failed_log(item: dict, lines: int = _GH_LOG_TAIL_LINES) -> str | None:
