@@ -57,6 +57,20 @@ class FallbackSlugTest(unittest.TestCase):
             self.assertRegex(naming.fallback_slug(title), naming.SLUG_RE)
 
 
+class CardSlugTest(unittest.TestCase):
+    def test_explicit_slug_wins(self):
+        self.assertEqual(naming.card_slug({"slug": "my-slug", "title": "T"}), "my-slug")
+
+    def test_falls_back_to_title_transliteration_when_unset(self):
+        self.assertEqual(naming.card_slug({"title": "Fix Login Bug"}), "fix-login-bug")
+
+    def test_blank_slug_falls_back_too(self):
+        self.assertEqual(naming.card_slug({"slug": "  ", "title": "Fix Login Bug"}), "fix-login-bug")
+
+    def test_falls_back_to_reference_when_title_missing(self):
+        self.assertEqual(naming.card_slug({"reference": "personal_site-9"}), "personal-site-9")
+
+
 class CardIdTest(unittest.TestCase):
     def test_extracts_numeric_tail_of_reference(self):
         self.assertEqual(naming.card_id("triggered-agents-218"), "218")

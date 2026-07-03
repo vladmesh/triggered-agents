@@ -42,7 +42,7 @@ def build_task(card: dict, ref: str, pr: str | None, spec: str, base_branch: str
     `pr` is the card's PR link — or None for a contrib (fork) card, which has no PR in this
     pipeline by definition (a human opens it against upstream from the pushed branch afterward);
     `branch`/`head_sha` then point at what to review instead (the worker's own report:done
-    protocol line, dispatcher._contrib_ref)."""
+    protocol line, validate._contrib_ref)."""
     project = card.get("project", "?")
     review_branch = naming.reviewer_branch(ref)
     if pr:

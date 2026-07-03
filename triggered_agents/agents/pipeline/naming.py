@@ -39,6 +39,13 @@ def fallback_slug(title: str) -> str:
     return slug or "task"
 
 
+def card_slug(card: dict) -> str:
+    """The card's explicit slug, or a transliterated fallback from its title — an old/manual card
+    created before the slug field existed still claims fine."""
+    slug = (card.get("slug") or "").strip()
+    return slug if slug else fallback_slug(card.get("title") or card["reference"])
+
+
 def card_id(reference: str) -> str:
     """The numeric tail of a `<project>-<id>` reference, e.g. `"218"` from
     `"triggered-agents-218"`. The reference itself is left untouched everywhere else (board-CLI,
