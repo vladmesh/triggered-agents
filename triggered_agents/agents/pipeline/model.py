@@ -10,6 +10,12 @@ because entering work is not a plain transition: it also picks a worker, checks 
 predecessor is Done, enforces one code task per project, and honours a global cap. Folding
 all that into the move matrix would hide it. So Ready->"In progress" is deliberately absent
 from TRANSITIONS, and `move` to In progress errors with a pointer at `claim`.
+
+steward has every po transition plus one override, Blocked->Done (STEWARD_OVERRIDE): a legal
+replacement for a human editing the board's raw Kanboard API to force a card past review, which is
+what happened on agent-kanban-232/235 and triggered-agents-230. The override still needs a paper
+trail, so ops.move_card requires a non-empty justification comment in the same call before it will
+run it; every other role stays exactly as guarded as before.
 """
 from __future__ import annotations
 
@@ -20,7 +26,7 @@ BOARD_NAME = os.environ.get("TA_PIPELINE_BOARD", "Pipeline")
 
 COLUMNS = ["Идеи", "Ready", "In progress", "Validate", "Blocked", "Done"]
 
-ROLES = ("po", "dispatcher", "worker", "reviewer")
+ROLES = ("po", "dispatcher", "worker", "reviewer", "steward")
 
 TASK_TYPES = ("code", "research", "debug")
 
@@ -70,7 +76,17 @@ TRANSITIONS: dict[str, set[tuple[str, str]]] = {
     # The layer-3 reviewer never moves cards (the dispatcher acts on its verdict, like it does on
     # a worker report). Its only artifacts are the verdict comment and Идеи cards.
     "reviewer": set(),
+    # steward gets every po transition plus one override: Blocked -> Done, a legal replacement for
+    # the raw-API Blocked->Done edits seen on agent-kanban-232/235 and triggered-agents-230. That
+    # override is only safe with a paper trail, so check_move alone does not gate it — ops.move_card
+    # additionally requires a non-empty justification comment in the same call (see STEWARD_OVERRIDE).
+    "steward": {("Идеи", "Ready"), ("Blocked", "Ready"), ("Blocked", "Done")},
 }
+
+# The one transition in TRANSITIONS that needs more than a role/column check: a non-empty
+# justification comment, supplied in the same ops.move_card call. Kept here (not just inline in
+# ops) so model stays the single source of truth for "what Blocked->Done even means".
+STEWARD_OVERRIDE = ("Blocked", "Done")
 
 # Comment markers, single source of truth for ops (and, later, the dispatcher reading back):
 #   [report:done] / [report:blocked]  worker report
@@ -113,6 +129,10 @@ MARKER_VALIDATE_ERROR = "validate:error"
 # dispatcher._watchdog_retry. Never posted on the terminal Blocked (budget exhausted): that one
 # stays a plain [dispatcher] comment, same as before this marker existed.
 MARKER_WATCHDOG_RETRY = "watchdog:retry"
+# The steward's justification for a Blocked->Done override (STEWARD_OVERRIDE), posted by
+# ops.move_card in the same call as the move itself — never a bare [steward] comment, so the
+# reason a card skipped review is always attached to the transition that needed it.
+MARKER_STEWARD_OVERRIDE = "steward:blocked-done"
 
 
 class GuardError(RuntimeError):

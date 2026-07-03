@@ -29,11 +29,17 @@ class RealRegistryTest(unittest.TestCase):
         self.reg.profile(heads.DEFAULT_PROFILE)  # must not raise
 
     def test_starting_profiles_present(self):
-        self.assertEqual(set(self.reg.known()), {"claude-sonnet", "claude-opus", "hermes-flash"})
+        self.assertEqual(set(self.reg.known()),
+                         {"claude-sonnet", "claude-opus", "claude-fable", "hermes-flash"})
 
     def test_claude_profiles_share_the_subscription_resource(self):
-        for pid in ("claude-sonnet", "claude-opus"):
+        for pid in ("claude-sonnet", "claude-opus", "claude-fable"):
             self.assertEqual(self.reg.profile(pid)["resource"], "claude-sub")
+
+    def test_claude_fable_falls_back_to_claude_opus(self):
+        # 2026-07-04 design grill: Fable's fallback is for Fable itself leaving the subscription,
+        # so it stays on claude-sub (claude-opus), not the cross-runtime hermes-flash chain.
+        self.assertEqual(self.reg.profile("claude-fable").get("fallback"), ["claude-opus"])
 
     def test_claude_sonnet_falls_back_to_hermes_flash_cross_runtime(self):
         # 2026-07-03 design session: head-technical retries must prove the switch on a genuinely
@@ -68,6 +74,13 @@ class RenderClaudeTest(unittest.TestCase):
                                    registry=self.reg)
         self.assertTrue(cmd.startswith("BOARD_ROLE=reviewer "))
         self.assertIn("--model opus", cmd)
+
+    def test_renders_claude_fable(self):
+        cmd = heads.render_command("claude-fable", role="steward", prompt="steward the board",
+                                   registry=self.reg)
+        self.assertTrue(cmd.startswith("BOARD_ROLE=steward "))
+        self.assertIn("claude --dangerously-skip-permissions --model fable", cmd)
+        self.assertIn(repr("steward the board"), cmd)
 
 
 class RenderHermesTest(unittest.TestCase):

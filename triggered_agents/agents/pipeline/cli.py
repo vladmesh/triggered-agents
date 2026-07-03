@@ -1,11 +1,14 @@
-"""pipeline agent — the task-pipeline board CLI (PO / dispatcher / worker share one binary).
+"""pipeline agent — the task-pipeline board CLI (PO / dispatcher / worker / steward share one
+binary).
 
 Role is a global `--role` (or env BOARD_ROLE) checked before the command runs: create is
-PO-only, claim is dispatcher-only, report/feedback are worker-only, move/ready defer to the
-transition matrix for the role, comment is open to any role (the role becomes the marker).
+PO- or steward-only, claim is dispatcher-only, report/feedback are worker-only, move/ready defer
+to the transition matrix for the role, comment is open to any role (the role becomes the marker).
 update accepts any role at this layer but is PO-only in ops (GuardError otherwise), same as
-move's per-role matrix. setup/list/show/probe need no role. Guards live in model/ops; this layer
-only wires argv to them and maps failures to exit codes.
+move's per-role matrix. steward gets every po transition (via move/ready) plus one more: Blocked
+-> Done, which additionally needs `move --reason` (a non-empty justification, posted as a comment
+in the same call) — see model.STEWARD_OVERRIDE and ops.move_card. setup/list/show/probe need no
+role. Guards live in model/ops; this layer only wires argv to them and maps failures to exit codes.
 
 `probe --resource <id>` exits 0/1 for green/red (see health.run_builtin_probe), not the generic
 KanboardError/GuardError table below — it is heads.toml's own probe command, run by
@@ -90,6 +93,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p_move = sub.add_parser("move")
     p_move.add_argument("--ref", required=True)
     p_move.add_argument("--to", required=True, dest="to_column")
+    p_move.add_argument("--reason")           # steward's Blocked->Done justification
+    p_move.add_argument("--reason-file")
 
     p_claim = sub.add_parser("claim")
     p_claim.add_argument("--ref", required=True)
@@ -173,7 +178,7 @@ def main(argv=None) -> int:
             return _emit(ops.show_card(args.ref))
 
         if args.cmd == "create":
-            if not _need_role(role, ("po",)):
+            if not _need_role(role, ("po", "steward")):
                 return 2
             desc = _text_arg(args.description, args.description_file)
             return _emit(ops.create_card(
@@ -193,7 +198,8 @@ def main(argv=None) -> int:
         if args.cmd == "move":
             if not _need_role(role, ROLES):
                 return 2
-            return _emit(ops.move_card(role, args.ref, args.to_column))
+            reason = _text_arg(args.reason, args.reason_file)
+            return _emit(ops.move_card(role, args.ref, args.to_column, reason=reason))
         if args.cmd == "claim":
             if not _need_role(role, ("dispatcher",)):
                 return 2
