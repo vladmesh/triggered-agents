@@ -57,6 +57,7 @@ class FakeWorker:
         self.ff_results = {}             # path -> ff_worktree result dict (default: clean no-op ff)
         self.ff_calls = []               # (path, base_branch) every ff_worktree call
         self.contrib_projects = set()    # project names is_contrib() should report True for
+        self.remote_head_shas = {}       # branch -> sha remote_head_sha returns; missing -> None
         self._n = 0
 
     def read_base_branch(self, project):
@@ -128,11 +129,16 @@ class FakeWorker:
         self.stand_runs.append((project, branch))
         return self.stand_result
 
-    def spawn_reviewer(self, project, worker_id, base_branch, review_md, title, pr_branch, review_branch):
+    def spawn_reviewer(self, project, worker_id, base_branch, review_md, title, pr_branch,
+                       review_branch, head_sha=None):
         if self.reviewer_raises:
             raise self.reviewer_raises
-        self.reviewer_spawns.append((project, worker_id, base_branch, title, pr_branch, review_branch))
+        self.reviewer_spawns.append((project, worker_id, base_branch, title, pr_branch,
+                                     review_branch, head_sha))
         return f"/rev/{worker_id}", f"rev-handle-{worker_id}"
+
+    def remote_head_sha(self, project, branch):
+        return self.remote_head_shas.get(branch)
 
     def teardown(self, workspace):
         self.torn_down.append(workspace)
@@ -153,7 +159,7 @@ class _DispatcherBase(unittest.TestCase):
                      "write_task", "launch_worker", "activity", "poll_pr", "notify", "teardown",
                      "read_stand_config", "pr_branch", "run_stand", "spawn_reviewer",
                      "workspace_exists", "workspace_path", "rename_terminal", "merge_pr",
-                     "list_agent_worktrees", "ff_worktree"):
+                     "list_agent_worktrees", "ff_worktree", "remote_head_sha"):
             wp = mock.patch(f"triggered_agents.agents.pipeline.worker.{name}",
                             getattr(self.worker, name))
             wp.start()
@@ -1184,11 +1190,12 @@ class WorkspaceNamingTest(_DispatcherBase):
         dispatcher.tick()   # CI green -> spawns the reviewer
         self.assertEqual(len(self.worker.reviewer_spawns), 1)
         expect_title = naming.reviewer_title(cid, "A")
-        _, worker_id, _, spawned_title, pr_branch, review_branch = self.worker.reviewer_spawns[0]
+        _, worker_id, _, spawned_title, pr_branch, review_branch, head_sha = self.worker.reviewer_spawns[0]
         self.assertEqual(spawned_title, expect_title)
         self.assertTrue(worker_id.startswith(f"review-{cid}-rev-slug"))
         self.assertEqual(pr_branch, naming.worker_branch(ref))
         self.assertEqual(review_branch, naming.reviewer_branch(ref))
+        self.assertIsNone(head_sha)   # a regular PR card never pins a sha (out of scope)
         handle = f"rev-handle-{worker_id}"
         dispatcher.tick()   # no verdict yet -> watchdog path must pin the title again
         self.assertIn((handle, expect_title), self.worker.renamed)
@@ -1781,6 +1788,9 @@ class ValidateContribTest(_DispatcherBase):
 
     def _to_validate(self, sha=SHA):
         ref = self._claim()
+        # remote_head_sha() mirrors this fork's real origin — a fresh push means the branch head
+        # actually is the reported sha, same as a real `git push` would leave it.
+        self.worker.remote_head_shas[self._branch(ref)] = sha
         ops.report(ref, "done", f"готово\nbranch: {self._branch(ref)}\nhead: {sha}")
         dispatcher.tick()
         self.assertEqual(self._column(ref), "Validate")
@@ -1828,6 +1838,78 @@ class ValidateContribTest(_DispatcherBase):
         self.assertEqual(len(stalls), 1)
         self.assertFalse(any(r.get("reason") == "no-pr-ref-stall" for r in runs))
 
+    # sha verification (triggered-agents-240): the report's claimed head must match the branch's
+    # real head on origin before a reviewer is spawned — a worker whose session lives on could keep
+    # pushing after report:done, so the claimed sha alone is not proof of what a review would land
+    # on.
+    def test_sha_mismatch_stalls_without_spawning_reviewer(self):
+        ref = self._claim()
+        branch = self._branch(ref)
+        self.worker.remote_head_shas[branch] = "actualsha9"   # worker kept pushing past the report
+        ops.report(ref, "done", f"готово\nbranch: {branch}\nhead: {self.SHA}")
+        dispatcher.tick()
+        self.assertEqual(self._column(ref), "Validate")       # not Blocked, not In progress — stall
+        self.assertEqual(self.worker.reviewer_spawns, [])      # never reviewed the wrong state
+        runs = self._runs()
+        self.assertTrue(any(r["event"] == "validate" and r.get("result") == "sha-mismatch"
+                            and r.get("level") == "warn" and r.get("branch") == branch
+                            and r.get("reported") == self.SHA and r.get("actual") == "actualsha9"
+                            for r in runs))
+
+    def test_sha_mismatch_gives_a_chance_to_rereport_and_recovers(self):
+        # The worker doesn't have to post a fresh report:done — once the branch on origin catches
+        # up to what was already claimed, the very next tick's check passes and review proceeds.
+        ref = self._claim()
+        branch = self._branch(ref)
+        self.worker.remote_head_shas[branch] = "actualsha9"
+        ops.report(ref, "done", f"готово\nbranch: {branch}\nhead: {self.SHA}")
+        dispatcher.tick()
+        self.assertEqual(self.worker.reviewer_spawns, [])
+        self.worker.remote_head_shas[branch] = self.SHA        # origin now matches the report
+        dispatcher.tick()
+        self.assertEqual(self._column(ref), "Validate")
+        self.assertEqual(len(self.worker.reviewer_spawns), 1)
+        self.assertEqual(self.worker.reviewer_spawns[0][6], self.SHA)
+
+    def test_branch_unreachable_on_origin_stalls_like_sha_mismatch(self):
+        # remote_head_sha returns None (branch not found / remote unreachable) — treated the same
+        # as a mismatch, not as "review the branch's current, unrelated tip".
+        ref = self._claim()
+        branch = self._branch(ref)
+        ops.report(ref, "done", f"готово\nbranch: {branch}\nhead: {self.SHA}")   # no remote_head_shas entry
+        dispatcher.tick()
+        self.assertEqual(self._column(ref), "Validate")
+        self.assertEqual(self.worker.reviewer_spawns, [])
+        self.assertTrue(any(r["event"] == "validate" and r.get("result") == "branch-unavailable"
+                            and r.get("branch") == branch for r in self._runs()))
+
+    def test_sha_mismatch_escalates_after_stall_cap(self):
+        ref = self._claim()
+        branch = self._branch(ref)
+        self.worker.remote_head_shas[branch] = "actualsha9"
+        ops.report(ref, "done", f"готово\nbranch: {branch}\nhead: {self.SHA}")
+        dispatcher.tick()
+        for i in range(2, dispatcher.VALIDATE_STALL_ATTEMPTS):
+            dispatcher.tick()
+            self.assertEqual(self._column(ref), "Validate")
+            self.assertEqual(dispatcher._load_cards()[ref]["validate_stall_fails"], i)
+        dispatcher.tick()
+        self.assertEqual(self._column(ref), "Blocked")
+        self.assertNotIn(ref, dispatcher._load_cards())
+        self.assertEqual(self.worker.reviewer_spawns, [])
+        stalls = [r for r in self._runs() if r["event"] == "validate" and r.get("reason") == "sha-mismatch-stall"]
+        self.assertEqual(len(stalls), 1)
+
+    def test_sha_check_skipped_once_reviewer_already_spawned(self):
+        # The gate applies only before a fresh spawn — once the reviewer is up for this code state,
+        # a later drift on origin (the worker still pushing) must not stall an in-flight review.
+        ref = self._to_validate()
+        self.assertEqual(len(self.worker.reviewer_spawns), 1)
+        self.worker.remote_head_shas[self._branch(ref)] = "driftedsha"
+        dispatcher.tick()                                     # watchdog path, not a re-check
+        self.assertEqual(self._column(ref), "Validate")
+        self.assertEqual(len(self.worker.reviewer_spawns), 1)  # no second spawn, no stall
+
     def test_report_with_branch_and_sha_greenlights_layer1_once(self):
         ref = self._to_validate()
         dispatcher.tick()                            # second green tick must not re-post
@@ -1839,8 +1921,9 @@ class ValidateContribTest(_DispatcherBase):
     def test_spawns_reviewer_off_reported_branch_without_gh(self):
         ref = self._to_validate()
         self.assertEqual(len(self.worker.reviewer_spawns), 1)
-        _, _, _, _, pr_branch, _ = self.worker.reviewer_spawns[0]
+        _, _, _, _, pr_branch, _, head_sha = self.worker.reviewer_spawns[0]
         self.assertEqual(pr_branch, self._branch(ref))     # naming.worker_branch(ref), no gh call
+        self.assertEqual(head_sha, self.SHA)   # pinned to the reported sha, not the branch's tip
         self.assertEqual(self.worker.polled, [])
 
     def test_green_verdict_goes_straight_to_done_and_tears_down(self):
@@ -1868,7 +1951,9 @@ class ValidateContribTest(_DispatcherBase):
             ops.verdict(ref, "red", f"блокер {i}")
             dispatcher.tick()
             self.assertEqual(self._column(ref), model.IN_PROGRESS)
-            ops.report(ref, "done", f"fix\nbranch: {self._branch(ref)}\nhead: sha{i}")
+            sha = f"aaaaaa{i}"                                # valid hex, distinct each rework
+            self.worker.remote_head_shas[self._branch(ref)] = sha
+            ops.report(ref, "done", f"fix\nbranch: {self._branch(ref)}\nhead: {sha}")
             dispatcher.tick()                                # -> Validate
             dispatcher.tick()                                # -> reviewer up again
         ops.verdict(ref, "red", "сверх капа")
@@ -1881,11 +1966,13 @@ class ValidateContribTest(_DispatcherBase):
         ops.verdict(ref, "red", "блокер: X")
         dispatcher.tick()
         self.assertEqual(self._column(ref), model.IN_PROGRESS)
+        self.worker.remote_head_shas[self._branch(ref)] = "def5678"
         ops.report(ref, "done", f"починил\nbranch: {self._branch(ref)}\nhead: def5678")
         dispatcher.tick()
         self.assertEqual(self._column(ref), "Validate")
         dispatcher.tick()                                    # fresh reviewer off the new head
         self.assertEqual(len(self.worker.reviewer_spawns), 2)
+        self.assertEqual(self.worker.reviewer_spawns[1][6], "def5678")  # pinned to the reworked sha
         ops.verdict(ref, "green", "теперь всё реально")
         dispatcher.tick()
         self.assertEqual(self._column(ref), "Done")
@@ -2180,6 +2267,16 @@ class WorkerHostCallsTest(unittest.TestCase):
         self.assertIn(["fetch", "origin", "pipeline/proj-1"], [a for _, a in self.git_calls])
         self.assertIn(["reset", "--hard", "FETCH_HEAD"], [a for _, a in self.git_calls])
         self.assertFalse(any("push" in args for _, args in self.git_calls))
+
+    def test_spawn_reviewer_with_head_sha_pins_reset_to_it_not_fetch_head(self):
+        # triggered-agents-240: a contrib card passes head_sha (the sha its report claimed) — the
+        # reviewer must land on exactly that commit, not the branch's live tip.
+        with mock.patch.object(self.worker, "_write_excluded", lambda *a: "/ws/fresh/REVIEW.md"):
+            self.worker.spawn_reviewer("proj", "rev-1", "main", "REVIEW body", "review A-1: title",
+                                       "pipeline/proj-1", "review/proj-1", head_sha="deadbeef")
+        self.assertIn(["fetch", "origin", "pipeline/proj-1"], [a for _, a in self.git_calls])
+        self.assertIn(["reset", "--hard", "deadbeef"], [a for _, a in self.git_calls])
+        self.assertFalse(any(a == ["reset", "--hard", "FETCH_HEAD"] for _, a in self.git_calls))
 
 
 class RollupTest(unittest.TestCase):
