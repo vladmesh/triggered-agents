@@ -134,14 +134,21 @@ def _is_done(task: dict, pid: int) -> bool:
 def create_card(project: str, task_type: str, title: str, description: str = "",
                 ref: str | None = None, column: str = "Идеи",
                 blocked_by: str | None = None, head: str | None = None,
-                slug: str | None = None) -> dict:
-    """PO-only: create a spec card in Идеи or Ready, keyed by reference, with metadata.
+                slug: str | None = None, role: str | None = None) -> dict:
+    """PO/steward: create a spec card in Идеи or Ready, keyed by reference, with metadata.
 
     `slug` names the card's future worker/reviewer workspace (`<reference>-<slug>`); when
     omitted, claim falls back to a transliterated slug of the title (naming.fallback_slug) so an
     old/manual card without one still claims fine. `head`, when given, must name a profile in
     heads.toml (checked before anything is written); omitted, the card gets heads.DEFAULT_PROFILE
-    at bring-up."""
+    at bring-up.
+
+    `role="steward"` scrubs title/description the same way add_comment does for steward — the
+    escalation/idea path SKILL.md sends steward through (create in Идеи/Ready, then move to
+    Blocked) is exactly where a quoted transcript/journalctl/env line could carry a raw secret
+    (2026-07-04 review, triggered-agents-244 blocker B1 third round). Every other caller
+    (po, reviewer_idea — which scrubs itself before calling here) passes no role and stays
+    verbatim, unchanged from before."""
     if task_type not in model.TASK_TYPES:
         raise model.GuardError(f"unknown task_type {task_type!r} (types: {', '.join(model.TASK_TYPES)})")
     if column not in ("Идеи", "Ready"):
@@ -150,6 +157,9 @@ def create_card(project: str, task_type: str, title: str, description: str = "",
         raise model.GuardError(f"slug {slug!r} must match [a-z0-9-]{{1,30}}")
     if head:
         _check_head(head)
+    if role == "steward":
+        title = worker.scrub_secrets(title)
+        description = worker.scrub_secrets(description)
     pid = board_id()
     col_id = _column_id(pid, column)
     sw_id = _ensure_swimlane(pid, project)

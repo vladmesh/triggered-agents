@@ -184,7 +184,7 @@ def main(argv=None) -> int:
             return _emit(ops.create_card(
                 project=args.project, task_type=args.task_type, title=args.title,
                 description=desc, ref=args.ref, column=args.column,
-                blocked_by=args.blocked_by, head=args.head, slug=args.slug))
+                blocked_by=args.blocked_by, head=args.head, slug=args.slug, role=role))
         if args.cmd == "update":
             if not _need_role(role, ROLES):
                 return 2

@@ -275,6 +275,32 @@ class TestCreate(PatchedBoardTest):
             ops.create_card("personal_site", "code", "T", head="codex-nope")
         self.assertEqual(board.tasks, {})
 
+    def test_steward_role_scrubs_title_and_description(self):
+        """2026-07-04 review, triggered-agents-244 blocker B1 (third round): SKILL.md sends
+        steward through exactly this path (create in Идеи/Ready, then escalate to Blocked) to
+        write up an anomaly it dug into via transcripts/journalctl/env — same reasoning as the
+        scrub already applied to steward's add_comment."""
+        board = self.make_board()
+        ops.create_card(
+            "triggered-agents", "code", "секрет API_TOKEN=supersecretvalue123 в заголовке",
+            description="тело: KANBOARD_SECRET=anothersecretvalue999", role="steward")
+        created = board.method_calls("createTask")
+        self.assertNotIn("supersecretvalue123", created[0]["title"])
+        self.assertNotIn("anothersecretvalue999", created[0]["description"])
+
+    def test_po_role_is_not_scrubbed(self):
+        board = self.make_board()
+        ops.create_card("personal_site", "code", "token KANBOARD_API_TOKEN=supersecretvalue123",
+                        role="po")
+        created = board.method_calls("createTask")
+        self.assertIn("supersecretvalue123", created[0]["title"])
+
+    def test_no_role_is_not_scrubbed_backward_compatible(self):
+        board = self.make_board()
+        ops.create_card("personal_site", "code", "token KANBOARD_API_TOKEN=supersecretvalue123")
+        created = board.method_calls("createTask")
+        self.assertIn("supersecretvalue123", created[0]["title"])
+
 
 class TestUpdate(PatchedBoardTest):
     def test_partial_update_touches_only_given_field(self):
@@ -780,6 +806,17 @@ class TestCliStewardRole(PatchedBoardTest):
                             "--type", "code", "--title", "T"])
         self.assertEqual(rc, 0)
         self.assertEqual(len(board.tasks), 1)
+
+    def test_steward_create_via_cli_is_scrubbed(self):
+        board = self.make_board()
+        rc = self.cli.main(["--role", "steward", "create", "--project", "triggered-agents",
+                            "--type", "code",
+                            "--title", "нашёл KANBOARD_API_TOKEN=supersecretvalue123",
+                            "--description", "AWS_SECRET=anothersecretvalue999"])
+        self.assertEqual(rc, 0)
+        created = board.method_calls("createTask")
+        self.assertNotIn("supersecretvalue123", created[0]["title"])
+        self.assertNotIn("anothersecretvalue999", created[0]["description"])
 
     def test_steward_move_blocked_to_done_with_reason_ok(self):
         board = self.make_board()
