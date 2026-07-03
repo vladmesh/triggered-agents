@@ -93,25 +93,34 @@ def _stale_signals(mark: dict) -> tuple[list[dict], dict]:
     """Cards past STALE_HOURS in their current column, excluding ones already notified at their
     current date_moved — a card that moves again re-arms the check; one that just sits still,
     already flagged once, does not re-fire every hour. (new stale hits, {ref: date_moved} for
-    every card currently in a watched column — the next watermark)."""
+    every card ACTUALLY reported stale this scan or a previous one at its still-current
+    date_moved — the next watermark).
+
+    notified_stale must only ever hold refs that crossed the threshold — never a fresh,
+    not-yet-stale card. A scan runs on ANY signal (not just a stale one), so if a not-yet-stale
+    card's date_moved were written here too, the very next scan's dedup check
+    (`notified.get(ref) == moved`) would already match it — permanently immunizing it against
+    ever firing once it genuinely does cross the threshold later, since date_moved never changes
+    while it just sits still (2026-07-04 review, triggered-agents-244 blocker B1 second round)."""
     now = time.time()
     threshold = STALE_HOURS * 3600
     notified = mark["notified_stale"]
     hits = []
-    current = {}
+    next_notified = {}
     for column in STALE_COLUMNS:
         for card in pipeline_ops.list_cards(column=column):
             moved = card.get("date_moved")
             if not moved:
                 continue
             ref = card["reference"]
-            current[ref] = moved
             if now - moved < threshold:
-                continue
+                continue  # not stale yet — never recorded, so it can still fire once it is
             if notified.get(ref) == moved:
+                next_notified[ref] = moved  # already reported at this exact dwell — stay silent
                 continue
             hits.append({"reference": ref, "column": column, "since": moved})
-    return hits, current
+            next_notified[ref] = moved  # just reported — suppress until it moves again
+    return hits, next_notified
 
 
 def _resource_signals(mark: dict) -> tuple[dict, dict]:

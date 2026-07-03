@@ -173,6 +173,32 @@ class StaleSignalsTest(StewardTestBase):
         batch = signals.scan()
         self.assertEqual(len(batch["signals"]["stale"]), 1)
 
+    def test_fresh_card_is_never_watermarked_just_by_an_unrelated_scan(self):
+        """2026-07-04 review, triggered-agents-244 blocker B1 (second round): a NOT-yet-stale
+        card's date_moved must never land in notified_stale just because some OTHER signal
+        (an unrelated Blocked card, here) triggered a scan+advance while it was still fresh."""
+        moved_at = int(time.time()) - 60  # just moved, one minute ago — nowhere near stale
+        self.board.add_task("A", "Ready", meta={"project": "personal_site"})
+        self.board.tasks[1]["date_moved"] = moved_at
+        self.board.add_task("B", "Blocked", meta={"project": "personal_site"})  # unrelated signal
+        signals.STATE.save_watermark(signals.scan()["pending"])
+        mark = signals.load_watermark()
+        self.assertNotIn("personal_site-1", mark["notified_stale"])
+
+    def test_fresh_card_swept_by_an_unrelated_signal_still_fires_once_it_goes_stale(self):
+        """The consequence of the bug above: without the fix, A's date_moved would already be
+        cached as "seen" from the scan below, so it could never fire once genuinely stale."""
+        moved_at = int(time.time()) - 60
+        self.board.add_task("A", "Ready", meta={"project": "personal_site"})
+        self.board.tasks[1]["date_moved"] = moved_at
+        self.board.add_task("B", "Blocked", meta={"project": "personal_site"})
+        signals.STATE.save_watermark(signals.scan()["pending"])
+        # wall-clock now moves past the threshold from A's own, UNCHANGED date_moved
+        future = moved_at + int(signals.STALE_HOURS * 3600) + 10
+        with mock.patch("time.time", return_value=future):
+            batch = signals.scan()
+        self.assertEqual([h["reference"] for h in batch["signals"]["stale"]], ["personal_site-1"])
+
 
 class ResourceSignalsTest(StewardTestBase):
     def test_flip_is_a_signal_steady_state_is_not(self):
