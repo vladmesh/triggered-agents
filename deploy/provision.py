@@ -168,6 +168,19 @@ def ensure_automation(spec: dict, workspace: Path) -> str | None:
     return aid
 
 
+def _precheck_gate(agent: str, precheck: str, dispatch: str) -> str:
+    """Bash snippet three-way on precheck's own exit code, not just true/false: 0 -> dispatch,
+    1 -> nothing to do (still a clean unit run, not a failure), anything else -> precheck itself
+    broke (Kanboard down, bad env) — propagate that exit code so the unit is recorded as failed
+    in journalctl, distinguishable there from a plain skip. Also NOT Orca's automation --precheck
+    field: `automations run` is trigger=manual and Orca only honors precheck for trigger=scheduled
+    (service.ts), which never ticks headless. So the gate lives here instead."""
+    return (f"{precheck}; rc=$?; "
+            f"if [ $rc -eq 0 ]; then exec {dispatch}; "
+            f'elif [ $rc -eq 1 ]; then echo "[ta-{agent}] precheck: no change, run skipped"; '
+            f'else echo "[ta-{agent}] precheck: ERROR (rc=$rc) — see runs.jsonl" >&2; exit $rc; fi')
+
+
 def _service_unit(agent: str, calendar: str, workspace: Path, precheck: str,
                   env_file: str = "") -> str:
     # Dispatch is our singleton terminal driver, NOT `orca automations run`: the latter dispatches
@@ -175,16 +188,7 @@ def _service_unit(agent: str, calendar: str, workspace: Path, precheck: str,
     # scheduled runs, which don't tick headless), so heads pile up. The driver converges the
     # workspace to one warm claude terminal and reuses it. See runtime/dispatch.py.
     dispatch = f"python3 -m triggered_agents {agent} dispatch"
-    if precheck:
-        # Change-detection gate. Also NOT Orca's automation --precheck field: `automations run`
-        # is trigger=manual and Orca only honors precheck for trigger=scheduled (service.ts),
-        # which never ticks headless. So gate here: precheck in the workspace (cwd on sys.path
-        # for `python3 -m`), dispatch only on exit 0, exit 0 either way so a skip isn't a unit
-        # failure.
-        gate = (f"if {precheck}; then exec {dispatch}; "
-                f'else echo "[ta-{agent}] precheck: no change, run skipped"; fi')
-    else:
-        gate = f"exec {dispatch}"
+    gate = _precheck_gate(agent, precheck, dispatch) if precheck else f"exec {dispatch}"
     env_line = f"EnvironmentFile={env_file}\n" if env_file else ""
     return f"""[Unit]
 Description=triggered-agents: {agent} {calendar} tick (precheck gate + singleton terminal dispatch)

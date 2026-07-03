@@ -159,17 +159,27 @@ def _worker_id(card: dict) -> str:
 
 def precheck() -> int:
     """Exit 0 when there is work: a Ready card to claim, an In-progress card to advance, or a
-    Validate card whose PR needs polling. Cheap: one board list, before any worktree/head is
-    touched."""
-    cards = ops.list_cards()
+    Validate card whose PR needs polling. Exit 1 when precheck ran fine and found nothing to do.
+    Exit 2 when precheck itself failed (Kanboard unreachable, broken env) — a distinct outcome
+    from a plain skip, so a dead board doesn't read as "nothing to do" in journalctl/runs.jsonl.
+    Every run logs exactly one event to runs.jsonl regardless of outcome, so health-check can
+    tell a live-but-idle dispatcher from one that stopped ticking. Cheap: one board list, before
+    any worktree/head is touched."""
+    try:
+        cards = ops.list_cards()
+    except Exception as e:  # noqa: BLE001 — any precheck failure must be logged, not just KanboardError
+        scrubbed = worker.scrub_secrets(str(e))
+        STATE.log_run("precheck", result="error", error_class=type(e).__name__, error=scrubbed)
+        print(f"pipeline: precheck failed ({type(e).__name__}): {scrubbed}", file=sys.stderr)
+        return 2
     ready = [c for c in cards if c["column"] == "Ready"]
     inflight = [c for c in cards if c["column"] == model.IN_PROGRESS and c["claim"]]
     validating = [c for c in cards if c["column"] == "Validate"]
     if ready or inflight or validating:
-        STATE.log_run("precheck", result="dispatch", ready=len(ready), inflight=len(inflight),
+        STATE.log_run("precheck", result="dispatched", ready=len(ready), inflight=len(inflight),
                       validating=len(validating))
         return 0
-    STATE.log_run("precheck", result="skip")
+    STATE.log_run("precheck", result="nothing-to-do")
     print("pipeline: nothing Ready, in flight or validating — SKIP", file=sys.stderr)
     return 1
 

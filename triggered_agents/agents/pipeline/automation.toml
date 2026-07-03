@@ -18,3 +18,10 @@ randomized_delay_sec = 20
 # Kanboard-креды для precheck и тика: агенты с LLM-головой сорсят .env сами, детерминированному
 # диспетчеру их отдаёт юнит.
 env_file = "/home/dev/control-panel/.env"
+
+[health]
+# Freshness budget for health.py's runs.jsonl check: named cadences ("hourly"/"daily") get a
+# built-in default there, but this agent's calendar is a raw 3-min OnCalendar expression, not one
+# of those names. 900s is 5x the tick period — enough slack for jitter/an occasional slow tick
+# without hiding a dead precheck for long.
+max_age_s = 900

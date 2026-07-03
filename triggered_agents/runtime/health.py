@@ -1,9 +1,12 @@
 """Health check for every registered triggered-agent.
 
-One line per agent: is the systemd timer active, and how fresh is the last tick in
-runs.jsonl (any event counts — precheck-skip still proves the timer fires and the
-runtime runs). Last `advance` is informational: it can legitimately be days old when
-nothing changed upstream. Exit non-zero if any agent is red.
+One line per agent: is the systemd timer active, and how fresh is the last *healthy* tick in
+runs.jsonl (any non-error event counts — precheck-nothing-to-do still proves the timer fires and
+the runtime runs). An event with result "error" does NOT count on its own: precheck logs one of
+those every tick a broken Kanboard/env keeps failing, so if freshness went by the raw last event
+a permanently down board would look perpetually alive (fresh error every 3 minutes) instead of
+red. Last `advance` is informational: it can legitimately be days old when nothing changed
+upstream. Exit non-zero if any agent is red.
 
 State lives in the agent's worktree (the systemd unit's WorkingDirectory), not in this
 checkout — so we look under the dispatch workspace, honoring TA_STATE the same way the
@@ -32,9 +35,14 @@ def _max_age_s(agent: str) -> int:
         return int(_ENV_MAX_AGE)
     try:
         spec = tomllib.loads((_REPO_ROOT / "triggered_agents" / "agents" / agent / "automation.toml").read_text())
-        cadence = spec.get("systemd", {}).get("calendar", "hourly")
     except (OSError, tomllib.TOMLDecodeError):
-        cadence = "hourly"
+        return 3 * 3600
+    # An explicit [health] max_age_s wins — needed for a calendar like pipeline's raw 3-min
+    # OnCalendar expression, which isn't one of the named cadences below.
+    explicit = spec.get("health", {}).get("max_age_s")
+    if explicit is not None:
+        return int(explicit)
+    cadence = spec.get("systemd", {}).get("calendar", "hourly")
     return _CADENCE_MAX_AGE_S.get(cadence, 3 * 3600)
 
 
@@ -79,11 +87,16 @@ def check(agents: tuple[str, ...]) -> int:
             problems.append("no runs.jsonl yet")
             last_tick = last_advance = None
         else:
-            last_tick = runs[-1]
-            age = _age_s(last_tick["ts"])
-            max_age = _max_age_s(agent)
-            if age > max_age:
-                problems.append(f"last tick {int(age / 60)}min ago (> {max_age // 60}min)")
+            healthy = [r for r in runs if r.get("result") != "error"]
+            if not healthy:
+                problems.append("only error events so far — board/env never came up")
+                last_tick = runs[-1]
+            else:
+                last_tick = healthy[-1]
+                age = _age_s(last_tick["ts"])
+                max_age = _max_age_s(agent)
+                if age > max_age:
+                    problems.append(f"last healthy tick {int(age / 60)}min ago (> {max_age // 60}min)")
             last_advance = next((r for r in reversed(runs) if r.get("event") == "advance"), None)
         status = "RED " if problems else "OK  "
         tick = last_tick["ts"] if last_tick else "-"

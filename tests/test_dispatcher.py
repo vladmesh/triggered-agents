@@ -187,11 +187,14 @@ class DispatcherTest(_DispatcherBase):
     def test_precheck_skip_when_empty(self):
         rc = dispatcher.precheck()
         self.assertEqual(rc, 1)
-        self.assertTrue(any(r["event"] == "precheck" and r.get("result") == "skip" for r in self._runs()))
+        self.assertTrue(any(r["event"] == "precheck" and r.get("result") == "nothing-to-do"
+                             for r in self._runs()))
 
     def test_precheck_dispatch_when_ready(self):
         self._ready_card("A")
         self.assertEqual(dispatcher.precheck(), 0)
+        self.assertTrue(any(r["event"] == "precheck" and r.get("result") == "dispatched"
+                             for r in self._runs()))
 
     def test_precheck_dispatch_when_inflight(self):
         self.board.add_task("A", "In progress", swimlane="personal_site",
@@ -204,6 +207,16 @@ class DispatcherTest(_DispatcherBase):
         self.board.add_task("A", "Validate", swimlane="personal_site",
                             meta={model.META_TASK_TYPE: "code", model.META_PROJECT: "personal_site"})
         self.assertEqual(dispatcher.precheck(), 0)
+
+    # Kanboard недоступен/битый env: исход error, ненулевой выход отличимый от nothing-to-do (1)
+    def test_precheck_error_when_board_unreachable(self):
+        with mock.patch.object(ops, "list_cards", side_effect=RuntimeError("connection refused")):
+            rc = dispatcher.precheck()
+        self.assertEqual(rc, 2)
+        self.assertNotEqual(rc, 1)  # must differ from the plain-skip exit code
+        runs = [r for r in self._runs() if r["event"] == "precheck"]
+        self.assertTrue(any(r.get("result") == "error" and r.get("error_class") == "RuntimeError"
+                             for r in runs))
 
     # claim + bring-up ------------------------------------------------------
     def test_tick_claims_and_launches(self):
