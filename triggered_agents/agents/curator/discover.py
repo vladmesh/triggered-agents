@@ -13,12 +13,23 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 from pathlib import Path
 
 # Claude project-dir naming: cwd path with every "/" turned into "-", leading "-".
 # Overridable via TA_CLAUDE_PROJECTS_DIR so a run (e.g. an e2e on fixtures) can point the
 # scan at a synthetic tree instead of the live ~/.claude/projects.
 CLAUDE_PROJECTS = Path(os.environ.get("TA_CLAUDE_PROJECTS_DIR", str(Path.home() / ".claude" / "projects")))
+
+# Hermes home. Overridable via TA_HERMES_HOME_DIR for the same reason as
+# TA_CLAUDE_PROJECTS_DIR above. On this host Hermes 0.17.0 stores sessions in a shared
+# SQLite DB (hermes_state.py: "replacing the per-session JSONL file approach") rather than
+# the per-session `session_*.json` files under a `sessions/` dir that the Orca ai-vault
+# scanner (our format reference) still expects -- that dir exists but is always empty here.
+# We read the live schema instead of the stale file-based reference.
+HERMES_HOME = Path(os.environ.get("TA_HERMES_HOME_DIR", str(Path.home() / ".hermes")))
+HERMES_STATE_DB = HERMES_HOME / "state.db"
+HERMES_MEMORY_DIR = HERMES_HOME / "memories"
 
 # cwd prefixes whose sessions we never harvest — the triggered-agents' own runs, so no
 # triggered-agent (curator included) harvests itself or its siblings:
@@ -95,9 +106,66 @@ def claude_sessions() -> list[dict]:
     return out
 
 
+def _hermes_query(sql: str, params: tuple = ()) -> list[tuple] | None:
+    """Run one read-only query against state.db. Returns None (not []) on any sqlite
+    failure -- a corrupted or transiently write-locked DB must degrade Hermes discovery
+    to empty, not raise and take down the whole harvest tick, including the unrelated
+    Claude side."""
+    try:
+        # Read-only: state.db is live-written by real Hermes sessions (WAL mode per its
+        # own docstring, concurrent readers are safe) -- the curator only ever reads it.
+        con = sqlite3.connect(f"file:{HERMES_STATE_DB}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return None
+    try:
+        return con.execute(sql, params).fetchall()
+    except sqlite3.Error:
+        return None
+    finally:
+        con.close()
+
+
+def hermes_sessions() -> list[dict]:
+    """List Hermes sessions from ~/.hermes/state.db as {head, path, session_id, cwd},
+    self-excluded by cwd like claude_sessions(). `path` is the shared state.db for every
+    row -- unlike Claude's one-file-per-session layout, harvest.py watermarks Hermes by
+    session_id, not by this path."""
+    out = []
+    if not HERMES_STATE_DB.is_file():
+        return out
+    rows = _hermes_query("SELECT id, cwd FROM sessions WHERE archived = 0 ORDER BY id")
+    if not rows:
+        return out
+    for session_id, cwd in rows:
+        cwd = cwd or ""
+        if cwd and _excluded(cwd):
+            continue
+        out.append({"head": "hermes", "path": str(HERMES_STATE_DB), "session_id": session_id, "cwd": cwd})
+    return out
+
+
+def hermes_messages(session_id: str, since_id: int = 0) -> list[dict]:
+    """Return {id, role, content, timestamp} rows for one Hermes session, id > since_id.
+
+    `active = 1` matches hermes_state.py's own default message-load filter: a /rollback
+    (checkpoint restore) soft-deletes superseded messages by flipping active to 0 rather
+    than removing the row, and those never became conversation the user acted on.
+    """
+    if not HERMES_STATE_DB.is_file():
+        return []
+    rows = _hermes_query(
+        "SELECT id, role, content, timestamp FROM messages "
+        "WHERE session_id = ? AND id > ? AND active = 1 ORDER BY id",
+        (session_id, since_id),
+    )
+    if not rows:
+        return []
+    return [{"id": r[0], "role": r[1], "content": r[2], "timestamp": r[3]} for r in rows]
+
+
 def all_sessions() -> list[dict]:
-    """All discoverable sessions across heads (Claude only for now)."""
-    return claude_sessions()
+    """All discoverable sessions across heads."""
+    return claude_sessions() + hermes_sessions()
 
 
 def claude_memory_files() -> list[dict]:
@@ -131,9 +199,29 @@ def claude_memory_files() -> list[dict]:
     return out
 
 
+def hermes_memory_files() -> list[dict]:
+    """List Hermes's built-in personal-memory files (MEMORY.md, USER.md) as {head, path, cwd}.
+
+    Unlike Claude, Hermes keeps ONE global pair of files for the whole install (see
+    tools/memory_tool.py in hermes-agent: MemoryStore reads/writes `<hermes home>/memories/
+    {MEMORY,USER}.md`, entries delimited by a "section sign" separator line) -- not scoped
+    per-project, so there is no cwd to self-exclude on here. cwd is reported as "" (global);
+    the curator applies its usual durable-fact bar to judge relevance instead of a
+    project-path filter.
+    """
+    out = []
+    if not HERMES_MEMORY_DIR.is_dir():
+        return out
+    for name in ("MEMORY.md", "USER.md"):
+        f = HERMES_MEMORY_DIR / name
+        if f.is_file():
+            out.append({"head": "hermes", "path": str(f), "cwd": ""})
+    return out
+
+
 def all_memory_files() -> list[dict]:
-    """All discoverable personal-memory files across heads (Claude only for now)."""
-    return claude_memory_files()
+    """All discoverable personal-memory files across heads."""
+    return claude_memory_files() + hermes_memory_files()
 
 
 if __name__ == "__main__":

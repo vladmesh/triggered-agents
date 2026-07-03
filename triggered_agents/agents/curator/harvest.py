@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import re
+from datetime import datetime, timezone
 from pathlib import Path
 
 from ...runtime.redact import redact
@@ -63,6 +64,80 @@ def parse_claude_lines(lines) -> list[dict]:
     return turns
 
 
+def _iso_ts(ts) -> str | None:
+    if not ts:
+        return None
+    try:
+        return datetime.fromtimestamp(float(ts), tz=timezone.utc).isoformat()
+    except (TypeError, ValueError, OSError):
+        return None
+
+
+def parse_hermes_rows(rows) -> list[dict]:
+    """Extract user/assistant text turns from Hermes state.db message rows.
+
+    Tool-call rows (role="tool", and assistant rows with empty content while a tool
+    call is in flight) are dropped the same way Claude's tool_use/tool_result blocks
+    are dropped in parse_claude_lines -- signal only.
+    """
+    turns = []
+    for row in rows:
+        role = row.get("role")
+        if role not in ("user", "assistant"):
+            continue
+        text = (row.get("content") or "").strip()
+        if not text or _SCAFFOLD.search(text):
+            continue
+        turns.append({"role": role, "text": text, "ts": _iso_ts(row.get("timestamp"))})
+    return turns
+
+
+def _harvest_claude_sessions(mark: dict) -> tuple[list[dict], dict]:
+    sessions_out, pending = [], {}
+    for sess in discover.claude_sessions():
+        path = Path(sess["path"])
+        try:
+            stat = path.stat()
+        except FileNotFoundError:
+            continue
+        prev = mark.get(sess["path"], {})
+        prev_lines = prev.get("lines", 0)
+        if prev.get("mtime") == stat.st_mtime and prev_lines:
+            continue  # unchanged since last run
+        all_lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        new_lines = all_lines[prev_lines:]
+        pending[sess["path"]] = {"lines": len(all_lines), "mtime": stat.st_mtime}
+        if not new_lines:
+            continue
+        turns = parse_claude_lines(new_lines)
+        for t in turns:
+            t["text"] = redact(t["text"])
+        if turns:
+            sessions_out.append({**sess, "turns": turns})
+    return sessions_out, pending
+
+
+def _harvest_hermes_sessions(mark: dict) -> tuple[list[dict], dict]:
+    """Watermarked by session_id -> last message id read, not by (path, mtime)/lines --
+    Hermes sessions share one SQLite file (discover.HERMES_STATE_DB) that is written
+    continuously by every live session, so file-level mtime/line-count doesn't identify
+    which session actually has new turns."""
+    sessions_out, pending = [], {}
+    for sess in discover.hermes_sessions():
+        key = f"hermes:{sess['session_id']}"
+        since_id = mark.get(key, {}).get("last_id", 0)
+        rows = discover.hermes_messages(sess["session_id"], since_id)
+        if not rows:
+            continue
+        pending[key] = {"last_id": rows[-1]["id"]}
+        turns = parse_hermes_rows(rows)
+        for t in turns:
+            t["text"] = redact(t["text"])
+        if turns:
+            sessions_out.append({**sess, "turns": turns})
+    return sessions_out, pending
+
+
 def harvest_memory_files(mark: dict) -> tuple[list[dict], dict]:
     """Read new/changed personal-memory files since the watermark.
 
@@ -90,34 +165,16 @@ def harvest(st) -> dict:
     """Read all new turns and changed memory files since the watermark. Does NOT advance
     the watermark.
 
-    Returns {"sessions": [...], "memory": [...], "pending": {source_path: watermark}}
+    Returns {"sessions": [...], "memory": [...], "pending": {source_key: watermark}}
     where pending is the combined watermark to persist via advance() after the canon commit.
     """
     mark = st.load_watermark()
-    sessions_out, pending = [], {}
-    for sess in discover.all_sessions():
-        path = Path(sess["path"])
-        try:
-            stat = path.stat()
-        except FileNotFoundError:
-            continue
-        prev = mark.get(sess["path"], {})
-        prev_lines = prev.get("lines", 0)
-        if prev.get("mtime") == stat.st_mtime and prev_lines:
-            continue  # unchanged since last run
-        all_lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-        new_lines = all_lines[prev_lines:]
-        pending[sess["path"]] = {"lines": len(all_lines), "mtime": stat.st_mtime}
-        if not new_lines:
-            continue
-        turns = parse_claude_lines(new_lines) if sess["head"] == "claude" else []
-        for t in turns:
-            t["text"] = redact(t["text"])
-        if turns:
-            sessions_out.append({**sess, "turns": turns})
+    claude_out, claude_pending = _harvest_claude_sessions(mark)
+    hermes_out, hermes_pending = _harvest_hermes_sessions(mark)
+    pending = {**claude_pending, **hermes_pending}
     memory_out, mem_pending = harvest_memory_files(mark)
     pending.update(mem_pending)
-    return {"sessions": sessions_out, "memory": memory_out, "pending": pending}
+    return {"sessions": claude_out + hermes_out, "memory": memory_out, "pending": pending}
 
 
 def advance(st, pending: dict) -> None:
