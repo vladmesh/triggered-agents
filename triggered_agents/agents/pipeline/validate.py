@@ -3,7 +3,12 @@ independent layer-3 reviewer head.
 
 layer 1 (mechanical, PR project): poll the card's PR through gh (worker.poll_pr) — CI red bounces
     the card back to In progress with a scrubbed comment and a nudge to the live worker; CI green
-    moves on. A contrib (fork) card has no PR in this pipeline by definition (a human opens it
+    moves on. A rollup stuck on PENDING/NONE (gh answers, but no check ever finishes) is watched by
+    its own time-based watchdog (_ci_pending_watchdog, CI_PENDING_STALL_SECONDS) — a required check
+    that never posts, a job waiting on manual environment approval, or a removed workflow otherwise
+    leaves the card unwatched in Validate forever, the one class neither the worker watchdog
+    (In-progress only) nor the layer-3 review watchdog (fires only after CI-green) covers. A
+    contrib (fork) card has no PR in this pipeline by definition (a human opens it
     against upstream from the pushed branch afterward) — layer 1 there is just the worker's own
     report:done, which must carry `branch:`/`head:` protocol lines instead of a PR link (the
     proof-of-push, parsed back by _contrib_ref); no gh call at all, but the claimed sha is checked
@@ -51,6 +56,14 @@ REVIEW_SPAWN_ATTEMPTS = int(os.environ.get("TA_REVIEW_SPAWN_ATTEMPTS", "3"))
 # How many consecutive ticks a Validate card may go without a PR link or with gh unreachable before
 # escalating once to Blocked — a stuck card must eventually surface to a human, not warn forever.
 VALIDATE_STALL_ATTEMPTS = int(os.environ.get("TA_VALIDATE_STALL_ATTEMPTS", "5"))
+# How long (seconds) a Validate card may sit on a non-terminal CI rollup (PENDING — some check
+# still running, or NONE — no checks at all) before a one-time escalation to Blocked. Distinct from
+# VALIDATE_STALL_ATTEMPTS: gh answers fine every tick here, CI just never reaches a terminal
+# rollup — a required status check nothing ever posts (branch-protection misconfig), a GHA job
+# waiting on manual environment approval, or a removed workflow whose required check stopped
+# arriving. Time-based rather than tick-count: a long-but-real CI run must not misfire, only a
+# rollup that never terminates at all should.
+CI_PENDING_STALL_SECONDS = int(os.environ.get("TA_CI_PENDING_STALL_SECONDS", str(6 * 3600)))
 # PR link the worker pastes into its report (the done protocol in TASK.md requires it). The last
 # one on the card wins, so a re-opened/re-pushed PR link supersedes an earlier one.
 _PR_URL_RE = re.compile(r"https://github\.com/[\w.-]+/[\w.-]+/pull/\d+")
@@ -172,6 +185,11 @@ def run(records: dict, watchdog_seconds: int, save_cards) -> bool:
       no PR link in the report / gh down -> a warn line in runs.jsonl (a flaky gh must not bounce a
         card or ping a human on one bad tick); past VALIDATE_STALL_ATTEMPTS ticks in a row, a
         one-time escalation to Blocked instead of warning forever with no signal.
+      CI stuck on PENDING/NONE (gh answers, but no check ever goes terminal) -> a warn line every
+        tick; past CI_PENDING_STALL_SECONDS of continuous non-terminal rollup, a one-time
+        escalation to Blocked (_ci_pending_watchdog) — a required check nothing posts, a job
+        waiting on manual environment approval, or a removed workflow otherwise sits here forever
+        with no signal to a human.
     A contrib (fork) card skips gh/CI/stand entirely — see _validate_contrib_card.
     Only Validate cards are looked at, so a tick with none never calls gh or the stand. Each card
     is driven in its own try/except (like dispatcher._bring_up): a failure on one card — an
@@ -248,12 +266,20 @@ def _validate_card(card: dict, records: dict, watchdog_seconds: int, save_cards)
             rec["comment_baseline"] = len(ops.show_card(ref)["comments"])
             rec["last_activity"] = time.time()
             rec["stand_fails"] = 0
+            rec.pop("ci_pending_since", None)
             worker.notify(rec.get("handle", ""),
                           f"CI по {pr} красный — джоба «{job}» упала, карточка вернулась в "
                           f"In progress. Разбор в комментарии карточки, почини и снова report done.")
         STATE.log_run("validate", reference=ref, to=model.IN_PROGRESS, reason="ci-red", job=job, pr=pr)
         return True
     if status["rollup"] == "SUCCESS":
+        # SUCCESS is a terminal rollup too (symmetric to the FAILURE reset above): a card that sat
+        # on PENDING for a while before going green must not carry that stale clock into a LATER
+        # PENDING spell (the worker keeps pushing after report:done, or a human re-runs the
+        # workflow) — that would consume the fresh restart's own budget with old, already-green
+        # elapsed time and trip the watchdog on a CI run that only just started.
+        if rec is not None:
+            rec.pop("ci_pending_since", None)
         # Marker checks are scoped to the card's report baseline (reset on every re-entry to
         # Validate) so a rework re-runs each lower layer instead of skipping it on a stale note.
         baseline = int(rec.get("comment_baseline", 0)) if rec is not None else 0
@@ -275,8 +301,7 @@ def _validate_card(card: dict, records: dict, watchdog_seconds: int, save_cards)
         # manifest a second time in the green-review path.
         return _review_gate(ref, pr, card, records, view, stand_cfg is not None,
                             watchdog_seconds, save_cards) or changed
-    STATE.log_run("validate", reference=ref, result=f"ci-{status['rollup'].lower()}", pr=pr)
-    return changed
+    return _ci_pending_watchdog(ref, rec, records, pr, status["rollup"]) or changed
 
 
 def _validate_contrib_card(ref: str, card: dict, rec: dict | None, records: dict, view: dict,
@@ -360,6 +385,45 @@ def _validate_stall(ref: str, reason: str, rec: dict | None, records: dict, **lo
         STATE.log_run("validate", reference=ref, to="Blocked", reason=f"{reason}-stall", fails=fails)
         return True
     rec["validate_stall_fails"] = fails
+    return True
+
+
+def _ci_pending_watchdog(ref: str, rec: dict | None, records: dict, pr: str, rollup: str) -> bool:
+    """CI rollup is PENDING (some check still running) or NONE (no checks configured at all) this
+    tick — neither a verdict nor a stall in establishing the PR (_validate_stall's job): gh answers
+    fine, there is just nothing terminal to react to yet. Tracks how long the card has sat on a
+    non-terminal rollup in `rec["ci_pending_since"]` and, once that exceeds
+    CI_PENDING_STALL_SECONDS, escalates once to Blocked — the "required check nothing ever posts /
+    manual environment approval / removed workflow" class from the card spec, which would otherwise
+    sit in Validate forever with no watchdog at all (worker/reviewer watchdogs only cover their own
+    heads, not this pre-review gh-polling window). An untracked card (no record) has nowhere to
+    keep the clock, so it stays a bare warn, same as _validate_stall does for its own untracked
+    case."""
+    STATE.log_run("validate", reference=ref, result=f"ci-{rollup.lower()}", pr=pr)
+    if rec is None:
+        return False
+    since = rec.get("ci_pending_since")
+    if since is None:
+        rec["ci_pending_since"] = time.time()
+        return True
+    stalled = time.time() - since
+    if stalled <= CI_PENDING_STALL_SECONDS:
+        return False
+    ws = rec.get("workspace") or "(неизвестен)"
+    # A reviewer may already be up (SUCCESS spawned layer 3, then a later push/re-run sent CI back
+    # to PENDING) — tear its throwaway worktree down same as _validate_stall does, so the
+    # escalation never leaks it.
+    clear_review(rec)
+    ops.add_comment(
+        "dispatcher", ref,
+        f"CI по {pr} висит в статусе {rollup} {int(stalled)}s (порог {CI_PENDING_STALL_SECONDS}s) "
+        f"без единого терминального результата — похоже на застрявший навсегда required check, "
+        f"джобу на ручном approval или удалённый воркфлоу. Карточка в Blocked, воркспейс {ws} "
+        f"оставлен для разбора.")
+    ops.move_card("dispatcher", ref, "Blocked")
+    records.pop(ref, None)
+    STATE.log_run("validate", reference=ref, to="Blocked", reason="ci-pending-stall", rollup=rollup,
+                  stalled=int(stalled), pr=pr)
     return True
 
 
@@ -621,6 +685,7 @@ def _review_red(ref: str, pr: str | None, rec: dict, records: dict,
     rec["comment_baseline"] = len(ops.show_card(ref)["comments"])
     rec["last_activity"] = time.time()
     rec["stand_fails"] = 0
+    rec.pop("ci_pending_since", None)
     worker.notify(rec.get("handle", ""),
                   f"Ревью по {phrase} красное — есть блокеры (слой 3). Карточка вернулась в "
                   f"In progress. Разбор в вердикте на карточке, почини и снова report done.")
