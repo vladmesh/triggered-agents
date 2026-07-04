@@ -319,6 +319,65 @@ class TestCreate(PatchedBoardTest):
         self.assertIn("supersecretvalue123", created[0]["title"])
 
 
+class TestWorkerCreateContinuation(PatchedBoardTest):
+    """triggered-agents-261: a worker's own `create` may land straight in Ready only as a
+    continuation of its own approved chain (own_ref itself, or one of its blocked_by
+    predecessors, transitively); anything else into Ready is a GuardError, and Идеи stays
+    ungated same as any other agent idea (reviewer_idea/retro_idea)."""
+
+    def test_ready_without_blocked_by_raises(self):
+        board = self.make_board()
+        own = board.add_task("A", "In progress", meta={model.META_PROJECT: "personal_site"})
+        with self.assertRaises(model.GuardError):
+            ops.create_card("personal_site", "code", "T", column="Ready",
+                            role="worker", own_ref=own)
+        self.assertEqual(len(board.tasks), 1)  # nothing new created
+
+    def test_ready_without_own_ref_raises(self):
+        board = self.make_board()
+        own = board.add_task("A", "In progress", meta={model.META_PROJECT: "personal_site"})
+        with self.assertRaises(model.GuardError):
+            ops.create_card("personal_site", "code", "T", column="Ready",
+                            blocked_by=own, role="worker")
+
+    def test_wrong_project_raises(self):
+        board = self.make_board()
+        own = board.add_task("A", "In progress", meta={model.META_PROJECT: "other_project"})
+        with self.assertRaises(model.GuardError):
+            ops.create_card("personal_site", "code", "T", column="Ready",
+                            blocked_by=own, role="worker", own_ref=own)
+
+    def test_blocked_by_outside_chain_raises(self):
+        board = self.make_board()
+        own = board.add_task("A", "In progress", meta={model.META_PROJECT: "personal_site"})
+        unrelated = board.add_task("B", "Done", meta={model.META_PROJECT: "personal_site"})
+        with self.assertRaises(model.GuardError):
+            ops.create_card("personal_site", "code", "T", column="Ready",
+                            blocked_by=unrelated, role="worker", own_ref=own)
+
+    def test_blocked_by_own_card_directly_ok(self):
+        board = self.make_board()
+        own = board.add_task("A", "In progress", meta={model.META_PROJECT: "personal_site"})
+        out = ops.create_card("personal_site", "code", "implement part 1", column="Ready",
+                              blocked_by=own, role="worker", own_ref=own)
+        self.assertEqual(out["column"], "Ready")
+        self.assertEqual(board.metadata[out["id"]][model.META_BLOCKED_BY], own)
+
+    def test_blocked_by_ancestor_in_chain_ok(self):
+        board = self.make_board()
+        pred = board.add_task("Pred", "Done", meta={model.META_PROJECT: "personal_site"})
+        own = board.add_task("A", "In progress", meta={
+            model.META_PROJECT: "personal_site", model.META_BLOCKED_BY: pred})
+        out = ops.create_card("personal_site", "code", "sibling continuation", column="Ready",
+                              blocked_by=pred, role="worker", own_ref=own)
+        self.assertEqual(out["column"], "Ready")
+
+    def test_idea_column_ungated_no_blocked_by_or_own_ref_needed(self):
+        board = self.make_board()
+        out = ops.create_card("any_project", "code", "random idea", role="worker")
+        self.assertEqual(out["column"], "Идеи")
+
+
 class TestCreateReportCard(PatchedBoardTest):
     """ops.create_report_card — the steward's own wake-up report card (triggered-agents-255):
     straight into In progress, already self-claimed, never through Ready/claim."""
@@ -1036,6 +1095,50 @@ class TestCliStewardRole(PatchedBoardTest):
         rc = self.cli.main(["--role", "worker", "move", "--ref", ref, "--to", "Done",
                             "--reason", "whatever"])
         self.assertEqual(rc, 3)
+
+
+class TestCliWorkerCreate(PatchedBoardTest):
+    """triggered-agents-261 at the CLI seam: worker may now call `create` at all (previously
+    po/steward only), gated further in ops via --own-ref/--blocked-by."""
+
+    def setUp(self):
+        from triggered_agents.agents.pipeline import cli
+        self.cli = cli
+
+    def test_worker_create_idea_ok(self):
+        board = self.make_board()
+        rc = self.cli.main(["--role", "worker", "create", "--project", "personal_site",
+                            "--type", "code", "--title", "T"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(board.tasks), 1)
+
+    def test_worker_create_ready_with_valid_chain_ok(self):
+        board = self.make_board()
+        own = board.add_task("A", "In progress", meta={model.META_PROJECT: "personal_site"})
+        rc = self.cli.main(["--role", "worker", "create", "--project", "personal_site",
+                            "--type", "code", "--title", "continuation",
+                            "--column", "Ready", "--blocked-by", own, "--own-ref", own])
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(board.tasks), 2)
+
+    def test_worker_create_ready_without_own_ref_exits_3(self):
+        board = self.make_board()
+        own = board.add_task("A", "In progress", meta={model.META_PROJECT: "personal_site"})
+        rc = self.cli.main(["--role", "worker", "create", "--project", "personal_site",
+                            "--type", "code", "--title", "continuation",
+                            "--column", "Ready", "--blocked-by", own])
+        self.assertEqual(rc, 3)
+        self.assertEqual(len(board.tasks), 1)
+
+    def test_worker_create_ready_outside_chain_exits_3(self):
+        board = self.make_board()
+        own = board.add_task("A", "In progress", meta={model.META_PROJECT: "personal_site"})
+        unrelated = board.add_task("B", "Done", meta={model.META_PROJECT: "personal_site"})
+        rc = self.cli.main(["--role", "worker", "create", "--project", "personal_site",
+                            "--type", "code", "--title", "continuation",
+                            "--column", "Ready", "--blocked-by", unrelated, "--own-ref", own])
+        self.assertEqual(rc, 3)
+        self.assertEqual(len(board.tasks), 2)  # nothing new created
 
 
 class TestReviewerRole(unittest.TestCase):
