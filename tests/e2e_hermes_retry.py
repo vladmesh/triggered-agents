@@ -40,7 +40,7 @@ os.environ["TA_STATE"] = _STATE_DIR
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from triggered_agents.agents.board.kanboard import call  # noqa: E402
+from triggered_agents.runtime.kanboard import call  # noqa: E402
 from triggered_agents.agents.pipeline import cli, dispatcher, heads, health, model, ops  # noqa: E402
 
 HERMES_TIMEOUT_S = int(os.environ.get("TA_E2E_HERMES_TIMEOUT_S", "240"))

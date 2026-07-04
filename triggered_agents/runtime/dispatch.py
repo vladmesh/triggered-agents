@@ -76,7 +76,7 @@ def _launch_cmd(agent: str, variant: str | None = None, card_ref: str | None = N
     A spec naming a `head` (a profile id in pipeline/heads.toml, e.g. the steward's claude-fable)
     launches through that registry: same adapter/model/fallback machinery a worker/reviewer head
     gets, resolved against this run's live resource health so a red claude-sub falls back to
-    claude-opus instead of launching on a rate-limited account. curator/retro/board name no head
+    claude-opus instead of launching on a rate-limited account. curator/retro name no head
     and keep the bare default-model `claude` invocation they always had. Any failure to resolve
     (a broken heads.toml is itself the kind of anomaly the steward exists to catch) falls back to
     the same bare invocation rather than leaving the agent undispatched for the whole tick.

@@ -28,7 +28,7 @@ os.environ["TA_STATE"] = _STATE_DIR
 # Run as `python3 tests/e2e_pipeline.py`: sys.path[0] is tests/, so add the repo root.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from triggered_agents.agents.board.kanboard import call  # noqa: E402
+from triggered_agents.runtime.kanboard import call  # noqa: E402
 from triggered_agents.agents.pipeline import cli, model  # noqa: E402
 
 _fail = False

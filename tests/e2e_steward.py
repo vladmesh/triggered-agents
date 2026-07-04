@@ -37,7 +37,7 @@ os.environ["TA_WORKSPACES_ROOT"] = _WS_DIR
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # repo root
 
-from triggered_agents.agents.board.kanboard import call  # noqa: E402
+from triggered_agents.runtime.kanboard import call  # noqa: E402
 from triggered_agents.agents.pipeline import cli as pipeline_cli  # noqa: E402
 from triggered_agents.agents.pipeline import model  # noqa: E402
 from triggered_agents.agents.pipeline import ops as pipeline_ops  # noqa: E402

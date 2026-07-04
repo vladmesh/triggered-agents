@@ -15,7 +15,7 @@ _STATE_DIR = tempfile.mkdtemp(prefix="ta-pipeline-test-")
 os.environ["TA_STATE"] = _STATE_DIR
 os.environ.pop("KANBOARD_ADMIN_USER", None)
 
-from triggered_agents.agents.board.kanboard import KanboardError  # noqa: E402
+from triggered_agents.runtime.kanboard import KanboardError  # noqa: E402
 from triggered_agents.agents.pipeline import model, ops  # noqa: E402
 
 

@@ -18,8 +18,8 @@ from __future__ import annotations
 
 import os
 
+from ...runtime.kanboard import KanboardError, call
 from ...runtime.state import AgentState
-from ..board.kanboard import KanboardError, call
 from . import heads, model, naming, worker
 
 STATE = AgentState("pipeline")

@@ -39,7 +39,7 @@ os.environ["TA_STATE"] = _STATE_DIR
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from triggered_agents.agents.board.kanboard import call  # noqa: E402
+from triggered_agents.runtime.kanboard import call  # noqa: E402
 from triggered_agents.agents.pipeline import cli, dispatcher, model, ops, worker  # noqa: E402
 
 _fail = False
