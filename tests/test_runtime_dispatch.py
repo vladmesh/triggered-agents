@@ -75,6 +75,14 @@ class _DispatchBase(unittest.TestCase):
 
         self.idle = True
 
+    def _logged_actions(self):
+        import json
+
+        runs = dispatch.AgentState("agent").dir / "runs.jsonl"
+        if not runs.is_file():
+            return []
+        return [json.loads(l).get("action") for l in runs.read_text(encoding="utf-8").splitlines()]
+
 
 class DispatchRunTest(_DispatchBase):
     def test_fresh_create_ensures_claude_ready_first(self):
@@ -114,6 +122,38 @@ class DispatchRunTest(_DispatchBase):
         self.assertEqual(self.ready_calls, [])
         sent = [c for c in self.orca_calls if c[:2] == ["terminal", "send"]]
         self.assertEqual(len(sent), 2)  # /clear, then the skill
+
+    def test_idle_reuse_diverts_to_fresh_terminal_when_head_is_red(self):
+        """triggered-agents-274: a warm idle terminal keeps whatever head it was spawned with, so
+        a preferred head gone red since spawn must not receive the skill there. Dispatch must
+        leave the idle terminal untouched (no send, no stop/close) and start a fresh one instead,
+        the same shape as a fresh create."""
+        self.terminals = [{"handle": "h1", "title": "✳ Claude Code", "lastOutputAt": 1000}]
+        self.idle = True
+        with mock.patch.object(dispatch, "_reuse_head_is_red", lambda agent: True):
+            dispatch.run("agent")
+        self.assertEqual(self.ready_calls, ["/ws/agent"])
+        create_calls = [c for c in self.orca_calls if c[:2] == ["terminal", "create"]]
+        self.assertEqual(len(create_calls), 1)
+        sent = [c for c in self.orca_calls if c[:2] == ["terminal", "send"]]
+        self.assertEqual(sent, [])
+        stop_or_close = [c for c in self.orca_calls if c[:2] in (["terminal", "stop"], ["terminal", "close"])]
+        self.assertEqual(stop_or_close, [])
+        self.assertEqual(self._logged_actions(), ["reused-red-fallback"])
+
+    def test_idle_reuse_stays_warm_when_head_is_green(self):
+        """Counterpart of the red case above: a green head keeps the existing warm-reuse
+        behavior — no extra terminal spawned, the idle one gets /clear + the skill."""
+        self.terminals = [{"handle": "h1", "title": "✳ Claude Code", "lastOutputAt": 1000}]
+        self.idle = True
+        with mock.patch.object(dispatch, "_reuse_head_is_red", lambda agent: False):
+            dispatch.run("agent")
+        self.assertEqual(self.ready_calls, [])
+        create_calls = [c for c in self.orca_calls if c[:2] == ["terminal", "create"]]
+        self.assertEqual(create_calls, [])
+        sent = [c for c in self.orca_calls if c[:2] == ["terminal", "send"]]
+        self.assertEqual(len(sent), 2)  # /clear, then the skill
+        self.assertEqual(self._logged_actions(), ["reused"])
 
     def test_busy_and_fresh_skips_dispatch_without_prep(self):
         self.terminals = [{"handle": "h1", "title": "✳ Claude Code", "lastOutputAt": 1000}]
@@ -226,6 +266,32 @@ class LaunchCmdTest(unittest.TestCase):
     def test_no_card_ref_leaves_skill_unchanged(self):
         skill, cmd = dispatch._launch_cmd("curator")
         self.assertEqual(skill, "/curate")
+
+
+class ReuseHeadIsRedTest(unittest.TestCase):
+    """`_reuse_head_is_red` against the real automation.toml files — the check idle-reuse makes
+    before sending into a warm terminal (triggered-agents-274)."""
+
+    def test_agent_without_head_field_is_never_red(self):
+        self.assertFalse(dispatch._reuse_head_is_red("curator"))
+
+    def test_steward_head_green_is_not_red(self):
+        from triggered_agents.agents.pipeline import health as pipeline_health
+
+        with mock.patch.object(pipeline_health, "refresh", lambda: {"claude-sub": "green"}):
+            self.assertFalse(dispatch._reuse_head_is_red("steward"))
+
+    def test_steward_head_red_resource_is_red(self):
+        from triggered_agents.agents.pipeline import health as pipeline_health
+
+        with mock.patch.object(pipeline_health, "refresh", lambda: {"claude-sub": "red"}):
+            self.assertTrue(dispatch._reuse_head_is_red("steward"))
+
+    def test_broken_resolution_defaults_to_not_red(self):
+        from triggered_agents.agents.pipeline import health as pipeline_health
+
+        with mock.patch.object(pipeline_health, "refresh", side_effect=RuntimeError("boom")):
+            self.assertFalse(dispatch._reuse_head_is_red("steward"))
 
 
 class StewardReportCardDispatchTest(unittest.TestCase):

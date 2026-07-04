@@ -5,6 +5,7 @@ its worktree, reused across ticks. On a trigger (after precheck passes, under th
 
   * no agent terminal          -> create one running `claude ... <skill>`
   * one idle agent terminal    -> `/clear` it and re-send <skill> (warm reuse, kills nothing)
+  * ...unless its head is red  -> leave the idle terminal alone, start a fresh one on fallback
   * it's busy and fresh        -> leave it working, dispatch nothing
   * it's busy but stuck        -> watchdog: stop the workspace and start one fresh
 
@@ -70,6 +71,31 @@ def _workspace(agent: str) -> str:
     return os.environ.get("TA_WORKSPACE") or str(Path.home() / "orca/workspaces/triggered-agents" / agent)
 
 
+def _load_spec(agent: str) -> dict:
+    return tomllib.loads((_REPO_ROOT / "triggered_agents" / "agents" / agent / "automation.toml").read_text())
+
+
+def _reuse_head_is_red(agent: str) -> bool:
+    """Whether the head named in `agent`'s automation.toml is currently sitting on a red
+    resource — the check idle-reuse needs before sending into an already-warm terminal, since
+    that terminal keeps whatever head it was spawned with and never re-resolves on its own
+    (only a fresh spawn does, via `_launch_cmd`). Best-effort and defaults to green, matching
+    `_launch_cmd`'s own fallback reasoning: a spec with no head, a broken heads.toml, or any
+    resolution failure all mean "nothing to divert from", so idle-reuse only ever skips the warm
+    terminal when a red resource is actually confirmed (triggered-agents-274).
+    """
+    try:
+        head = _load_spec(agent).get("head")
+        if not head:
+            return False
+        from ..agents.pipeline import health as pipeline_health
+        statuses = pipeline_health.refresh()
+        resource = pipeline_health.resource_of(head)
+        return resource is not None and statuses.get(resource, pipeline_health.GREEN) == pipeline_health.RED
+    except Exception:
+        return False
+
+
 def _launch_cmd(agent: str, variant: str | None = None, card_ref: str | None = None) -> tuple[str, str]:
     """(skill, full claude launch command) from the agent's automation.toml.
 
@@ -91,7 +117,7 @@ def _launch_cmd(agent: str, variant: str | None = None, card_ref: str | None = N
     argument), not just tacked onto the rendered command afterward where it could land outside the
     quoted prompt.
     """
-    spec = tomllib.loads((_REPO_ROOT / "triggered_agents" / "agents" / agent / "automation.toml").read_text())
+    spec = _load_spec(agent)
     skill = spec["variants"][variant]["skill"] if variant else spec["skill"]
     if card_ref:
         skill = f"{skill} --card {card_ref}"
@@ -240,6 +266,18 @@ def run(agent: str, variant: str | None = None) -> int:
             _orca(["terminal", "create", "--worktree", f"path:{ws}", "--command", launch])
             state.log_run(event, action="watchdog-restart")
             print(f"dispatch[{agent}]: busy but stuck ({int(quiet)}s silent) — watchdog restart -> {skill}")
+            return 0
+
+        # idle: a warm terminal keeps whatever head it was spawned with, so a preferred head
+        # that's gone red since spawn would otherwise get the skill anyway (only fresh spawns
+        # re-resolve). Divert like a fresh create instead, without touching the idle terminal —
+        # it may still hold a live process (triggered-agents-274).
+        if _reuse_head_is_red(agent):
+            skill, launch = _dispatch_command(agent, variant)
+            _ensure_claude_ready(ws)
+            _orca(["terminal", "create", "--worktree", f"path:{ws}", "--command", launch])
+            state.log_run(event, action="reused-red-fallback")
+            print(f"dispatch[{agent}]: idle terminal's head is red — fresh fallback terminal -> {skill}")
             return 0
 
         # idle: warm reuse, killing nothing -> no ghost. Close only legacy duplicates (one-time).
