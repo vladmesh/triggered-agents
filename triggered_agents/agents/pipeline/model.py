@@ -56,6 +56,12 @@ TASK_TYPES = ("code", "research", "debug")
 #   claim        worker/workspace id, set by the claim command
 #   slug         short [a-z0-9-]{1,30} tag naming the card's worker/reviewer workspace; a card
 #                without one (old/manual) falls back to a transliterated slug of its title
+#   base_branch  overrides the project's manifest base_branch for this card only (worker.
+#                resolve_base_branch): worktree bring-up and PR/merge target both use it instead
+#                of the manifest default. Empty -> manifest base_branch (default main), unchanged
+#                from before this field existed. For sprint shim projects (dnd-simulator): cards
+#                of one sprint all carry base_branch=sprint/NNN-slug so main stays closed until
+#                the sprint's own closing PR.
 #   retry_same   watchdog same-head auto-retries already used on this card's current life (int,
 #                as a string); reset to "" on every arrival in Ready (move_card)
 #   retry_switch watchdog head-switch auto-retries already used (int, as a string); same reset
@@ -70,6 +76,7 @@ META_BLOCKED_BY = "blocked_by"
 META_HEAD = "head"
 META_CLAIM = "claim"
 META_SLUG = "slug"
+META_BASE_BRANCH = "base_branch"
 META_RETRY_SAME = "retry_same"
 META_RETRY_SWITCH = "retry_switch"
 META_RETRY_HEADS = "retry_heads"

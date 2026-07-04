@@ -143,6 +143,14 @@ def read_base_branch(project: str) -> str:
     return _load_manifest(project).get("workspace", {}).get("base_branch", "main")
 
 
+def resolve_base_branch(project: str, card_base_branch: str | None) -> str:
+    """A card's own base_branch (model.META_BASE_BRANCH) wins over the project's manifest
+    lookup — the sprint-shim case (dnd-simulator): a card can pin its worktree/PR/merge target to
+    `sprint/NNN-slug` instead of the manifest's `main`. Empty/None falls back to read_base_branch
+    exactly as before this field existed."""
+    return card_base_branch or read_base_branch(project)
+
+
 def is_contrib(project: str) -> bool:
     """Whether the project's manifest declares `[workspace] contrib = true` — a fork whose
     bring-up must branch off the upstream remote instead of origin (see create_workspace)."""

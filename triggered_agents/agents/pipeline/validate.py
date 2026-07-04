@@ -538,7 +538,7 @@ def _spawn_reviewer(ref: str, pr: str | None, card: dict, rec: dict, records: di
     label = pr if pr else f"ветке `{contrib[0]}` @ `{contrib[1]}`"
     note = f"PR: {pr}" if pr else f"Ветка: `{contrib[0]}` @ `{contrib[1]}`"
     try:
-        base = worker.read_base_branch(project)
+        base = worker.resolve_base_branch(project, card.get("base_branch") or "")
         review_md = reviewer.build_task(card, ref, pr, spec, base,
                                         branch=contrib[0] if contrib else None,
                                         head_sha=contrib[1] if contrib else None)

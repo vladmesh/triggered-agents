@@ -522,15 +522,17 @@ def _format_comment_ts(ts) -> str:
         return str(ts) if ts else "?"
 
 
-def _task_md_metadata(card: dict) -> list[str]:
+def _task_md_metadata(card: dict, base: str) -> list[str]:
     """Metadata block: type, head, slug (always resolved — a card may rely on the fallback),
-    blocked_by only when the card actually has a predecessor."""
+    the resolved base branch (card override or manifest default — worker.resolve_base_branch already
+    picked it before this is rendered), blocked_by only when the card actually has a predecessor."""
     lines = [
         "## Метаданные",
         "",
         f"- тип: {card.get('task_type') or '?'}",
         f"- голова: {card.get('head') or '(не задана — дефолт)'}",
         f"- слаг: {naming.card_slug(card)}",
+        f"- база: {base}",
     ]
     if card.get("blocked_by"):
         lines.append(f"- blocked_by: {card['blocked_by']}")
@@ -555,12 +557,17 @@ def _task_md_history(comments: list[dict]) -> list[str]:
     return lines
 
 
-def _task_md(card: dict, view: dict) -> str:
+def _task_md(card: dict, view: dict, base: str) -> str:
     """The one-time TASK.md handed to the worker head: protocol header, card metadata, the spec,
     and — when the card has prior comments — its full history. A card claimed for the first time
     has no comments, so it gets exactly the header+metadata+spec that existed before this section
     was added (plus the new always-on protocol lines below). A card returning from Blocked or a
     dead head carries its history, so the header also warns that a branch/PR may already exist.
+
+    `base` is the already-resolved base branch (card's own base_branch override, or the project's
+    manifest default — worker.resolve_base_branch, computed once by the caller) — named explicitly
+    in the PR-open instruction so a card with a sprint-shim override never has the worker guess at
+    `gh pr create`'s own default branch.
 
     A contrib (fork) project never opens a PR in this pipeline (a human does it against upstream
     from the pushed branch) — its Done/report protocol replaces the PR-link paragraphs with a
@@ -590,7 +597,7 @@ def _task_md(card: dict, view: dict) -> str:
     else:
         done_clause = (
             f"Done для тебя: код закоммичен туда, локальные тесты зелёные, ветка запушена, PR "
-            f"открыт через `gh` (base — базовая ветка проекта). В коммитах и PR никаких упоминаний "
+            f"открыт через `gh` (base — `{base}`). В коммитах и PR никаких упоминаний "
             f"AI и Co-Authored-By, стиль — как в git log репо."
         )
         report_clause = (
@@ -629,7 +636,7 @@ def _task_md(card: dict, view: dict) -> str:
             f"автора) не трогать, туда не пушить и не мержить.",
             "",
         ]
-    lines += _task_md_metadata(card)
+    lines += _task_md_metadata(card, base)
     lines += [
         naming.memory_block("worker", card.get("project") or "?"),
         "",
@@ -660,12 +667,24 @@ def _bring_up(card: dict, worker_id: str, records: dict, head: str) -> None:
 
     `head` is the profile _claim_next already resolved through health.resolve_head — it may be a
     fallback, not card's own metadata head, so it's recorded verbatim (not re-derived from the
-    card) both for the launch and for _advance's later watchdog-freeze lookup."""
+    card) both for the launch and for _advance's later watchdog-freeze lookup.
+
+    The card's own `base_branch` (model.META_BASE_BRANCH), when set, overrides the project's
+    manifest base_branch for this card only (worker.resolve_base_branch) — the sprint-shim case.
+    Checked against origin first (worker.remote_head_sha): a missing branch goes straight to
+    Blocked with the override named in the reason, never a silent fallback to the manifest/main."""
     ref = card["reference"]
     project = card.get("project") or ""
+    card_base = card.get("base_branch") or ""
     ws = None
     try:
-        base = worker.read_base_branch(project)
+        if card_base and worker.remote_head_sha(project, card_base) is None:
+            _block(ref, "base-branch",
+                   f"карточка задаёт base_branch `{card_base}`, которой нет на origin проекта "
+                   f"`{project}` — фолбэк на манифест/main запрещён, карточка в Blocked до "
+                   f"появления ветки на origin.", base_branch=card_base)
+            return
+        base = worker.resolve_base_branch(project, card_base)
         ws = worker.create_workspace(project, worker_id, base)
         worker.set_branch(ws, naming.worker_branch(ref))
         ok, log = worker.provision(ws)
@@ -674,7 +693,7 @@ def _bring_up(card: dict, worker_id: str, records: dict, head: str) -> None:
                    workspace=ws)
             return
         view = ops.show_card(ref)
-        worker.write_task(ws, _task_md(card, view))
+        worker.write_task(ws, _task_md(card, view, base))
         title = naming.worker_title(naming.card_id(ref), card.get("title") or ref)
         handle = worker.launch_worker(ws, head, worker_id, title)
     except Exception as e:
