@@ -21,5 +21,5 @@ orca = "hourly"
 [systemd]
 # The actual scheduler on this headless box. Unit name is derived as ta-<name>.
 calendar = "hourly"
-randomized_delay_sec = 90   # jitter so the sweep never races a SessionEnd trigger at exactly :00
+randomized_delay_sec = 90   # jitter so the sweep never lands exactly on :00 with the rest of the hourly crowd
 legacy_unit = "curator-sweep"  # one-time: remove the pre-provisioning hand-written unit of this name
