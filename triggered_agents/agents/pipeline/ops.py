@@ -131,12 +131,67 @@ def _is_done(task: dict, pid: int) -> bool:
     return active is not None and int(active) == 0
 
 
+def _blocked_by_chain(pid: int, ref: str) -> set[str]:
+    """`ref` plus every predecessor reachable by following blocked_by transitively — the chain
+    a card sits in (triggered-agents-261). Stops at a missing card, an unset blocked_by, or a
+    repeat (cycle guard); a malformed/cyclic chain just yields whatever was reachable."""
+    seen: set[str] = set()
+    cur: str | None = ref
+    while cur and cur not in seen:
+        seen.add(cur)
+        task = call("getTaskByReference", project_id=pid, reference=cur)
+        if not task:
+            break
+        meta = call("getTaskMetadata", task_id=int(task["id"])) or {}
+        cur = meta.get(model.META_BLOCKED_BY) or None
+    return seen
+
+
+def _check_worker_continuation(project: str, column: str, blocked_by: str | None,
+                               own_ref: str | None) -> None:
+    """Guard for a worker's own `create` (triggered-agents-261): a card landing straight in Ready
+    is only legal as a continuation of the worker's own approved chain — `own_ref` (the card
+    reference this worker is running as) itself, or one of its blocked_by predecessors,
+    transitively. `--column Идеи` stays ungated (same as reviewer_idea/retro_idea): an
+    unapproved idea from a worker still only ever reaches Идеи, never Ready, so it needs no
+    project/chain check here."""
+    if column != "Ready":
+        return
+    if not blocked_by:
+        raise model.GuardError(
+            "worker create into Ready needs --blocked-by pointing at its own chain "
+            "(use --column Идеи for an unrelated idea)"
+        )
+    if not own_ref:
+        raise model.GuardError(
+            "worker create into Ready needs --own-ref (the card reference this worker is "
+            "running as)"
+        )
+    pid = board_id()
+    own_task = _get_by_ref(own_ref)
+    own_meta = call("getTaskMetadata", task_id=int(own_task["id"])) or {}
+    own_project = own_meta.get(model.META_PROJECT)
+    if own_project != project:
+        raise model.GuardError(
+            f"worker may only create cards in its own project ({own_project!r}), not {project!r}"
+        )
+    if blocked_by not in _blocked_by_chain(pid, own_ref):
+        raise model.GuardError(
+            f"blocked_by {blocked_by!r} is not {own_ref!r}'s own card or a card in its chain"
+        )
+
+
 def create_card(project: str, task_type: str, title: str, description: str = "",
                 ref: str | None = None, column: str = "Идеи",
                 blocked_by: str | None = None, head: str | None = None,
                 slug: str | None = None, base_branch: str | None = None,
-                role: str | None = None) -> dict:
-    """PO/steward: create a spec card in Идеи or Ready, keyed by reference, with metadata.
+                role: str | None = None, own_ref: str | None = None) -> dict:
+    """PO/steward/worker: create a spec card in Идеи or Ready, keyed by reference, with metadata.
+
+    `role="worker"` may only reach Ready via its own chain — see _check_worker_continuation
+    (triggered-agents-261); an Идеи card from a worker is otherwise ungated, matching the
+    general agent-idea policy (reviewer_idea/retro_idea). `own_ref` is the worker's own card
+    reference, required (and only meaningful) for that Ready path.
 
     `slug` names the card's future worker/reviewer workspace (`<reference>-<slug>`); when
     omitted, claim falls back to a transliterated slug of the title (naming.fallback_slug) so an
@@ -160,6 +215,8 @@ def create_card(project: str, task_type: str, title: str, description: str = "",
         raise model.GuardError(f"slug {slug!r} must match [a-z0-9-]{{1,30}}")
     if head:
         _check_head(head)
+    if role == "worker":
+        _check_worker_continuation(project, column, blocked_by, own_ref)
     if role == "steward":
         title = worker.scrub_secrets(title)
         description = worker.scrub_secrets(description)
