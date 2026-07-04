@@ -7,8 +7,9 @@ Flow the agent follows each run:
   2. agent investigates by its own judgment (transcripts, workspaces, repos, curator/retro
      output — everything is readable), fixes what blocks the pipeline right now (infra/
      control-panel, direct commit), files cards for the rest, escalates what it cannot resolve
-     to Blocked with a writeup, comments on every card it touched, writes one markdown report per
-     run to control-panel/docs/steward/.
+     to Blocked with a writeup, comments on every card it touched, and posts the run's report as
+     a comment on the wake-up report card the dispatcher created for this run (triggered-
+     agents-255/259 — no more markdown file in control-panel/docs/steward/).
   3. `python3 -m triggered_agents steward advance`  -> folds the scanned state into the
      watermark, so a condition that hasn't changed does not re-spawn the head next hour.
 
