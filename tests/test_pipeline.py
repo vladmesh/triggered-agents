@@ -624,6 +624,21 @@ class TestClaim(PatchedBoardTest):
                                         model.META_PROJECT: "triggered-agents"})
         ops.claim_card(code_ref, "w2")  # must not raise
 
+    def test_report_cards_do_not_eat_the_global_wip_cap(self):
+        """triggered-agents-255 review (red, layer 3): a report card holds no worker session
+        (no bring-up, no workspace, _reconcile skips it) so it must not count toward WORKER_CAP
+        either — only the sibling per-project code guard excluded it before this fix. Three
+        piled-up (e.g. stale) report cards must still let an ordinary code claim through under
+        a cap that would otherwise be exhausted by them alone."""
+        board = self.make_board()
+        for i in range(3):
+            ops.create_report_card("triggered-agents", f"steward: sweep {i}", f"steward-sweep-{i}")
+        ref = board.add_task("B", "Ready", meta={model.META_TASK_TYPE: "code",
+                                                 model.META_PROJECT: "personal_site"})
+        ops.claim_card(ref, "w1", cap=1)  # must not raise despite 3 report cards In progress
+        tid = next(t["id"] for t in board.tasks.values() if t["reference"] == ref)
+        self.assertEqual(board._column_title_for(tid), model.IN_PROGRESS)
+
 
 class TestRetryState(PatchedBoardTest):
     """Watchdog retry bookkeeping (model.META_RETRY_*): reset on any arrival in Ready, restated by

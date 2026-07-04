@@ -342,7 +342,8 @@ def claim_card(reference: str, worker: str, cap: int = 3) -> dict:
     predecessor, if any, is Done; if it is a code card, no other active code card for the
     same project sits in In progress or Validate (a Validate card still owns its worker
     session for rework, so it counts); and fewer than `cap` cards sit in In progress or
-    Validate (both hold a live worker session).
+    Validate (both hold a live worker session — a steward report card doesn't and is excluded
+    from this count, same as it is excluded from the per-project code guard).
 
     The whole thing runs under AgentState("pipeline").lock(): Kanboard offers no
     compare-and-swap, so with a single dispatcher the host-local lock is what closes the
@@ -374,23 +375,28 @@ def claim_card(reference: str, worker: str, cap: int = 3) -> dict:
         task_type = meta.get(model.META_TASK_TYPE)
         project = meta.get(model.META_PROJECT)
         actives = call("getAllTasks", project_id=pid, status_id=1) or []
-        if task_type == "code":
-            for t in actives:
-                if int(t["id"]) == tid:
-                    continue
-                col = _column_title(pid, int(t["column_id"]))
-                if col not in (model.IN_PROGRESS, "Validate"):
-                    continue
-                tmeta = call("getTaskMetadata", task_id=int(t["id"])) or {}
-                if tmeta.get(model.META_PROJECT) == project and tmeta.get(model.META_TASK_TYPE) == "code":
-                    raise model.GuardError(
-                        f"one code task per project: {t.get('reference') or t['id']!r} "
-                        f"({project}) is already in {col!r}"
-                    )
 
-        # Validate counts toward the cap too: a card there still owns its worker session.
-        wip = sum(1 for t in actives
-                  if _column_title(pid, int(t["column_id"])) in (model.IN_PROGRESS, "Validate"))
+        # Validate counts toward both guards too: a card there still owns its worker session.
+        wip = 0
+        for t in actives:
+            if int(t["id"]) == tid:
+                continue
+            col = _column_title(pid, int(t["column_id"]))
+            if col not in (model.IN_PROGRESS, "Validate"):
+                continue
+            tmeta = call("getTaskMetadata", task_id=int(t["id"])) or {}
+            if tmeta.get(model.META_STEWARD_REPORT) == "1":
+                # No bring-up, no workspace, no worker session — doesn't hold a WORKER_CAP
+                # slot and isn't a code card either.
+                continue
+            if task_type == "code" and tmeta.get(model.META_PROJECT) == project \
+                    and tmeta.get(model.META_TASK_TYPE) == "code":
+                raise model.GuardError(
+                    f"one code task per project: {t.get('reference') or t['id']!r} "
+                    f"({project}) is already in {col!r}"
+                )
+            wip += 1
+
         if wip >= cap:
             raise model.GuardError(f"cap reached: {wip} card(s) in In progress/Validate (cap {cap})")
 
