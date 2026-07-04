@@ -69,7 +69,7 @@ def _workspace(agent: str) -> str:
     return os.environ.get("TA_WORKSPACE") or str(Path.home() / "orca/workspaces/triggered-agents" / agent)
 
 
-def _launch_cmd(agent: str) -> tuple[str, str]:
+def _launch_cmd(agent: str, variant: str | None = None) -> tuple[str, str]:
     """(skill, full claude launch command) from the agent's automation.toml.
 
     A spec naming a `head` (a profile id in pipeline/heads.toml, e.g. the steward's claude-fable)
@@ -79,9 +79,13 @@ def _launch_cmd(agent: str) -> tuple[str, str]:
     and keep the bare default-model `claude` invocation they always had. Any failure to resolve
     (a broken heads.toml is itself the kind of anomaly the steward exists to catch) falls back to
     the same bare invocation rather than leaving the agent undispatched for the whole tick.
+
+    `variant` (e.g. the steward's "deep-sweep", triggered-agents-254) reads `skill` from
+    `spec["variants"][variant]` instead of the top-level one — a second, differently-scheduled
+    mode of the same agent, same worktree/workspace/head, just a different prompt sent into it.
     """
     spec = tomllib.loads((_REPO_ROOT / "triggered_agents" / "agents" / agent / "automation.toml").read_text())
-    skill = spec["skill"]
+    skill = spec["variants"][variant]["skill"] if variant else spec["skill"]
     head = spec.get("head")
     if not head:
         return skill, f"claude --dangerously-skip-permissions {skill}"
@@ -158,10 +162,15 @@ def _reap_ghosts(ws: str) -> int:
     return closed
 
 
-def run(agent: str) -> int:
-    skill, launch = _launch_cmd(agent)
+def run(agent: str, variant: str | None = None) -> int:
+    """`variant` selects a differently-scheduled mode of the same agent (e.g. the steward's
+    "deep-sweep", triggered-agents-254): a different prompt from `_launch_cmd`, and its own
+    runs.jsonl event name (instead of the plain "dispatch" every hourly tick logs) so the two
+    wake-up kinds stay distinguishable in the agent's own telemetry."""
+    skill, launch = _launch_cmd(agent, variant)
     ws = _workspace(agent)
     state = AgentState(agent)
+    event = variant or "dispatch"
     with state.lock():
         reaped = _reap_ghosts(ws)  # prune dead-pty tabs so ghosts never accumulate
         if reaped:
@@ -170,7 +179,7 @@ def run(agent: str) -> int:
         if not terms:
             _ensure_claude_ready(ws)
             _orca(["terminal", "create", "--worktree", f"path:{ws}", "--command", launch])
-            state.log_run("dispatch", action="created")
+            state.log_run(event, action="created")
             print(f"dispatch[{agent}]: no terminal — created fresh -> {skill}")
             return 0
 
@@ -178,7 +187,7 @@ def run(agent: str) -> int:
         if not _is_idle(survivor["handle"]):
             quiet = _quiet_seconds(survivor, time.time())
             if quiet <= WATCHDOG_SECONDS:  # a fresh, working agent — don't interrupt or pile on
-                state.log_run("dispatch", action="busy-skip")
+                state.log_run(event, action="busy-skip")
                 print(f"dispatch[{agent}]: agent busy ({int(quiet)}s silent) — left running, no dispatch")
                 return 0
             # busy but silent too long -> stuck: sweep and restart (makes a ghost, but rare)
@@ -186,7 +195,7 @@ def run(agent: str) -> int:
             time.sleep(1.0)
             _ensure_claude_ready(ws)
             _orca(["terminal", "create", "--worktree", f"path:{ws}", "--command", launch])
-            state.log_run("dispatch", action="watchdog-restart")
+            state.log_run(event, action="watchdog-restart")
             print(f"dispatch[{agent}]: busy but stuck ({int(quiet)}s silent) — watchdog restart -> {skill}")
             return 0
 
@@ -197,7 +206,7 @@ def run(agent: str) -> int:
         _orca(["terminal", "send", "--terminal", survivor["handle"], "--text", "/clear", "--enter"])
         time.sleep(1.0)  # let /clear settle before the skill lands
         _orca(["terminal", "send", "--terminal", survivor["handle"], "--text", skill, "--enter"])
-        state.log_run("dispatch", action="reused")
+        state.log_run(event, action="reused")
         tail = f"; closed {len(extras)} dup(s)" if extras else ""
         print(f"dispatch[{agent}]: reused idle terminal (/clear -> {skill}){tail}")
         return 0

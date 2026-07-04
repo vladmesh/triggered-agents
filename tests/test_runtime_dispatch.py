@@ -36,7 +36,7 @@ class _DispatchBase(unittest.TestCase):
         self.orca_calls = []
         self.ready_calls = []        # (workspace,) each time _ensure_claude_ready runs
 
-        p = mock.patch.object(dispatch, "_launch_cmd", lambda agent: ("/skill", "claude ... /skill"))
+        p = mock.patch.object(dispatch, "_launch_cmd", lambda agent, variant=None: ("/skill", "claude ... /skill"))
         p.start()
         self.addCleanup(p.stop)
 
@@ -83,6 +83,29 @@ class DispatchRunTest(_DispatchBase):
         self.assertEqual(self.ready_calls, ["/ws/agent"])
         create_calls = [c for c in self.orca_calls if c[:2] == ["terminal", "create"]]
         self.assertEqual(len(create_calls), 1)
+
+    def test_variant_dispatch_logs_a_distinct_event_not_plain_dispatch(self):
+        """triggered-agents-254: the deep-sweep timer's dispatch must be distinguishable in
+        runs.jsonl from a regular signal-gated tick, not just another 'dispatch' line."""
+        import json
+        from triggered_agents.runtime.state import AgentState
+
+        self.terminals = []
+        dispatch.run("agent", "deep-sweep")
+        runs = AgentState("agent").dir / "runs.jsonl"
+        events = [json.loads(l)["event"] for l in runs.read_text(encoding="utf-8").splitlines()]
+        self.assertIn("deep-sweep", events)
+        self.assertNotIn("dispatch", events)
+
+    def test_plain_dispatch_still_logs_dispatch_event(self):
+        import json
+        from triggered_agents.runtime.state import AgentState
+
+        self.terminals = []
+        dispatch.run("agent")
+        runs = AgentState("agent").dir / "runs.jsonl"
+        events = [json.loads(l)["event"] for l in runs.read_text(encoding="utf-8").splitlines()]
+        self.assertEqual(events, ["dispatch"])
 
     def test_idle_reuse_does_not_re_run_prep(self):
         self.terminals = [{"handle": "h1", "title": "✳ Claude Code", "lastOutputAt": 1000}]
@@ -162,6 +185,15 @@ class LaunchCmdTest(unittest.TestCase):
         self.assertIn("BOARD_ROLE=steward", cmd)
         self.assertIn("hermes", cmd)
         self.assertIn("google/gemini-2.5-flash", cmd)
+
+    def test_steward_deep_sweep_variant_resolves_its_own_skill_through_the_same_head(self):
+        from triggered_agents.agents.pipeline import health as pipeline_health
+
+        with mock.patch.object(pipeline_health, "refresh", lambda: {"claude-sub": "green"}):
+            skill, cmd = dispatch._launch_cmd("steward", "deep-sweep")
+        self.assertEqual(skill, "/steward deep-sweep")
+        self.assertIn("BOARD_ROLE=steward", cmd)
+        self.assertIn("--model fable", cmd)
 
     def test_steward_head_keeps_original_name_when_the_whole_chain_is_red(self):
         from triggered_agents.agents.pipeline import health as pipeline_health

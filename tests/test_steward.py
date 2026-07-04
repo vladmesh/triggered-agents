@@ -394,6 +394,38 @@ class CliTest(StewardTestBase):
         self.assertEqual(cli.cmd_precheck(), 1)  # no fresh wake-up for the same card next hour
 
 
+class DeepSweepWatermarkTest(StewardTestBase):
+    """cli.py's deep-sweep-since/deep-sweep-advance (triggered-agents-254) — a separate
+    watermark from signals.py's scan/advance, tracking only "when did the last unconditional
+    sweep run", independent of the five-signal dedup."""
+
+    def test_first_ever_run_reports_null(self):
+        rc = cli.cmd_deep_sweep_since()
+        self.assertEqual(rc, 0)
+
+    def test_advance_then_since_reports_a_timestamp(self):
+        self.assertEqual(cli.cmd_deep_sweep_advance(), 0)
+        mark = json.loads(cli.STATE.dir.joinpath("deep_sweep_watermark.json").read_text())
+        self.assertIn("last_run", mark)
+        self.assertTrue(mark["last_run"])  # non-empty ISO string
+
+    def test_deep_sweep_watermark_is_independent_of_the_signal_watermark(self):
+        """Advancing the deep-sweep watermark must not touch signals.py's own watermark.json —
+        the two gates must not be able to starve each other of a wake-up."""
+        ref = self.board.add_task("A", "Blocked", meta={"project": "personal_site"})
+        cli.cmd_deep_sweep_advance()
+        # the Blocked card is still a fresh, un-notified signal — deep-sweep advancing must not
+        # have folded it into signals.py's watermark.
+        self.assertEqual(cli.cmd_precheck(), 0)
+        batch = signals.scan()
+        self.assertEqual(batch["signals"]["new_blocked"], [ref])
+
+    def test_deep_sweep_advance_logs_its_own_event(self):
+        cli.cmd_deep_sweep_advance()
+        runs = [json.loads(l) for l in (cli.STATE.dir / "runs.jsonl").read_text().splitlines()]
+        self.assertTrue(any(r["event"] == "deep-sweep-advance" for r in runs))
+
+
 class CrossWorkspaceStateTest(unittest.TestCase):
     """Reproduces the actual prod layout (triggered-agents-253): the steward's own state root and
     the pipeline dispatcher's live state root are two genuinely disjoint directory trees — not

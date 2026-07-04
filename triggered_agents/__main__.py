@@ -36,7 +36,11 @@ def main(argv=None) -> int:
             from .agents.pipeline import dispatcher
             return dispatcher.tick()
         from .runtime import dispatch
-        return dispatch.run(agent)
+        # An optional variant name (e.g. the steward's "deep-sweep", triggered-agents-254)
+        # selects a second, differently-scheduled mode of the same agent — see automation.toml's
+        # [variants.<name>] table and dispatch.run's docstring.
+        variant = rest[1] if len(rest) > 1 else None
+        return dispatch.run(agent, variant)
     cli = import_module(f"triggered_agents.agents.{agent}.cli")
     return cli.main(rest)
 

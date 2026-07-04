@@ -35,3 +35,27 @@ randomized_delay_sec = 150   # jitter so the hourly sweep never races curator/bo
 # precheck hits Kanboard directly (signals.py), before any claude head is up to source .env
 # itself — same reason the pipeline dispatcher's unit needs this (see pipeline/automation.toml).
 env_file = "/home/dev/control-panel/.env"
+
+# Second, unconditional mode (triggered-agents-254): once a day the head wakes up with NO
+# precheck gate at all, regardless of whether signals.py found anything — the five signal
+# detectors themselves can be blind (253: a wrong path made the pipeline log look permanently
+# quiet), and a signal-gated wake-up can never catch that. deploy/provision.py reads this table
+# and provisions a SECOND systemd unit (ta-<name>-deep-sweep) alongside the hourly one above —
+# same worktree/workspace/head, no separate Orca automation. `skill` carries an argument
+# ("deep-sweep") the same way a slash command would if typed by hand, so the one SKILL.md file
+# can branch to its own section instead of the five-signal one; cli.py's deep-sweep-since/
+# deep-sweep-advance keep this mode's watermark (last unconditional sweep) entirely separate
+# from signals.py's per-kind watermark, so neither gate can starve the other of a wake-up.
+[variants.deep-sweep]
+skill = "/steward deep-sweep"
+
+[variants.deep-sweep.systemd]
+# Fixed, deliberately not-round time so it never coincides with retro's daily pass (00:00 +
+# <=5min jitter, see retro/automation.toml) or the hourly :00-:03 crowd (curator/board/pipeline).
+# Time-only systemd OnCalendar shorthand (no date field, so no internal space — provision.py's
+# `_timer_unit` splits `calendar` on whitespace to emit one OnCalendar line per space-separated
+# spec, the same convention pipeline/automation.toml uses for its two-offset 3-min cadence; a
+# spec with its own internal space would get split apart and break).
+calendar = "03:47:00"
+randomized_delay_sec = 600
+env_file = "/home/dev/control-panel/.env"
