@@ -42,7 +42,6 @@ import sys
 import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
-from pathlib import Path
 
 from ...runtime.state import AgentState
 from . import health, heads, model, naming, ops, validate, worker
@@ -66,74 +65,43 @@ RETRY_SWITCH_BUDGET = int(os.environ.get("TA_RETRY_SWITCH_BUDGET", "1"))
 _LOG_TAIL_LINES = 40
 
 
-def _lock_stale(lockfile: Path) -> bool:
-    """True when the lock's pid is no longer alive (SIGKILL/reboot mid-tick: finally never ran,
-    the file stayed). An unreadable/garbled lock also counts as stale — it proves nothing."""
-    try:
-        pid = int(lockfile.read_text(encoding="utf-8", errors="replace").strip())
-    except (OSError, ValueError):
-        return True
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return True
-    except PermissionError:
-        pass  # alive under another uid — a live holder
-    return False
-
-
 @contextmanager
 def _tick_lock():
     """One dispatcher tick at a time. Separate file from ops' claim lock (dir/lock), so a tick
-    can call ops.claim_card — which takes that lock — without deadlocking on itself. A lock left
-    by a killed tick is reclaimed by pid liveness, not honored forever.
+    can call ops.claim_card — which takes that lock — without deadlocking on itself.
 
-    Two manual ticks racing on top of the timer could both see the same lock as stale and both
-    unlink+recreate it (systemd only serializes its own runs, not a concurrent manual invocation).
-    A companion mutex file, held via flock only for the decide-and-(re)create span, makes that
-    span exclusive across processes: whoever gets the flock first either creates the lock fresh,
-    reclaims it, or observes the other's already-live lock and skips — no two ticks ever both
-    conclude "stale" against the same generation of the file. Holding the flock through the pid
-    write also closes the create-without-pid-yet window: no other process can read the lockfile
-    while it's between O_EXCL create and the pid write, since that whole span is behind the flock."""
+    Held via flock(LOCK_EX | LOCK_NB) on `dispatch.lock` itself for the whole tick, not just
+    around a claim step: the kernel drops the lock the moment its holder dies (SIGKILL, crash,
+    reboot), so a killed tick never leaves anything for the next one to reason about — no
+    stale-pid check, no reclaim branch, no two ticks racing to both decide "stale" and unlink the
+    same generation of the file. The file itself is never unlinked, only ever opened at the same
+    path and (un)locked — deleting a flocked file while another process might be mid-open is the
+    classic way to end up with two processes each holding a lock on a different inode of the same
+    name. pid is (re)written on every acquire, so a SKIP message can still name the current
+    holder.
+
+    A busy lock is a normal skip, not a failure: a long stand run holds the tick for minutes
+    while the 3-min systemd timer keeps firing (LOCK_NB fails instantly rather than blocking the
+    timer's own process). Exit 0 so systemd doesn't log a run of unit failures for expected
+    overlap."""
     STATE.ensure_dir()
     lockfile = STATE.dir / "dispatch.lock"
-    mutexfile = STATE.dir / "dispatch.lock.mutex"
-    mfd = os.open(mutexfile, os.O_CREAT | os.O_RDWR)
+    fd = os.open(lockfile, os.O_CREAT | os.O_RDWR)
     try:
-        fcntl.flock(mfd, fcntl.LOCK_EX)
-        fd = None
-        for attempt in (1, 2):  # second attempt only after unlinking a stale lock
-            try:
-                fd = os.open(lockfile, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-                break
-            except FileExistsError:
-                if attempt == 2 or not _lock_stale(lockfile):
-                    holder = lockfile.read_text(encoding="utf-8", errors="replace").strip() if lockfile.is_file() else "?"
-                    # A busy lock is a normal skip, not a failure: a long stand run holds the tick
-                    # for minutes while the 3-min systemd timer keeps firing. Exit 0 so systemd
-                    # doesn't log a run of unit failures for expected overlap.
-                    print(f"pipeline: another dispatcher tick holds the lock ({lockfile}, pid {holder}) — SKIP",
-                          file=sys.stderr)
-                    raise SystemExit(0)
-                STATE.log_run("lock-reclaimed", stale_holder=lockfile.read_text(encoding="utf-8", errors="replace").strip()
-                              if lockfile.is_file() else "?")
-                try:
-                    lockfile.unlink()
-                except FileNotFoundError:
-                    pass
-        os.write(fd, str(os.getpid()).encode())
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
         os.close(fd)
-    finally:
-        fcntl.flock(mfd, fcntl.LOCK_UN)
-        os.close(mfd)
+        holder = lockfile.read_text(encoding="utf-8", errors="replace").strip() if lockfile.is_file() else "?"
+        print(f"pipeline: another dispatcher tick holds the lock ({lockfile}, pid {holder}) — SKIP",
+              file=sys.stderr)
+        raise SystemExit(0)
+    os.ftruncate(fd, 0)
+    os.write(fd, str(os.getpid()).encode())
     try:
         yield
     finally:
-        try:
-            lockfile.unlink()
-        except FileNotFoundError:
-            pass
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
 
 
 def _load_cards() -> dict:
