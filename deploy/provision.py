@@ -269,38 +269,55 @@ def remove_legacy_unit(legacy: str) -> None:
         run(["sudo", "rm", "-f", str(SYSTEMD_DIR / f"{legacy}.{suffix}")], check=False)
 
 
-def ensure_variant_systemd(agent: str, variant: str, vspec: dict, workspace: Path) -> None:
-    """A second, differently-scheduled mode of the same agent (spec's `[variants.<name>]` table,
-    e.g. the steward's "deep-sweep") — same worktree/workspace, its own systemd unit pair, no
-    precheck gate (see _variant_service_unit)."""
-    vsysd = vspec.get("systemd", {})
-    calendar = vsysd.get("calendar", "daily")
-    delay = int(vsysd.get("randomized_delay_sec", 0))
-    unit = f"ta-{agent}-{variant}"
-    _sudo_write(SYSTEMD_DIR / f"{unit}.service",
-                _variant_service_unit(agent, variant, calendar, workspace, vsysd.get("env_file", "")))
-    _sudo_write(SYSTEMD_DIR / f"{unit}.timer", _timer_unit(f"{agent} {variant}", calendar, delay))
-    run(["sudo", "systemctl", "daemon-reload"])
-    run(["sudo", "systemctl", "enable", "--now", f"{unit}.timer"])
-    log(f"systemd unit active: {unit}.timer ({calendar})")
+def render_units(agent: str, spec: dict, workspace: Path) -> dict[str, str]:
+    """unit filename ('ta-<agent>.service', ...) -> rendered content, for `agent`'s main
+    service+timer and every `[variants.*]` pair declared in `spec` (the parsed automation.toml).
+    Single source of truth for "what SHOULD this agent's units contain right now": ensure_systemd
+    below writes exactly this to disk, and steward's drift.py (triggered-agents-256) compares it
+    against what's actually there. Extracting the spec fields (calendar/env_file/delay defaults)
+    a second time in drift.py would let that copy silently diverge from this one — the same
+    two-renderers-drift-from-each-other risk the unit *text* builders (_service_unit etc.) already
+    avoid by being called from both places instead of reimplemented."""
+    sysd = spec.get("systemd", {})
+    calendar = sysd.get("calendar", "hourly")
+    units = {
+        f"ta-{agent}.service": _service_unit(agent, calendar, workspace, spec.get("precheck", ""),
+                                              sysd.get("env_file", "")),
+        f"ta-{agent}.timer": _timer_unit(agent, calendar, int(sysd.get("randomized_delay_sec", 0))),
+    }
+    for variant, vspec in spec.get("variants", {}).items():
+        vsysd = vspec.get("systemd", {})
+        vcalendar = vsysd.get("calendar", "daily")
+        vunit = f"ta-{agent}-{variant}"
+        units[f"{vunit}.service"] = _variant_service_unit(agent, variant, vcalendar, workspace,
+                                                           vsysd.get("env_file", ""))
+        units[f"{vunit}.timer"] = _timer_unit(f"{agent} {variant}", vcalendar,
+                                              int(vsysd.get("randomized_delay_sec", 0)))
+    return units
 
 
 def ensure_systemd(agent: str, spec: dict, workspace: Path) -> None:
+    units = render_units(agent, spec, workspace)
     sysd = spec.get("systemd", {})
-    calendar = sysd.get("calendar", "hourly")
-    delay = int(sysd.get("randomized_delay_sec", 0))
     unit = f"ta-{agent}"
-    _sudo_write(SYSTEMD_DIR / f"{unit}.service",
-                _service_unit(agent, calendar, workspace, spec.get("precheck", ""),
-                              sysd.get("env_file", "")))
-    _sudo_write(SYSTEMD_DIR / f"{unit}.timer", _timer_unit(agent, calendar, delay))
+    _sudo_write(SYSTEMD_DIR / f"{unit}.service", units[f"{unit}.service"])
+    _sudo_write(SYSTEMD_DIR / f"{unit}.timer", units[f"{unit}.timer"])
     remove_legacy_unit(sysd.get("legacy_unit", ""))
     run(["sudo", "systemctl", "daemon-reload"])
     run(["sudo", "systemctl", "enable", "--now", f"{unit}.timer"])
-    log(f"systemd unit active: {unit}.timer ({calendar})")
+    log(f"systemd unit active: {unit}.timer ({sysd.get('calendar', 'hourly')})")
 
+    # A second, differently-scheduled mode of the same agent (spec's `[variants.<name>]` table,
+    # e.g. the steward's "deep-sweep") — same worktree/workspace, its own systemd unit pair, no
+    # precheck gate (see _variant_service_unit).
     for variant, vspec in spec.get("variants", {}).items():
-        ensure_variant_systemd(agent, variant, vspec, workspace)
+        vcalendar = vspec.get("systemd", {}).get("calendar", "daily")
+        vunit = f"ta-{agent}-{variant}"
+        _sudo_write(SYSTEMD_DIR / f"{vunit}.service", units[f"{vunit}.service"])
+        _sudo_write(SYSTEMD_DIR / f"{vunit}.timer", units[f"{vunit}.timer"])
+        run(["sudo", "systemctl", "daemon-reload"])
+        run(["sudo", "systemctl", "enable", "--now", f"{vunit}.timer"])
+        log(f"systemd unit active: {vunit}.timer ({vcalendar})")
 
 
 def provision(agent: str) -> None:

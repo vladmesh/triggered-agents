@@ -62,6 +62,10 @@ class FakeWorker:
         self.remote_head_shas = {}       # branch -> sha remote_head_sha returns; missing -> None
         self.stopped_terminals = []      # workspaces stop_terminals was asked to stop (no rm)
         self.workspace_calls = []        # (project, name, base_branch) every create_workspace call
+        self.pr_files_result = None      # list[str] | None returned by pr_files (None -> gh down)
+        self.pr_files_calls = []         # PR urls pr_files was asked about
+        self.apply_provision_result = {"ok": True, "log": "provisioned"}
+        self.apply_provision_calls = []  # each `agents` list apply_provision was called with
         self._n = 0
 
     def read_base_branch(self, project):
@@ -149,6 +153,14 @@ class FakeWorker:
     def remote_head_sha(self, project, branch):
         return self.remote_head_shas.get(branch)
 
+    def pr_files(self, pr_url):
+        self.pr_files_calls.append(pr_url)
+        return self.pr_files_result
+
+    def apply_provision(self, agents):
+        self.apply_provision_calls.append(list(agents))
+        return self.apply_provision_result
+
     def teardown(self, workspace):
         self.torn_down.append(workspace)
 
@@ -172,7 +184,7 @@ class _DispatcherBase(unittest.TestCase):
                      "read_stand_config", "pr_branch", "run_stand", "spawn_reviewer",
                      "workspace_exists", "workspace_path", "rename_terminal", "merge_pr",
                      "pr_base_branch", "list_agent_worktrees", "ff_worktree", "remote_head_sha",
-                     "stop_terminals"):
+                     "stop_terminals", "pr_files", "apply_provision"):
             wp = mock.patch(f"triggered_agents.agents.pipeline.worker.{name}",
                             getattr(self.worker, name))
             wp.start()
@@ -1568,6 +1580,100 @@ class ValidateTest(_DispatcherBase):
         dispatcher.tick()                                        # escalates -> must clear_review
         self.assertEqual(self._column(ref), "Blocked")
         self.assertTrue(any(w.startswith("/rev/") for w in self.worker.torn_down))
+
+
+class PostMergeProvisionApplyTest(_DispatcherBase):
+    """triggered-agents-256: a merged PR that touches deploy/provision.py or an agent's own
+    automation.toml gets its live systemd units re-provisioned right away, one-shot, without
+    touching the (already Done) card on failure. Only the triggered-agents project itself has
+    these paths, so every non-triggered-agents merge must never even call gh for the file list."""
+
+    PR = "https://github.com/vladmesh/triggered-agents/pull/99"
+
+    def _to_validate(self, project="triggered-agents", pr=PR):
+        ref = self._claim_one(project=project)
+        ops.report(ref, "done", f"готово\nPR: {pr}")
+        self.worker.pr_status = None
+        dispatcher.tick()
+        self.assertEqual(self._column(ref), "Validate")
+        return ref
+
+    def _merge(self, ref):
+        self.worker.pr_status = {"merged": True, "state": "MERGED", "rollup": "SUCCESS",
+                                 "failed_job": None, "failed_log": None}
+        dispatcher.tick()
+        self.assertEqual(self._column(ref), "Done")
+
+    def test_other_project_never_calls_gh_for_files(self):
+        ref = self._to_validate(project="personal_site")
+        self._merge(ref)
+        self.assertEqual(self.worker.pr_files_calls, [])
+        self.assertEqual(self.worker.apply_provision_calls, [])
+
+    def test_unrelated_files_skip_apply(self):
+        ref = self._to_validate()
+        self.worker.pr_files_result = ["README.md", "tests/test_pipeline.py"]
+        self._merge(ref)
+        self.assertEqual(self.worker.pr_files_calls, [self.PR])
+        self.assertEqual(self.worker.apply_provision_calls, [])
+
+    def test_provision_py_change_applies_to_every_agent(self):
+        ref = self._to_validate()
+        self.worker.pr_files_result = ["deploy/provision.py", "deploy/README.md"]
+        self._merge(ref)
+        self.assertEqual(self.worker.apply_provision_calls, [[]])   # [] -> every agent
+
+    def test_automation_toml_change_applies_only_that_agent(self):
+        ref = self._to_validate()
+        self.worker.pr_files_result = ["triggered_agents/agents/curator/automation.toml"]
+        self._merge(ref)
+        self.assertEqual(self.worker.apply_provision_calls, [["curator"]])
+
+    def test_multiple_automation_toml_changes_dedup_and_sort(self):
+        ref = self._to_validate()
+        self.worker.pr_files_result = [
+            "triggered_agents/agents/steward/automation.toml",
+            "triggered_agents/agents/curator/automation.toml",
+            "triggered_agents/agents/steward/automation.toml",
+        ]
+        self._merge(ref)
+        self.assertEqual(self.worker.apply_provision_calls, [["curator", "steward"]])
+
+    def test_gh_unavailable_warns_and_never_applies(self):
+        ref = self._to_validate()
+        self.worker.pr_files_result = None
+        self._merge(ref)
+        self.assertEqual(self.worker.apply_provision_calls, [])
+        self.assertTrue(any(r["event"] == "postmerge-apply" and r.get("result") == "gh-unavailable"
+                            and r.get("level") == "warn" for r in self._runs()))
+
+    def test_apply_failure_is_logged_but_card_stays_done(self):
+        ref = self._to_validate()
+        self.worker.pr_files_result = ["deploy/provision.py"]
+        self.worker.apply_provision_result = {"ok": False, "log": "systemctl daemon-reload failed"}
+        self._merge(ref)
+        self.assertEqual(self._column(ref), "Done")                # merge already happened
+        self.assertTrue(any(r["event"] == "postmerge-apply" and r.get("result") == "error"
+                            and r.get("level") == "error" for r in self._runs()))
+
+    def test_apply_success_logs_ok_not_a_signal(self):
+        ref = self._to_validate()
+        self.worker.pr_files_result = ["triggered_agents/agents/retro/automation.toml"]
+        self._merge(ref)
+        hits = [r for r in self._runs() if r["event"] == "postmerge-apply"]
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["result"], "ok")
+        self.assertNotEqual(hits[0].get("level"), "warn")
+        self.assertNotEqual(hits[0].get("result"), "error")
+
+    def test_one_shot_not_retried_next_tick(self):
+        # Once Done, the card has left Validate entirely — a later tick must not re-derive/re-apply.
+        ref = self._to_validate()
+        self.worker.pr_files_result = ["deploy/provision.py"]
+        self._merge(ref)
+        self.assertEqual(len(self.worker.apply_provision_calls), 1)
+        dispatcher.tick()
+        self.assertEqual(len(self.worker.apply_provision_calls), 1)
 
 
 class ValidateStandTest(_DispatcherBase):

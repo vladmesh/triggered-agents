@@ -656,6 +656,85 @@ def merge_pr(pr_url: str) -> dict:
     return {"ok": False, "error": (p.stderr or p.stdout).strip() or f"gh exit {p.returncode}"}
 
 
+def pr_files(pr_url: str) -> list[str] | None:
+    """Paths changed by a PR (its cumulative diff — the same set a squash merge lands as one
+    commit), via gh — same None-on-trouble contract as poll_pr/pr_branch/pr_base_branch. gh still
+    answers `pr view --json files` for a PR gh itself reports merged/closed, so this needs no
+    local git fetch/diff against the merge commit (validate._apply_provision_after_merge calls it
+    right after gh has already reported the PR merged)."""
+    data = _gh_json(["pr", "view", pr_url, "--json", "files"])
+    if not isinstance(data, dict):
+        return None
+    return [f.get("path") for f in (data.get("files") or []) if f.get("path")]
+
+
+# --- Post-merge provision apply (triggered-agents-256) ----------------------------------------
+# deploy/provision.py refuses to run from anywhere but the canonical checkout (~/triggered-agents,
+# see its own CANONICAL_ROOT guard, triggered-agents-257) — the dispatcher runs from ITS OWN named
+# worktree instead (a sibling under the same workspaces root, never that checkout), so applying a
+# freshly-merged provision.py/automation.toml can't just run the copy sitting in the dispatcher's
+# own cwd. Nothing ever commits to the canonical checkout, so fetching+hard-resetting it to
+# origin/main right before every apply is safe and mirrors the same discipline deploy/provision.py
+# already applies to every per-agent worktree (ensure_worktree) — without this the checkout stays
+# on whatever commit a human last happened to `git pull`, and the freshly-merged logic/spec would
+# never actually run.
+TRIGGERED_AGENTS_CANONICAL_ROOT = Path(os.environ.get("TA_CANONICAL_ROOT") or Path.home() / "triggered-agents")
+_DEPLOY_PROVISION = TRIGGERED_AGENTS_CANONICAL_ROOT / "deploy" / "provision.py"
+PROVISION_APPLY_TIMEOUT_S = int(os.environ.get("TA_PROVISION_APPLY_TIMEOUT_S", "300"))
+
+
+def apply_provision(agents: list[str]) -> dict:
+    """Fast-forward the canonical triggered-agents checkout to origin/main, then run its
+    deploy/provision.py for `agents` (empty list -> every agent with a spec, mirroring
+    deploy/provision.py's own argv-empty convention). Returns {"ok": bool, "log": str} — every
+    step's combined stdout+stderr, one after another, untruncated (the caller scrubs/tails before
+    logging it). Never raises: a failed fetch/reset/provision run all fold into a non-ok result —
+    this is a one-shot post-merge action with no retry (validate._apply_provision_after_merge).
+
+    A named agent (a non-empty `agents`, i.e. only that agent's own automation.toml changed) is
+    filtered against the FRESH post-reset tree before the provision.py call: a merge that DELETES
+    an agent's automation.toml (decommissioning it — the exact ta-board precedent this card was
+    written around) still names that agent in the diff, but running `provision.py <agent>` for a
+    spec that no longer exists is a guaranteed SystemExit — a false 'apply failed' signal on every
+    single decommission merge, not a real failure. An agent whose spec is simply gone this way is
+    silently nothing-to-provision here (noted in the log, not an error) — tearing down its now-
+    orphaned live unit is the drift check's "extra" case (steward/drift.py), a deliberate human
+    step, not an automatic one. The empty-list ("all") case is untouched: deploy/provision.py's
+    own argv-empty path already computes its agent list fresh from the same post-reset tree, so a
+    removed agent is naturally absent from it with no filtering needed here."""
+    root = str(TRIGGERED_AGENTS_CANONICAL_ROOT)
+    log_parts = []
+    for step in (["git", "-C", root, "fetch", "--quiet", "origin", "main"],
+                 ["git", "-C", root, "reset", "--hard", "origin/main"]):
+        try:
+            p = subprocess.run(step, capture_output=True, text=True, timeout=ORCA_TIMEOUT_S)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            log_parts.append(f"$ {' '.join(step)}\n{e}")
+            return {"ok": False, "log": "\n".join(log_parts)}
+        log_parts.append(f"$ {' '.join(step)}\n{p.stdout}{p.stderr}")
+        if p.returncode != 0:
+            return {"ok": False, "log": "\n".join(log_parts)}
+    if agents:
+        specs_dir = TRIGGERED_AGENTS_CANONICAL_ROOT / "triggered_agents" / "agents"
+        existing = sorted(a for a in agents if (specs_dir / a / "automation.toml").is_file())
+        missing = sorted(set(agents) - set(existing))
+        if missing:
+            log_parts.append(
+                f"no automation.toml on origin/main for: {', '.join(missing)} (decommissioned in "
+                f"this merge, or never existed) — nothing to provision for them, skipped")
+        if not existing:
+            return {"ok": True, "log": "\n".join(log_parts)}
+        agents = existing
+    cmd = ["python3", str(_DEPLOY_PROVISION), *agents]
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=PROVISION_APPLY_TIMEOUT_S)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        log_parts.append(f"$ {' '.join(cmd)}\n{e}")
+        return {"ok": False, "log": "\n".join(log_parts)}
+    log_parts.append(f"$ {' '.join(cmd)}\n{p.stdout}{p.stderr}")
+    return {"ok": p.returncode == 0, "log": "\n".join(log_parts)}
+
+
 # --- Stand deploy + e2e (Validate layer 2) ----------------------------------------------------
 # The dispatcher decides on the board; the heavy host work (git checkout, compose, e2e) lives in
 # stand.py. These delegates keep the dispatcher talking to a single host boundary (worker.py) and
