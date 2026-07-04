@@ -689,7 +689,19 @@ def apply_provision(agents: list[str]) -> dict:
     deploy/provision.py's own argv-empty convention). Returns {"ok": bool, "log": str} — every
     step's combined stdout+stderr, one after another, untruncated (the caller scrubs/tails before
     logging it). Never raises: a failed fetch/reset/provision run all fold into a non-ok result —
-    this is a one-shot post-merge action with no retry (validate._apply_provision_after_merge)."""
+    this is a one-shot post-merge action with no retry (validate._apply_provision_after_merge).
+
+    A named agent (a non-empty `agents`, i.e. only that agent's own automation.toml changed) is
+    filtered against the FRESH post-reset tree before the provision.py call: a merge that DELETES
+    an agent's automation.toml (decommissioning it — the exact ta-board precedent this card was
+    written around) still names that agent in the diff, but running `provision.py <agent>` for a
+    spec that no longer exists is a guaranteed SystemExit — a false 'apply failed' signal on every
+    single decommission merge, not a real failure. An agent whose spec is simply gone this way is
+    silently nothing-to-provision here (noted in the log, not an error) — tearing down its now-
+    orphaned live unit is the drift check's "extra" case (steward/drift.py), a deliberate human
+    step, not an automatic one. The empty-list ("all") case is untouched: deploy/provision.py's
+    own argv-empty path already computes its agent list fresh from the same post-reset tree, so a
+    removed agent is naturally absent from it with no filtering needed here."""
     root = str(TRIGGERED_AGENTS_CANONICAL_ROOT)
     log_parts = []
     for step in (["git", "-C", root, "fetch", "--quiet", "origin", "main"],
@@ -702,6 +714,17 @@ def apply_provision(agents: list[str]) -> dict:
         log_parts.append(f"$ {' '.join(step)}\n{p.stdout}{p.stderr}")
         if p.returncode != 0:
             return {"ok": False, "log": "\n".join(log_parts)}
+    if agents:
+        specs_dir = TRIGGERED_AGENTS_CANONICAL_ROOT / "triggered_agents" / "agents"
+        existing = sorted(a for a in agents if (specs_dir / a / "automation.toml").is_file())
+        missing = sorted(set(agents) - set(existing))
+        if missing:
+            log_parts.append(
+                f"no automation.toml on origin/main for: {', '.join(missing)} (decommissioned in "
+                f"this merge, or never existed) — nothing to provision for them, skipped")
+        if not existing:
+            return {"ok": True, "log": "\n".join(log_parts)}
+        agents = existing
     cmd = ["python3", str(_DEPLOY_PROVISION), *agents]
     try:
         p = subprocess.run(cmd, capture_output=True, text=True, timeout=PROVISION_APPLY_TIMEOUT_S)

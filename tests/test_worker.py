@@ -552,12 +552,23 @@ class ApplyProvisionTest(unittest.TestCase):
     short-circuiting, not the shell commands themselves (that's the card's live host check)."""
 
     def setUp(self):
-        p = mock.patch.object(worker, "TRIGGERED_AGENTS_CANONICAL_ROOT", Path("/canon"))
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.canon = Path(self.tmp.name)
+        p = mock.patch.object(worker, "TRIGGERED_AGENTS_CANONICAL_ROOT", self.canon)
         p.start()
         self.addCleanup(p.stop)
-        p2 = mock.patch.object(worker, "_DEPLOY_PROVISION", Path("/canon/deploy/provision.py"))
+        p2 = mock.patch.object(worker, "_DEPLOY_PROVISION", self.canon / "deploy" / "provision.py")
         p2.start()
         self.addCleanup(p2.stop)
+
+    def _spec(self, agent: str) -> None:
+        """Simulate `agent`'s automation.toml still existing on origin/main after the reset — the
+        filter in apply_provision checks the real filesystem, so a test whose agent should be
+        treated as still-specced needs the file actually there."""
+        d = self.canon / "triggered_agents" / "agents" / agent
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "automation.toml").write_text("name = \"" + agent + "\"\n", encoding="utf-8")
 
     def _ok(self, out=""):
         return subprocess.CompletedProcess([], 0, out, "")
@@ -566,6 +577,8 @@ class ApplyProvisionTest(unittest.TestCase):
         return subprocess.CompletedProcess([], 1, "", err)
 
     def test_happy_path_runs_fetch_reset_then_provision_with_agents(self):
+        self._spec("curator")
+        self._spec("steward")
         calls = []
 
         def fake_run(cmd, **kw):
@@ -575,10 +588,11 @@ class ApplyProvisionTest(unittest.TestCase):
         with mock.patch("subprocess.run", fake_run):
             result = worker.apply_provision(["curator", "steward"])
         self.assertTrue(result["ok"])
+        root = str(self.canon)
         self.assertEqual(calls, [
-            ["git", "-C", "/canon", "fetch", "--quiet", "origin", "main"],
-            ["git", "-C", "/canon", "reset", "--hard", "origin/main"],
-            ["python3", "/canon/deploy/provision.py", "curator", "steward"],
+            ["git", "-C", root, "fetch", "--quiet", "origin", "main"],
+            ["git", "-C", root, "reset", "--hard", "origin/main"],
+            ["python3", str(self.canon / "deploy" / "provision.py"), "curator", "steward"],
         ])
 
     def test_empty_agents_means_every_agent_no_argv(self):
@@ -590,9 +604,10 @@ class ApplyProvisionTest(unittest.TestCase):
 
         with mock.patch("subprocess.run", fake_run):
             worker.apply_provision([])
-        self.assertEqual(calls[-1], ["python3", "/canon/deploy/provision.py"])
+        self.assertEqual(calls[-1], ["python3", str(self.canon / "deploy" / "provision.py")])
 
     def test_fetch_failure_short_circuits_before_reset_or_provision(self):
+        self._spec("curator")
         calls = []
 
         def fake_run(cmd, **kw):
@@ -606,6 +621,7 @@ class ApplyProvisionTest(unittest.TestCase):
         self.assertIn("network unreachable", result["log"])
 
     def test_reset_failure_short_circuits_before_provision(self):
+        self._spec("curator")
         calls = []
 
         def fake_run(cmd, **kw):
@@ -619,6 +635,8 @@ class ApplyProvisionTest(unittest.TestCase):
         self.assertIn("cannot reset", result["log"])
 
     def test_provision_failure_is_reported_not_ok(self):
+        self._spec("curator")
+
         def fake_run(cmd, **kw):
             return self._ok() if cmd[0] == "git" else self._fail("provision blew up")
 
@@ -626,6 +644,39 @@ class ApplyProvisionTest(unittest.TestCase):
             result = worker.apply_provision(["curator"])
         self.assertFalse(result["ok"])
         self.assertIn("provision blew up", result["log"])
+
+    def test_decommissioned_agent_spec_is_skipped_not_a_failure(self):
+        # Regression (review verdict, triggered-agents-256): a merge that DELETES an agent's own
+        # automation.toml (decommissioning it, the ta-board precedent) still names that agent in
+        # the diff — running provision.py for a spec that's gone is a guaranteed SystemExit, a
+        # false 'apply failed' signal on every single decommission merge. No spec on disk for
+        # "board" here (never called self._spec("board")) simulates exactly that post-reset state.
+        calls = []
+
+        def fake_run(cmd, **kw):
+            calls.append(cmd)
+            return self._ok()
+
+        with mock.patch("subprocess.run", fake_run):
+            result = worker.apply_provision(["board"])
+        self.assertTrue(result["ok"])                     # not an error — nothing left to do
+        self.assertIn("board", result["log"])
+        # fetch + reset only ran; provision.py itself was never invoked for a dead spec.
+        self.assertEqual(len(calls), 2)
+
+    def test_mixed_existing_and_decommissioned_agents_provisions_only_the_existing_one(self):
+        self._spec("curator")   # "board" left unspecced -> filtered out, not an error
+        calls = []
+
+        def fake_run(cmd, **kw):
+            calls.append(cmd)
+            return self._ok()
+
+        with mock.patch("subprocess.run", fake_run):
+            result = worker.apply_provision(["board", "curator"])
+        self.assertTrue(result["ok"])
+        self.assertEqual(calls[-1], ["python3", str(self.canon / "deploy" / "provision.py"), "curator"])
+        self.assertIn("board", result["log"])
 
     def test_timeout_at_any_step_is_a_non_ok_result_not_a_raise(self):
         def fake_run(cmd, **kw):

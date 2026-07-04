@@ -33,7 +33,10 @@ SYSTEMD_DIR = Path("/etc/systemd/system")
 def _expected_units() -> dict[str, str]:
     """unit filename ('ta-<agent>.service', ...) -> expected content, for every agent spec found
     under provision.AGENTS_DIR — the same set deploy/provision.py's own `main()` provisions with
-    no argv (every agent with a spec)."""
+    no argv (every agent with a spec). Delegates the actual rendering to provision.render_units,
+    the exact function ensure_systemd itself calls before writing units to disk, so this can never
+    drift from what a real provision run would produce (see render_units' own docstring — the
+    same anti-duplication reasoning that already applies to the unit-text builders themselves)."""
     expected: dict[str, str] = {}
     for agent_dir in sorted(provision.AGENTS_DIR.iterdir()):
         spec_path = agent_dir / "automation.toml"
@@ -42,20 +45,7 @@ def _expected_units() -> dict[str, str]:
         agent = agent_dir.name
         spec = tomllib.loads(spec_path.read_text(encoding="utf-8"))
         workspace = pipeline_worker.AGENTS_ROOT / agent
-        sysd = spec.get("systemd", {})
-        calendar = sysd.get("calendar", "hourly")
-        expected[f"ta-{agent}.service"] = provision._service_unit(
-            agent, calendar, workspace, spec.get("precheck", ""), sysd.get("env_file", ""))
-        expected[f"ta-{agent}.timer"] = provision._timer_unit(
-            agent, calendar, int(sysd.get("randomized_delay_sec", 0)))
-        for variant, vspec in spec.get("variants", {}).items():
-            vsysd = vspec.get("systemd", {})
-            vcalendar = vsysd.get("calendar", "daily")
-            unit = f"ta-{agent}-{variant}"
-            expected[f"{unit}.service"] = provision._variant_service_unit(
-                agent, variant, vcalendar, workspace, vsysd.get("env_file", ""))
-            expected[f"{unit}.timer"] = provision._timer_unit(
-                f"{agent} {variant}", vcalendar, int(vsysd.get("randomized_delay_sec", 0)))
+        expected.update(provision.render_units(agent, spec, workspace))
     return expected
 
 
