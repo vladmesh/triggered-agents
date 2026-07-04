@@ -43,6 +43,8 @@ class FakeWorker:
         self.polled = []                 # PR urls poll_pr was asked about
         self.merge_result = {"ok": True, "error": None}  # dict returned by merge_pr
         self.merged = []                 # PR urls merge_pr was asked to merge
+        self.pr_bases = {}               # pr_url -> baseRefName pr_base_branch returns (default "main")
+        self.pr_base_polled = []         # PR urls pr_base_branch was asked about
         self.notified = []               # (handle, text) nudges sent to worker terminals
         self.stand_config = None         # dict from read_stand_config, or None for no-stand project
         self.stand_branch = "pipeline/x"  # branch pr_branch returns (None -> gh can't answer)
@@ -118,6 +120,10 @@ class FakeWorker:
         self.merged.append(pr_url)
         return self.merge_result
 
+    def pr_base_branch(self, pr_url):
+        self.pr_base_polled.append(pr_url)
+        return self.pr_bases.get(pr_url, "main")
+
     def notify(self, handle, text):
         self.notified.append((handle, text))
         return bool(handle)
@@ -165,7 +171,8 @@ class _DispatcherBase(unittest.TestCase):
                      "write_task", "launch_worker", "activity", "poll_pr", "notify", "teardown",
                      "read_stand_config", "pr_branch", "run_stand", "spawn_reviewer",
                      "workspace_exists", "workspace_path", "rename_terminal", "merge_pr",
-                     "list_agent_worktrees", "ff_worktree", "remote_head_sha", "stop_terminals"):
+                     "pr_base_branch", "list_agent_worktrees", "ff_worktree", "remote_head_sha",
+                     "stop_terminals"):
             wp = mock.patch(f"triggered_agents.agents.pipeline.worker.{name}",
                             getattr(self.worker, name))
             wp.start()
@@ -2368,6 +2375,43 @@ class AutomergeTest(_DispatcherBase):
         self.assertTrue(any(r["event"] == "review" and r.get("reason") == "automerge-fail"
                             for r in self._runs()))
         dispatcher.tick()                                  # Blocked, off the board -> no retry
+        self.assertEqual(self.worker.merged, [self.PR])
+
+    def test_base_branch_mismatch_blocks_without_merging(self):
+        # triggered-agents-266: a sprint-shim card (base_branch override) whose worker opened the
+        # PR against the wrong base (gh pr create defaulting to main) must not be silently
+        # squash-merged there — the mismatch Blocks instead of reaching worker.merge_pr at all.
+        self.worker.stand_config = None
+        self.worker.remote_head_shas["sprint/007-dnd"] = "deadbeef"
+        ref = self._claim_one(project="dnd-simulator",
+                              meta={model.META_BASE_BRANCH: "sprint/007-dnd"})
+        ops.report(ref, "done", f"готово\nPR: {self.PR}")
+        self.worker.pr_status = None
+        dispatcher.tick()
+        self.assertEqual(self._column(ref), "Validate")
+        self._ci_green()
+        dispatcher.tick()                     # no stand -> spawns the reviewer directly
+        ops.verdict(ref, "green", "все критерии реально выполнены")
+        self.worker.pr_bases[self.PR] = "main"    # worker ignored TASK.md, PR opened against main
+        dispatcher.tick()
+        self.assertEqual(self._column(ref), "Blocked")
+        self.assertNotIn(ref, dispatcher._load_cards())
+        self.assertEqual(self.worker.merged, [])
+        journal = self._markers(ref)
+        self.assertIn("sprint/007-dnd", journal)
+        self.assertIn("main", journal)
+        self.assertTrue(any(r["event"] == "review" and r.get("reason") == "base-mismatch"
+                            and r.get("expected") == "sprint/007-dnd" and r.get("actual") == "main"
+                            for r in self._runs()))
+
+    def test_base_branch_check_unavailable_retries_without_merging_or_blocking(self):
+        ref = self._to_review_green_no_stand()
+        self.worker.pr_bases[self.PR] = None      # gh can't answer baseRefName this tick
+        dispatcher.tick()
+        self.assertEqual(self.worker.merged, [])
+        self.assertEqual(self._column(ref), "Validate")
+        self.worker.pr_bases.pop(self.PR)          # gh answers "main" (the default) next tick
+        dispatcher.tick()
         self.assertEqual(self.worker.merged, [self.PR])
 
     def test_automerge_off_switch_reverts_both_stand_and_no_stand_to_human_merge(self):

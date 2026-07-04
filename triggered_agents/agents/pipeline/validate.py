@@ -25,9 +25,12 @@ layer 3 (independent review, every project): once the lower layers are green, sp
     verdict exactly the way dispatcher._advance drives an In-progress card by the worker's report:
     spawn once per code state, read the verdict past a baseline, act. Red -> back to In progress
     with a nudge, up to REVIEW_RETURN_CAP returns over the card's life, then Blocked до vladmesh.
-    Green on a PR project (stand or not) triggers the dispatcher's own squash merge, one-shot: a
-    failed attempt (conflict, red required check, gh down) goes straight to Blocked, never a
-    retry-loop — TA_AUTOMERGE=off reverts this to waiting for a human merge, no redeploy needed.
+    Green on a PR project (stand or not) triggers the dispatcher's own squash merge, one-shot, but
+    only once the PR's actual base (gh) matches resolve_base_branch(project, card.base_branch) —
+    a mismatch (e.g. a sprint-shim card's PR opened against main instead of sprint/NNN) Blocks
+    instead of merging into the wrong branch. A failed merge attempt (conflict, red required
+    check, gh down) also goes straight to Blocked, never a retry-loop — TA_AUTOMERGE=off reverts
+    this to waiting for a human merge, no redeploy needed.
     Green on a contrib card has nothing to wait for (no PR in this pipeline) and goes straight to
     Done with the worker workspace torn down. A reviewer that goes silent without a verdict is
     caught by the same watchdog threshold as a worker head.
@@ -522,7 +525,7 @@ def _review_gate(ref: str, pr: str | None, card: dict, records: dict, view: dict
     if verdict is None:
         return _review_watchdog(ref, rec, records, watchdog_seconds)
     if verdict == "green":
-        return _review_green(ref, pr, is_stand, rec, records, contrib)
+        return _review_green(ref, pr, card, is_stand, rec, records, contrib)
     return _review_red(ref, pr, rec, records, contrib)
 
 
@@ -620,7 +623,7 @@ def _review_green_contrib(ref: str, rec: dict, records: dict) -> bool:
     return True
 
 
-def _review_green(ref: str, pr: str | None, is_stand: bool, rec: dict, records: dict,
+def _review_green(ref: str, pr: str | None, card: dict, is_stand: bool, rec: dict, records: dict,
                   contrib: tuple[str, str] | None = None) -> bool:
     """Green verdict: all three layers clear. Tear the reviewer worktree down once. A contrib card
     (`contrib` set) has nothing left to wait for — straight to Done (_review_green_contrib).
@@ -635,6 +638,14 @@ def _review_green(ref: str, pr: str | None, is_stand: bool, rec: dict, records: 
     attempt — conflict, stale branch, gh down — is a final outcome here, not a retry: a comment
     with the reason and straight to Blocked so a human is pulled in instead of the tick hammering
     `gh pr merge` forever.
+
+    Before that squash merge, the PR's actual base (worker.pr_base_branch) is checked against
+    resolve_base_branch(project, card's own base_branch) — a worker on a sprint-shim card
+    (base_branch=sprint/NNN) who ignores TASK.md and lets `gh pr create` default to main would
+    otherwise get silently squash-merged into main, exactly what the shim exists to prevent
+    (triggered-agents-266). A mismatch never reached a merge, so it Blocks rather than retrying;
+    gh being unreachable here is a transient like poll_pr/pr_branch, so it just waits for a tick
+    where gh answers.
 
     With automerge off, the card logs the terminal green exactly once (`review_green_logged`), not
     on every tick it idles here waiting for a human to merge — the original one-shot contract this
@@ -654,6 +665,19 @@ def _review_green(ref: str, pr: str | None, is_stand: bool, rec: dict, records: 
         return True
     if rec.get("automerge_done"):
         return changed
+    expected_base = worker.resolve_base_branch(card.get("project") or "", card.get("base_branch") or "")
+    actual_base = worker.pr_base_branch(pr)
+    if actual_base is None:
+        return changed
+    if actual_base != expected_base:
+        ops.add_comment("dispatcher", ref,
+                        f"PR {pr} открыт против `{actual_base}`, ожидалась база `{expected_base}` — "
+                        f"автомерж остановлен, карточка в Blocked.")
+        ops.move_card("dispatcher", ref, "Blocked")
+        records.pop(ref, None)
+        STATE.log_run("review", reference=ref, to="Blocked", reason="base-mismatch", pr=pr,
+                      expected=expected_base, actual=actual_base)
+        return True
     rec["automerge_done"] = True
     result = worker.merge_pr(pr)
     if result["ok"]:
