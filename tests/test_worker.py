@@ -545,5 +545,96 @@ class SpawnReviewerClosesOrphanTest(unittest.TestCase):
         close.assert_called_once_with("/ws", "term-rev")
 
 
+class ApplyProvisionTest(unittest.TestCase):
+    """worker.apply_provision (triggered-agents-256): fetch+hard-reset the canonical checkout to
+    origin/main, then run its deploy/provision.py for the given agents. subprocess.run is faked
+    end to end — no real git, no real host provisioning — so these check the call sequence and
+    short-circuiting, not the shell commands themselves (that's the card's live host check)."""
+
+    def setUp(self):
+        p = mock.patch.object(worker, "TRIGGERED_AGENTS_CANONICAL_ROOT", Path("/canon"))
+        p.start()
+        self.addCleanup(p.stop)
+        p2 = mock.patch.object(worker, "_DEPLOY_PROVISION", Path("/canon/deploy/provision.py"))
+        p2.start()
+        self.addCleanup(p2.stop)
+
+    def _ok(self, out=""):
+        return subprocess.CompletedProcess([], 0, out, "")
+
+    def _fail(self, err="boom"):
+        return subprocess.CompletedProcess([], 1, "", err)
+
+    def test_happy_path_runs_fetch_reset_then_provision_with_agents(self):
+        calls = []
+
+        def fake_run(cmd, **kw):
+            calls.append(cmd)
+            return self._ok()
+
+        with mock.patch("subprocess.run", fake_run):
+            result = worker.apply_provision(["curator", "steward"])
+        self.assertTrue(result["ok"])
+        self.assertEqual(calls, [
+            ["git", "-C", "/canon", "fetch", "--quiet", "origin", "main"],
+            ["git", "-C", "/canon", "reset", "--hard", "origin/main"],
+            ["python3", "/canon/deploy/provision.py", "curator", "steward"],
+        ])
+
+    def test_empty_agents_means_every_agent_no_argv(self):
+        calls = []
+
+        def fake_run(cmd, **kw):
+            calls.append(cmd)
+            return self._ok()
+
+        with mock.patch("subprocess.run", fake_run):
+            worker.apply_provision([])
+        self.assertEqual(calls[-1], ["python3", "/canon/deploy/provision.py"])
+
+    def test_fetch_failure_short_circuits_before_reset_or_provision(self):
+        calls = []
+
+        def fake_run(cmd, **kw):
+            calls.append(cmd)
+            return self._fail("network unreachable")
+
+        with mock.patch("subprocess.run", fake_run):
+            result = worker.apply_provision(["curator"])
+        self.assertFalse(result["ok"])
+        self.assertEqual(len(calls), 1)                  # never reached reset or provision
+        self.assertIn("network unreachable", result["log"])
+
+    def test_reset_failure_short_circuits_before_provision(self):
+        calls = []
+
+        def fake_run(cmd, **kw):
+            calls.append(cmd)
+            return self._ok() if cmd[3] == "fetch" else self._fail("cannot reset")
+
+        with mock.patch("subprocess.run", fake_run):
+            result = worker.apply_provision(["curator"])
+        self.assertFalse(result["ok"])
+        self.assertEqual(len(calls), 2)                   # fetch + reset, never provision
+        self.assertIn("cannot reset", result["log"])
+
+    def test_provision_failure_is_reported_not_ok(self):
+        def fake_run(cmd, **kw):
+            return self._ok() if cmd[0] == "git" else self._fail("provision blew up")
+
+        with mock.patch("subprocess.run", fake_run):
+            result = worker.apply_provision(["curator"])
+        self.assertFalse(result["ok"])
+        self.assertIn("provision blew up", result["log"])
+
+    def test_timeout_at_any_step_is_a_non_ok_result_not_a_raise(self):
+        def fake_run(cmd, **kw):
+            raise subprocess.TimeoutExpired(cmd, 5)
+
+        with mock.patch("subprocess.run", fake_run):
+            result = worker.apply_provision(["curator"])
+        self.assertFalse(result["ok"])
+
+
 if __name__ == "__main__":
     unittest.main()
