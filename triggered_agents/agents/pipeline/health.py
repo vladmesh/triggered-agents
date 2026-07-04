@@ -40,9 +40,10 @@ HEALTH_FILE = STATE.dir / "resource_health.json"
 PROBE_TTL_S = int(os.environ.get("TA_PROBE_TTL_S", "300"))
 PROBE_TIMEOUT_S = int(os.environ.get("TA_PROBE_TIMEOUT_S", "20"))
 # Comma-separated resource ids to report red without running their real probe at all — a live e2e
-# proving the retry-switch/fallback machinery lands on a genuinely different runtime (e.g.
-# hermes-flash) needs to redden claude-sub on demand, without actually touching the shared
-# subscription. Bypasses the TTL cache too, so flipping it takes effect on the very next refresh().
+# proving the fallback machinery behaves right under a red resource (steward chain lands on the
+# hermes head, product heads claim-skip) needs to redden claude-sub on demand, without actually
+# touching the shared subscription. Bypasses the TTL cache too, so flipping it takes effect on the
+# very next refresh().
 _FORCE_RED_ENV = "TA_HEALTH_FORCE_RED"
 
 GREEN = "green"

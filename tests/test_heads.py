@@ -30,7 +30,7 @@ class RealRegistryTest(unittest.TestCase):
 
     def test_starting_profiles_present(self):
         self.assertEqual(set(self.reg.known()),
-                         {"claude-sonnet", "claude-opus", "claude-fable", "hermes-flash"})
+                         {"claude-sonnet", "claude-opus", "claude-fable", "hermes"})
 
     def test_claude_profiles_share_the_subscription_resource(self):
         for pid in ("claude-sonnet", "claude-opus", "claude-fable"):
@@ -40,16 +40,18 @@ class RealRegistryTest(unittest.TestCase):
         # 2026-07-04 (vladmesh): the steward must survive the whole claude-sub resource going red,
         # so after claude-opus the chain leaves the subscription onto a non-Anthropic runtime.
         self.assertEqual(self.reg.profile("claude-fable").get("fallback"),
-                         ["claude-opus", "hermes-flash"])
+                         ["claude-opus", "hermes"])
 
-    def test_claude_sonnet_falls_back_to_hermes_flash_cross_runtime(self):
-        # 2026-07-03 design session: head-technical retries must prove the switch on a genuinely
-        # different, non-claude runtime — claude-opus is untouched (still claude-sub only).
-        self.assertEqual(self.reg.profile("claude-sonnet").get("fallback"), ["hermes-flash"])
+    def test_product_heads_have_no_cross_runtime_fallback(self):
+        # 2026-07-04 (vladmesh): product tasks are Claude-only — overnight 04.07 the gemini-flash
+        # fallback finished worker turns without push/PR/report, so a red claude-sub must mean
+        # claim-skip (resolve_head -> None, card waits in Ready), never a hermes claim. Hermes
+        # stays only in the steward's claude-fable chain above.
+        self.assertEqual(self.reg.profile("claude-sonnet").get("fallback") or [], [])
         self.assertEqual(self.reg.profile("claude-opus").get("fallback") or [], [])
 
-    def test_hermes_flash_is_on_its_own_resource(self):
-        self.assertEqual(self.reg.profile("hermes-flash")["resource"], "openrouter")
+    def test_hermes_is_on_its_own_resource(self):
+        self.assertEqual(self.reg.profile("hermes")["resource"], "openrouter")
 
     def test_unknown_profile_raises_with_known_ids_listed(self):
         with self.assertRaises(heads.HeadRegistryError) as ctx:
@@ -93,15 +95,15 @@ class RenderHermesTest(unittest.TestCase):
         self.reg = heads.load_registry()
 
     def test_renders_hermes_binary_not_claude(self):
-        cmd = heads.render_command("hermes-flash", role="worker", prompt="ping", registry=self.reg)
+        cmd = heads.render_command("hermes", role="worker", prompt="ping", registry=self.reg)
         self.assertIn("BOARD_ROLE=worker hermes", cmd)
         self.assertNotIn("claude", cmd)
         self.assertNotIn("--dangerously-skip-permissions", cmd)
 
     def test_carries_model_provider_and_yolo_flags(self):
-        cmd = heads.render_command("hermes-flash", role="worker", prompt="ping", registry=self.reg)
+        cmd = heads.render_command("hermes", role="worker", prompt="ping", registry=self.reg)
         self.assertIn("-z " + repr("ping"), cmd)
-        self.assertIn("-m google/gemini-2.5-flash", cmd)
+        self.assertIn("-m openai/gpt-5.5", cmd)
         self.assertIn("--provider openrouter", cmd)
         self.assertIn("--yolo", cmd)
         self.assertIn("--cli", cmd)

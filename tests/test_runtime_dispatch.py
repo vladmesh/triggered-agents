@@ -175,16 +175,16 @@ class LaunchCmdTest(unittest.TestCase):
     def test_steward_head_falls_back_to_next_profile_when_resource_red(self):
         from triggered_agents.agents.pipeline import health as pipeline_health
 
-        # claude-fable's chain is claude-opus (same claude-sub resource) then hermes-flash (a
+        # claude-fable's chain is claude-opus (same claude-sub resource) then hermes (a
         # different, openrouter resource) — see heads.toml, PR #38: the steward is the watcher of
         # last resort and must wake even when the whole claude-sub resource is red. With claude-sub
         # red and openrouter unmentioned (defaults green — heads.health.resolve_head), resolution
-        # walks past claude-opus (same red resource) onto hermes-flash.
+        # walks past claude-opus (same red resource) onto hermes.
         with mock.patch.object(pipeline_health, "refresh", lambda: {"claude-sub": "red"}):
             skill, cmd = dispatch._launch_cmd("steward")
         self.assertIn("BOARD_ROLE=steward", cmd)
         self.assertIn("hermes", cmd)
-        self.assertIn("google/gemini-2.5-flash", cmd)
+        self.assertIn("openai/gpt-5.5", cmd)
 
     def test_steward_deep_sweep_variant_resolves_its_own_skill_through_the_same_head(self):
         from triggered_agents.agents.pipeline import health as pipeline_health

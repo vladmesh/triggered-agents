@@ -20,20 +20,23 @@ account = "claude-subscription"
 probe = "python3 -m triggered_agents pipeline probe --resource claude-sub"
 
 [resources.openrouter]
-# Pay-per-token OpenRouter credit (key: project_inspect/.env open_router_key). claude-sonnet's
-# fallback below (2026-07-03 design session: head-technical retries must prove the switch on a
-# genuinely different, non-claude runtime) — this is the one resource live money can actually be
-# spent against on a claim/retry, not just a debug knob. Probe: one real 1-token chat completion
-# against gemini-flash (health.probe_openrouter) — red on a missing key, a non-2xx response, or a
-# timeout.
+# Pay-per-token OpenRouter credit (key: project_inspect/.env open_router_key). Since 2026-07-04
+# only the steward's last-resort hermes profile draws from it — product tasks are Claude-only, so
+# this is spent when the whole claude-sub resource is red and the watcher still has to wake.
+# Probe: one real 1-token chat completion against gemini-flash (health.probe_openrouter) — red on
+# a missing key, a non-2xx response, or a timeout.
 account = "openrouter-pooled-key"
 probe = "python3 -m triggered_agents pipeline probe --resource openrouter"
 
 [profiles.claude-sonnet]
+# No fallback (2026-07-04, vladmesh): product tasks run on Claude only. Overnight 04.07 the
+# gemini-flash fallback burned three worker attempts without ever reaching the report step, so a
+# red claude-sub now means claim-skip — the card waits in Ready until the resource recovers
+# (health.resolve_head returns None) instead of spending openrouter tokens on work that won't land.
 resource = "claude-sub"
 adapter = "claude"
 model = "sonnet"
-fallback = ["hermes-flash"]
+fallback = []
 
 [profiles.claude-opus]
 resource = "claude-sub"
@@ -43,20 +46,21 @@ fallback = []
 
 [profiles.claude-fable]
 # Fable head for the steward agent (triggered-agents-243 design grill, 2026-07-04). Fallback:
-# claude-opus first (Fable itself leaving the subscription), then hermes-flash on a non-Anthropic
+# claude-opus first (Fable itself leaving the subscription), then hermes on a non-Anthropic
 # model (vladmesh, 2026-07-04) — the steward is the watcher of last resort and must wake even when
 # the whole claude-sub resource is red; a few paid openrouter tokens are the accepted price.
 resource = "claude-sub"
 adapter = "claude"
 model = "fable"
-fallback = ["claude-opus", "hermes-flash"]
+fallback = ["claude-opus", "hermes"]
 
-[profiles.hermes-flash]
-# Cross-runtime fallback for claude-sonnet (pay-per-token via openrouter): a live head-technical
-# retry (dispatcher._watchdog_retry) or a claim while claude-sub is red can both land here for
-# real — health.resolve_head/next_retry_head walk this chain the same way either path.
+[profiles.hermes]
+# Last-resort head for the steward chain ONLY — deliberately absent from every product profile's
+# fallback (2026-07-04, vladmesh). Model is gpt-5.5, not a flash-tier one (same date): overnight
+# 04.07 gemini-flash finished worker turns declaring success without push/PR/report, so the one
+# place hermes still runs gets a model smart enough to follow the protocol.
 resource = "openrouter"
 adapter = "hermes"
-model = "google/gemini-2.5-flash"
+model = "openai/gpt-5.5"
 provider = "openrouter"
 fallback = []

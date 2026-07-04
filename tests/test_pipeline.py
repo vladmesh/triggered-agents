@@ -568,7 +568,7 @@ class TestClaim(PatchedBoardTest):
         board = self.make_board()
         ref = board.add_task("A", "Ready", meta={model.META_TASK_TYPE: "code",
                                                  model.META_PROJECT: "personal_site",
-                                                 model.META_HEAD: "hermes-flash"})
+                                                 model.META_HEAD: "hermes"})
         ops.claim_card(ref, "w1")  # must not raise
 
     def test_refuses_unknown_head_with_clear_message(self):
@@ -787,9 +787,9 @@ class TestRetryState(PatchedBoardTest):
                                                  model.META_PROJECT: "personal_site",
                                                  model.META_HEAD: "claude-sonnet"})
         ops.set_retry_state(ref, retry_same=1, retry_switch=1,
-                            retry_heads="claude-sonnet,hermes-flash", head="hermes-flash")
+                            retry_heads="claude-sonnet,hermes", head="hermes")
         meta = ops.get_metadata(ref)
-        self.assertEqual(meta[model.META_HEAD], "hermes-flash")
+        self.assertEqual(meta[model.META_HEAD], "hermes")
 
     def test_set_retry_state_survives_being_written_right_after_a_ready_reset(self):
         # Exactly the sequence dispatcher._watchdog_retry runs: move_card(...,'Ready') resets the
