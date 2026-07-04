@@ -256,6 +256,22 @@ class ManifestLookupTest(unittest.TestCase):
         self.assertEqual(worker.read_base_branch("bare-proj"), "main")
         self.assertFalse(worker.is_contrib("bare-proj"))
 
+    def test_resolve_base_branch_card_override_wins_over_manifest(self):
+        d = self._project_dir("sprint-proj")
+        (d / "workspace.toml").write_text('[workspace]\nbase_branch = "develop"\n')
+        self.assertEqual(worker.resolve_base_branch("sprint-proj", "sprint/007-slug"),
+                         "sprint/007-slug")
+
+    def test_resolve_base_branch_falls_back_to_manifest_when_card_unset(self):
+        d = self._project_dir("sprint-proj2")
+        (d / "workspace.toml").write_text('[workspace]\nbase_branch = "develop"\n')
+        self.assertEqual(worker.resolve_base_branch("sprint-proj2", None), "develop")
+        self.assertEqual(worker.resolve_base_branch("sprint-proj2", ""), "develop")
+
+    def test_resolve_base_branch_falls_back_to_default_main_when_neither_set(self):
+        self._project_dir("bare-proj2")
+        self.assertEqual(worker.resolve_base_branch("bare-proj2", None), "main")
+
 
 class ContribBaseRefTest(unittest.TestCase):
     """ensure_contrib_base_ref: idempotent `orca repo set-base-ref` against `orca repo show`'s

@@ -134,14 +134,17 @@ def _is_done(task: dict, pid: int) -> bool:
 def create_card(project: str, task_type: str, title: str, description: str = "",
                 ref: str | None = None, column: str = "Идеи",
                 blocked_by: str | None = None, head: str | None = None,
-                slug: str | None = None, role: str | None = None) -> dict:
+                slug: str | None = None, base_branch: str | None = None,
+                role: str | None = None) -> dict:
     """PO/steward: create a spec card in Идеи or Ready, keyed by reference, with metadata.
 
     `slug` names the card's future worker/reviewer workspace (`<reference>-<slug>`); when
     omitted, claim falls back to a transliterated slug of the title (naming.fallback_slug) so an
     old/manual card without one still claims fine. `head`, when given, must name a profile in
     heads.toml (checked before anything is written); omitted, the card gets heads.DEFAULT_PROFILE
-    at bring-up.
+    at bring-up. `base_branch`, when given, overrides the project's manifest base_branch for this
+    card only (worker.resolve_base_branch); omitted, bring-up falls back to the manifest lookup
+    exactly as before this field existed.
 
     `role="steward"` scrubs title/description the same way add_comment does for steward — the
     escalation/idea path SKILL.md sends steward through (create in Идеи/Ready, then move to
@@ -176,6 +179,8 @@ def create_card(project: str, task_type: str, title: str, description: str = "",
         values[model.META_HEAD] = head
     if slug:
         values[model.META_SLUG] = slug
+    if base_branch:
+        values[model.META_BASE_BRANCH] = base_branch
     call("saveTaskMetadata", task_id=task_id, values=values)
     return {"action": "created", "id": task_id, "reference": ref, "column": column}
 
@@ -212,12 +217,13 @@ def create_report_card(project: str, title: str, slug: str, description: str = "
 
 
 def update_card(role: str, reference: str, slug: str | None = None,
-                head: str | None = None, blocked_by: str | None = None) -> dict:
-    """PO-only: patch slug/head/blocked_by metadata on an existing card. Only the fields
-    passed (not None) change; column and claim are never touched. Same validation as
+                head: str | None = None, blocked_by: str | None = None,
+                base_branch: str | None = None) -> dict:
+    """PO-only: patch slug/head/blocked_by/base_branch metadata on an existing card. Only the
+    fields passed (not None) change; column and claim are never touched. Same validation as
     create_card (slug SLUG_RE, head against heads.toml, blocked_by pointing at an existing
     card), all checked before anything is written so a rejected update leaves metadata
-    untouched."""
+    untouched. `base_branch=""` clears the override back to the manifest default."""
     if role != "po":
         raise model.GuardError(f"role {role!r} may not update card metadata (po only)")
     if slug is not None and not naming.SLUG_RE.match(slug):
@@ -235,6 +241,8 @@ def update_card(role: str, reference: str, slug: str | None = None,
         values[model.META_HEAD] = head
     if blocked_by is not None:
         values[model.META_BLOCKED_BY] = blocked_by
+    if base_branch is not None:
+        values[model.META_BASE_BRANCH] = base_branch
     if values:
         call("saveTaskMetadata", task_id=int(task["id"]), values=values)
     meta = call("getTaskMetadata", task_id=int(task["id"])) or {}
@@ -244,6 +252,7 @@ def update_card(role: str, reference: str, slug: str | None = None,
         "slug": meta.get(model.META_SLUG, ""),
         "head": meta.get(model.META_HEAD, ""),
         "blocked_by": meta.get(model.META_BLOCKED_BY, ""),
+        "base_branch": meta.get(model.META_BASE_BRANCH, ""),
     }
 
 
@@ -503,6 +512,7 @@ def _card_view(pid: int, task: dict, cols: dict, lanes: dict) -> dict:
         "head": meta.get(model.META_HEAD, ""),
         "claim": meta.get(model.META_CLAIM, ""),
         "slug": meta.get(model.META_SLUG, ""),
+        "base_branch": meta.get(model.META_BASE_BRANCH, ""),
         "steward_report": meta.get(model.META_STEWARD_REPORT, ""),
     }
 

@@ -59,6 +59,7 @@ class FakeWorker:
         self.contrib_projects = set()    # project names is_contrib() should report True for
         self.remote_head_shas = {}       # branch -> sha remote_head_sha returns; missing -> None
         self.stopped_terminals = []      # workspaces stop_terminals was asked to stop (no rm)
+        self.workspace_calls = []        # (project, name, base_branch) every create_workspace call
         self._n = 0
 
     def read_base_branch(self, project):
@@ -75,6 +76,7 @@ class FakeWorker:
         return self.ff_results.get(path, {"ok": True, "reason": None, "before": "x", "after": "x"})
 
     def create_workspace(self, project, name, base_branch):
+        self.workspace_calls.append((project, name, base_branch))
         if self.create_raises:
             raise self.create_raises
         self._n += 1
@@ -354,6 +356,42 @@ class DispatcherTest(_DispatcherBase):
         dispatcher.tick()
         self.assertEqual(self._column(ref), "Blocked")
         self.assertEqual(self.worker.launched, [])
+
+    # card-level base_branch override (triggered-agents-260) ----------------
+    def test_no_base_branch_uses_manifest_default(self):
+        # unchanged behavior: no card override -> the project's manifest lookup (stubbed "main").
+        ref = self._ready_card("A")
+        dispatcher.tick()
+        self.assertEqual(len(self.worker.workspace_calls), 1)
+        project, _name, base = self.worker.workspace_calls[0]
+        self.assertEqual((project, base), ("personal_site", "main"))
+        task_md = self.worker.tasks_written[0][1]
+        self.assertIn("- база: main", task_md)
+        self.assertIn("base — `main`", task_md)
+
+    def test_card_base_branch_overrides_manifest_at_bring_up(self):
+        self.worker.remote_head_shas["sprint/007-dnd"] = "deadbeef"
+        ref = self._ready_card("A", project="dnd-simulator",
+                               meta={model.META_BASE_BRANCH: "sprint/007-dnd"})
+        dispatcher.tick()
+        self.assertEqual(len(self.worker.workspace_calls), 1)
+        project, _name, base = self.worker.workspace_calls[0]
+        self.assertEqual((project, base), ("dnd-simulator", "sprint/007-dnd"))
+        self.assertEqual(self._column(ref), model.IN_PROGRESS)
+        task_md = self.worker.tasks_written[0][1]
+        self.assertIn("- база: sprint/007-dnd", task_md)
+        self.assertIn("base — `sprint/007-dnd`", task_md)
+
+    def test_card_base_branch_missing_on_origin_blocks_no_silent_main_fallback(self):
+        # no self.worker.remote_head_shas entry -> remote_head_sha returns None (branch absent)
+        ref = self._ready_card("A", project="dnd-simulator",
+                               meta={model.META_BASE_BRANCH: "sprint/999-ghost"})
+        dispatcher.tick()
+        self.assertEqual(self._column(ref), "Blocked")
+        self.assertEqual(self.worker.workspace_calls, [])   # never created off main, never at all
+        self.assertEqual(self.worker.launched, [])
+        posted = " ".join(c["comment"] for cl in self.board.comments.values() for c in cl)
+        self.assertIn("sprint/999-ghost", posted)
 
     def test_claim_orders_by_position_and_skips_blocked_by(self):
         # pred not Done, so B is unclaimable; A (next in order) should be claimed instead.
@@ -1718,6 +1756,22 @@ class ValidateReviewTest(_DispatcherBase):
         self.assertIn("review_baseline", dispatcher._load_cards()[ref])
         dispatcher.tick()                                # verdict still pending -> no re-spawn
         self.assertEqual(len(self.worker.reviewer_spawns), 1)
+
+    def test_reviewer_spawn_uses_card_base_branch_override(self):
+        # triggered-agents-260: the reviewer's own worktree must land on the card's base_branch
+        # override too, not the project manifest default ("main" here, stubbed read_base_branch).
+        self.worker.remote_head_shas["sprint/007-dnd"] = "deadbeef"
+        ref = self._claim_one(project="dnd-simulator",
+                              meta={model.META_BASE_BRANCH: "sprint/007-dnd"})
+        pr = "https://github.com/vladmesh/dnd-simulator/pull/1"
+        ops.report(ref, "done", f"готово\nPR: {pr}")
+        self.worker.pr_status = None
+        dispatcher.tick()
+        self._ci_green()
+        dispatcher.tick()
+        self.assertEqual(len(self.worker.reviewer_spawns), 1)
+        base_used = self.worker.reviewer_spawns[0][2]
+        self.assertEqual(base_used, "sprint/007-dnd")
 
     def _automerge_off(self):
         os.environ["TA_AUTOMERGE"] = "off"

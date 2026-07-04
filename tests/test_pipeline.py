@@ -271,6 +271,16 @@ class TestCreate(PatchedBoardTest):
                 ops.create_card("personal_site", "code", "T", slug=bad)
         self.assertEqual(board.tasks, {})
 
+    def test_base_branch_is_stored_in_metadata(self):
+        board = self.make_board()
+        out = ops.create_card("personal_site", "code", "T", base_branch="sprint/007-dnd")
+        self.assertEqual(board.metadata[out["id"]][model.META_BASE_BRANCH], "sprint/007-dnd")
+
+    def test_missing_base_branch_leaves_metadata_unset(self):
+        board = self.make_board()
+        out = ops.create_card("personal_site", "code", "T")
+        self.assertNotIn(model.META_BASE_BRANCH, board.metadata[out["id"]])
+
     def test_head_is_stored_in_metadata(self):
         board = self.make_board()
         out = ops.create_card("personal_site", "code", "T", head="claude-opus")
@@ -356,7 +366,8 @@ class TestUpdate(PatchedBoardTest):
         self.assertEqual(board.metadata[tid][model.META_SLUG], "old-slug")
         self.assertEqual(board.metadata[tid][model.META_HEAD], "claude-opus")
         self.assertEqual(out, {"action": "updated", "reference": ref,
-                               "slug": "old-slug", "head": "claude-opus", "blocked_by": ""})
+                               "slug": "old-slug", "head": "claude-opus", "blocked_by": "",
+                               "base_branch": ""})
 
     def test_unknown_head_raises_and_writes_nothing(self):
         board = self.make_board()
@@ -395,6 +406,18 @@ class TestUpdate(PatchedBoardTest):
         with self.assertRaises(model.GuardError):
             ops.update_card("po", ref, blocked_by="ghost")
         self.assertEqual(board.method_calls("saveTaskMetadata"), [])
+
+    def test_base_branch_is_stored_and_clearable(self):
+        board = self.make_board()
+        ref = board.add_task("A", "Ready", meta={model.META_TASK_TYPE: "code",
+                                                 model.META_PROJECT: "personal_site"})
+        out = ops.update_card("po", ref, base_branch="sprint/007-dnd")
+        self.assertEqual(out["base_branch"], "sprint/007-dnd")
+        tid = next(t["id"] for t in board.tasks.values() if t["reference"] == ref)
+        self.assertEqual(board.metadata[tid][model.META_BASE_BRANCH], "sprint/007-dnd")
+        out = ops.update_card("po", ref, base_branch="")
+        self.assertEqual(out["base_branch"], "")
+        self.assertEqual(board.metadata[tid][model.META_BASE_BRANCH], "")
 
     def test_role_other_than_po_raises_and_writes_nothing(self):
         board = self.make_board()
@@ -442,6 +465,31 @@ class TestCliUpdate(PatchedBoardTest):
         rc = self.cli.main(["--role", "worker", "update", "--ref", ref, "--slug", "new-slug"])
         self.assertEqual(rc, 3)
         self.assertEqual(board.method_calls("saveTaskMetadata"), [])
+
+    def test_po_update_base_branch_ok(self):
+        board = self.make_board()
+        ref = board.add_task("A", "Ready", meta={model.META_TASK_TYPE: "code",
+                                                 model.META_PROJECT: "personal_site"})
+        rc = self.cli.main(["--role", "po", "update", "--ref", ref,
+                           "--base-branch", "sprint/007-dnd"])
+        self.assertEqual(rc, 0)
+        tid = next(t["id"] for t in board.tasks.values() if t["reference"] == ref)
+        self.assertEqual(board.metadata[tid][model.META_BASE_BRANCH], "sprint/007-dnd")
+
+
+class TestCliCreateBaseBranch(PatchedBoardTest):
+    def setUp(self):
+        from triggered_agents.agents.pipeline import cli
+        self.cli = cli
+
+    def test_po_create_with_base_branch_ok(self):
+        board = self.make_board()
+        rc = self.cli.main(["--role", "po", "create", "--project", "dnd-simulator",
+                           "--type", "code", "--title", "T",
+                           "--base-branch", "sprint/007-dnd"])
+        self.assertEqual(rc, 0)
+        tid = next(iter(board.tasks))
+        self.assertEqual(board.metadata[tid][model.META_BASE_BRANCH], "sprint/007-dnd")
 
 
 class TestClaim(PatchedBoardTest):
