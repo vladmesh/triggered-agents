@@ -40,6 +40,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # repo root
 from triggered_agents.agents.board.kanboard import call  # noqa: E402
 from triggered_agents.agents.pipeline import cli as pipeline_cli  # noqa: E402
 from triggered_agents.agents.pipeline import model  # noqa: E402
+from triggered_agents.agents.pipeline import ops as pipeline_ops  # noqa: E402
 from triggered_agents.agents.steward import cli as steward_cli  # noqa: E402
 from triggered_agents.agents.steward import signals  # noqa: E402
 
@@ -169,6 +170,33 @@ def main() -> int:
         rc, show = run_board(None, ["show", "--ref", ref2])
         texts = " ".join(c["text"] for c in show["comments"])
         check("override left a paper trail", f"[{model.MARKER_STEWARD_OVERRIDE}]" in texts)
+
+        # 5c. triggered-agents-255: the steward's own wake-up report card — a stand-in for what
+        #     the real dispatch machinery does before spawning the head (dispatch.py's
+        #     _steward_report_card), then the head's own end-of-run close.
+        report = pipeline_ops.create_report_card(
+            "triggered-agents", "steward: e2e hourly sweep", "steward-sweep-e2e-1")
+        report_ref = report["reference"]
+        check("report card created straight in In progress", report["column"] == model.IN_PROGRESS)
+        rc, show = run_board(None, ["show", "--ref", report_ref])
+        check("report card already carries its own claim",
+             show["metadata"].get(model.META_CLAIM) == "steward-sweep-e2e-1")
+
+        # a real code card for the same project claims fine regardless of the report card sitting
+        # In progress (the one-code-task-per-project guard must never count it).
+        rc, code_card = run_board("po", ["create", "--project", "triggered-agents", "--type", "code",
+                                        "--title", "E2E: real code card", "--column", "Ready"])
+        check("code card created rc=0", rc == 0)
+        rc, _ = run_board("dispatcher", ["claim", "--ref", code_card["reference"], "--worker", "w-e2e"])
+        check("code card claims fine alongside the report card", rc == 0)
+
+        rc, _ = run_board("steward", ["comment", "--ref", report_ref,
+                                      "--body", "e2e: сигналов не нашёл, прогон чистый"])
+        check("progress comment on the report card rc=0", rc == 0)
+        rc, _ = run_board("steward", ["move", "--ref", report_ref, "--to", "Done"])
+        check("report card closes to Done rc=0", rc == 0)
+        rc, show = run_board(None, ["show", "--ref", report_ref])
+        check("report card actually in Done", rc == 0 and show["column"] == "Done")
 
         # 6. clean up the staged anomalies, advance, and confirm the gate goes quiet again. The
         # resource_health.json cache stays red on disk (nothing here flips it back to green) —

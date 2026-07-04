@@ -24,6 +24,14 @@ break-glass action a human would otherwise have to do by hand through the Kanboa
 dispatcher itself is the thing that broke (a claimed In-progress/Validate card's watchdog never
 fires if the tick that would run it is dead) — the dispatcher's own In progress/Validate -> Blocked
 stays automatic and unaffected; this is steward reaching in from outside that loop.
+
+steward also gets In progress -> Done (STEWARD_REPORT_DONE, triggered-agents-255), but only for its
+own wake-up report card: ops.create_report_card puts that card straight into In progress (never
+through Ready/claim, already self-claimed in the same call) so the dispatch machinery can hand a
+head a card to work before it even starts, and this is the one legal way back out of it once the
+report is written. ops.move_card gates it further — the card must actually carry
+META_STEWARD_REPORT, so this can never become a side door for closing an ordinary code/research
+card out of review.
 """
 from __future__ import annotations
 
@@ -65,6 +73,10 @@ META_SLUG = "slug"
 META_RETRY_SAME = "retry_same"
 META_RETRY_SWITCH = "retry_switch"
 META_RETRY_HEADS = "retry_heads"
+# "1" on a card ops.create_report_card made (the steward's own wake-up report, triggered-agents-
+# 255) — never set any other way. The only thing this flag gates is STEWARD_REPORT_DONE below; it
+# is not a general-purpose "belongs to steward" marker.
+META_STEWARD_REPORT = "steward_report"
 
 IN_PROGRESS = "In progress"
 
@@ -95,6 +107,7 @@ TRANSITIONS: dict[str, set[tuple[str, str]]] = {
         ("Идеи", "Ready"), ("Blocked", "Ready"), ("Blocked", "Done"),
         ("Идеи", "Blocked"), ("Ready", "Blocked"),
         ("In progress", "Blocked"), ("Validate", "Blocked"),
+        ("In progress", "Done"),
     },
 }
 
@@ -102,6 +115,10 @@ TRANSITIONS: dict[str, set[tuple[str, str]]] = {
 # justification comment, supplied in the same ops.move_card call. Kept here (not just inline in
 # ops) so model stays the single source of truth for "what Blocked->Done even means".
 STEWARD_OVERRIDE = ("Blocked", "Done")
+
+# The other transition that needs more than a role/column check: the card must carry
+# META_STEWARD_REPORT (ops.move_card checks metadata before allowing it) — see module docstring.
+STEWARD_REPORT_DONE = ("In progress", "Done")
 
 # Comment markers, single source of truth for ops (and, later, the dispatcher reading back):
 #   [report:done] / [report:blocked]  worker report

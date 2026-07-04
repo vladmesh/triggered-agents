@@ -273,12 +273,20 @@ def _reconcile(records: dict) -> bool:
     of the watchdog firing on a workspace it can no longer see. Adopted with a fresh comment
     baseline, so from here a report advances an In-progress card normally, a Validate card is
     driven by validate.run (fresh review, lower layers re-checked past the new baseline), and pure
-    silence ends in the watchdog -> Blocked."""
+    silence ends in the watchdog -> Blocked.
+
+    Never adopts the steward's own report card (c["steward_report"], triggered-agents-255): that
+    card's claim names a slug, not a worker workspace (create_report_card sets META_CLAIM to its
+    own slug so claim_card can never re-pick it up), so _restore_workspace would fabricate a path
+    that never existed, worker.activity() on it would sit permanently silent, and the watchdog
+    would eventually requeue it to Ready with its claim cleared — exactly the corruption the report
+    card's own docstring assumes can't happen. The steward owns that card's In progress -> Done/
+    Blocked lifecycle entirely by hand; the dispatcher must leave it alone."""
     changed = False
     for column in (model.IN_PROGRESS, "Validate"):
         for c in ops.list_cards(column=column):
             ref = c["reference"]
-            if not c["claim"] or ref in records:
+            if not c["claim"] or ref in records or c["steward_report"]:
                 continue
             now = time.time()
             records[ref] = {
