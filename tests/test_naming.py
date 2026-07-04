@@ -162,5 +162,23 @@ class MemoryBlockTest(unittest.TestCase):
         self.assertIn("канон", text)
 
 
+class StewardSkillMirrorTest(unittest.TestCase):
+    """.claude/skills/steward/SKILL.md hand-mirrors naming.memory_block("steward",
+    "triggered-agents") (static markdown, no per-card project to render from) — this guards
+    against the mirror silently drifting from the source of truth (found during the #45 review,
+    triggered-agents-252)."""
+
+    def test_skill_carries_the_current_memory_block(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        skill = (repo_root / ".claude" / "skills" / "steward" / "SKILL.md").read_text(
+            encoding="utf-8")
+        expected = naming.memory_block("steward", "triggered-agents")
+
+        def normalize(text):
+            return " ".join(text.split())
+
+        self.assertIn(normalize(expected), normalize(skill))
+
+
 if __name__ == "__main__":
     unittest.main()
