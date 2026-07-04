@@ -5,16 +5,17 @@ its worktree, reused across ticks. On a trigger (after precheck passes, under th
 
   * no agent terminal          -> create one running `claude ... <skill>`
   * one idle agent terminal    -> `/clear` it and re-send <skill> (warm reuse, kills nothing)
-  * ...unless its head is red  -> leave the idle terminal alone, start a fresh one on fallback
+  * ...unless its head is red  -> stop it, start a fresh one on the resolved fallback instead
   * it's busy and fresh        -> leave it working, dispatch nothing
   * it's busy but stuck        -> watchdog: stop the workspace and start one fresh
 
 Why warm reuse and not stop+create every run: Orca retains a dead pty as a ghost tab in the
 workspace session after the process exits, so churning a terminal each tick piles up ghost tabs.
 Reuse never kills the process, so no ghost is born — steady state stays at one terminal. The rare
-kill paths (watchdog, closing legacy duplicates) do leave ghosts, so every run first reaps them
-via `session.tabs.close` (`_reap_ghosts`) — the one lever that reaches the session store; the
-`terminal` CLI can't. Together: steady state creates none, and any stray gets swept next tick.
+kill paths (watchdog, a red idle head, closing legacy duplicates) do leave ghosts, so every run
+first reaps them via `session.tabs.close` (`_reap_ghosts`) — the one lever that reaches the
+session store; the `terminal` CLI can't. Together: steady state creates none, and any stray gets
+swept next tick.
 
 Why not `orca automations run`: it dispatches trigger=manual and spawns a NEW head every tick
 (reuse only kicks in for scheduled runs, which don't tick headless), so heads piled up.
@@ -31,6 +32,12 @@ onboarding theme picker hangs on stdin nobody sends, and never renames its tab a
 shell default — invisible to the `Claude`-in-title match above, so it's neither reused nor
 reaped and just sits there as a silent orphan (found live in the curator workspace: a terminal
 stuck at "choose the text style" that `_agent_terminals` couldn't see).
+
+A live terminal never re-resolves its head profile on its own, so every spawn that resolves one
+(create, watchdog-restart, red-fallback) records it via `AgentState.save_head_profile` — the only
+place idle-reuse can learn which resource the warm terminal is actually running against, since
+that can already be a fallback and differ from the agent's static preferred head
+(triggered-agents-275).
 """
 from __future__ import annotations
 
@@ -75,29 +82,46 @@ def _load_spec(agent: str) -> dict:
     return tomllib.loads((_REPO_ROOT / "triggered_agents" / "agents" / agent / "automation.toml").read_text())
 
 
-def _reuse_head_is_red(agent: str) -> bool:
-    """Whether the head named in `agent`'s automation.toml is currently sitting on a red
-    resource — the check idle-reuse needs before sending into an already-warm terminal, since
-    that terminal keeps whatever head it was spawned with and never re-resolves on its own
-    (only a fresh spawn does, via `_launch_cmd`). Best-effort and defaults to green, matching
-    `_launch_cmd`'s own fallback reasoning: a spec with no head, a broken heads.toml, or any
-    resolution failure all mean "nothing to divert from", so idle-reuse only ever skips the warm
-    terminal when a red resource is actually confirmed (triggered-agents-274).
+def _reuse_head_is_red(agent: str, state: AgentState) -> bool:
+    """Whether the profile the idle terminal was ACTUALLY launched with is currently sitting on a
+    red resource — the check idle-reuse needs before sending into an already-warm terminal, since
+    that terminal keeps whatever profile it was spawned with and never re-resolves on its own
+    (only a fresh spawn does, via `_launch_cmd`).
+
+    Reads the profile `state` recorded at the terminal's last create/restart/red-fallback
+    (`AgentState.load_head_profile`) rather than re-reading `agent`'s static preferred head from
+    automation.toml: the two can diverge (the terminal may already be running on a fallback), and
+    checking the wrong one either misses a genuinely dead terminal (preferred head recovered while
+    the terminal's actual fallback profile went red) or diverts needlessly (preferred head still
+    red while the terminal is already happily running its fallback). Falls back to the static
+    preferred head when nothing was recorded yet (state predates this tracking).
+
+    Best-effort and defaults to green, matching `_launch_cmd`'s own fallback reasoning: a spec
+    with no head, a broken heads.toml, or any resolution failure all mean "nothing to divert
+    from", so idle-reuse only ever skips the warm terminal when a red resource is actually
+    confirmed (triggered-agents-274, triggered-agents-275).
     """
     try:
         head = _load_spec(agent).get("head")
         if not head:
             return False
+        profile = state.load_head_profile() or head
         from ..agents.pipeline import health as pipeline_health
         statuses = pipeline_health.refresh()
-        resource = pipeline_health.resource_of(head)
+        resource = pipeline_health.resource_of(profile)
         return resource is not None and statuses.get(resource, pipeline_health.GREEN) == pipeline_health.RED
     except Exception:
         return False
 
 
-def _launch_cmd(agent: str, variant: str | None = None, card_ref: str | None = None) -> tuple[str, str]:
-    """(skill, full claude launch command) from the agent's automation.toml.
+def _launch_cmd(agent: str, variant: str | None = None,
+                card_ref: str | None = None) -> tuple[str, str, str | None]:
+    """(skill, full claude launch command, resolved head profile) from the agent's
+    automation.toml. The third element is the profile id actually rendered into the launch
+    command (None for a spec with no `head`, or when resolution raised) — the caller records it
+    via `AgentState.save_head_profile` so a later idle-reuse tick can check the resource this very
+    terminal is running against instead of just the agent's static preferred head
+    (triggered-agents-275).
 
     A spec naming a `head` (a profile id in pipeline/heads.toml, e.g. the steward's claude-fable)
     launches through that registry: same adapter/model/fallback machinery a worker/reviewer head
@@ -123,15 +147,15 @@ def _launch_cmd(agent: str, variant: str | None = None, card_ref: str | None = N
         skill = f"{skill} --card {card_ref}"
     head = spec.get("head")
     if not head:
-        return skill, f"claude --dangerously-skip-permissions {skill}"
+        return skill, f"claude --dangerously-skip-permissions {skill}", None
     try:
         from ..agents.pipeline import health as pipeline_health
         from ..agents.pipeline import heads as pipeline_heads
         statuses = pipeline_health.refresh()
         resolved = pipeline_health.resolve_head(head, statuses) or head
-        return skill, pipeline_heads.render_command(resolved, role=agent, prompt=skill)
+        return skill, pipeline_heads.render_command(resolved, role=agent, prompt=skill), resolved
     except Exception:
-        return skill, f"claude --dangerously-skip-permissions {skill}"
+        return skill, f"claude --dangerously-skip-permissions {skill}", None
 
 
 def _steward_report_card(agent: str, variant: str | None) -> str | None:
@@ -154,10 +178,11 @@ def _steward_report_card(agent: str, variant: str | None) -> str | None:
     return card["reference"]
 
 
-def _dispatch_command(agent: str, variant: str | None) -> tuple[str, str]:
-    """(skill, launch) for a dispatch about to actually reach the head — the one spot that also
-    creates the steward's report card, so every real dispatch (fresh create, watchdog restart,
-    idle reuse) carries one and a busy-skip tick never does (no card, nobody to close it)."""
+def _dispatch_command(agent: str, variant: str | None) -> tuple[str, str, str | None]:
+    """(skill, launch, resolved head profile) for a dispatch about to actually reach the head —
+    the one spot that also creates the steward's report card, so every real dispatch (fresh
+    create, watchdog restart, idle reuse) carries one and a busy-skip tick never does (no card,
+    nobody to close it)."""
     card_ref = _steward_report_card(agent, variant)
     return _launch_cmd(agent, variant, card_ref=card_ref) if card_ref else _launch_cmd(agent, variant)
 
@@ -244,9 +269,10 @@ def run(agent: str, variant: str | None = None) -> int:
             print(f"dispatch[{agent}]: reaped {reaped} ghost tab(s)")
         terms = _agent_terminals(ws)
         if not terms:
-            skill, launch = _dispatch_command(agent, variant)
+            skill, launch, profile = _dispatch_command(agent, variant)
             _ensure_claude_ready(ws)
             _orca(["terminal", "create", "--worktree", f"path:{ws}", "--command", launch])
+            state.save_head_profile(profile)
             state.log_run(event, action="created")
             print(f"dispatch[{agent}]: no terminal — created fresh -> {skill}")
             return 0
@@ -261,23 +287,29 @@ def run(agent: str, variant: str | None = None) -> int:
             # busy but silent too long -> stuck: sweep and restart (makes a ghost, but rare)
             _orca(["terminal", "stop", "--worktree", f"path:{ws}"])
             time.sleep(1.0)
-            skill, launch = _dispatch_command(agent, variant)
+            skill, launch, profile = _dispatch_command(agent, variant)
             _ensure_claude_ready(ws)
             _orca(["terminal", "create", "--worktree", f"path:{ws}", "--command", launch])
+            state.save_head_profile(profile)
             state.log_run(event, action="watchdog-restart")
             print(f"dispatch[{agent}]: busy but stuck ({int(quiet)}s silent) — watchdog restart -> {skill}")
             return 0
 
-        # idle: a warm terminal keeps whatever head it was spawned with, so a preferred head
-        # that's gone red since spawn would otherwise get the skill anyway (only fresh spawns
-        # re-resolve). Divert like a fresh create instead, without touching the idle terminal —
-        # it may still hold a live process (triggered-agents-274).
-        if _reuse_head_is_red(agent):
-            skill, launch = _dispatch_command(agent, variant)
+        # idle: a warm terminal keeps whatever profile it was spawned with, so a resource that's
+        # gone red since spawn would otherwise get the skill anyway (only a fresh spawn
+        # re-resolves). Stop it and start fresh on the resolved fallback instead — same shape as
+        # the watchdog restart above — rather than leaving the red terminal running alongside a
+        # new one, which would pile up one extra terminal per red tick (triggered-agents-274,
+        # triggered-agents-275).
+        if _reuse_head_is_red(agent, state):
+            _orca(["terminal", "stop", "--worktree", f"path:{ws}"])
+            time.sleep(1.0)
+            skill, launch, profile = _dispatch_command(agent, variant)
             _ensure_claude_ready(ws)
             _orca(["terminal", "create", "--worktree", f"path:{ws}", "--command", launch])
+            state.save_head_profile(profile)
             state.log_run(event, action="reused-red-fallback")
-            print(f"dispatch[{agent}]: idle terminal's head is red — fresh fallback terminal -> {skill}")
+            print(f"dispatch[{agent}]: idle terminal's head is red — stopped, fresh fallback terminal -> {skill}")
             return 0
 
         # idle: warm reuse, killing nothing -> no ghost. Close only legacy duplicates (one-time).
@@ -286,7 +318,7 @@ def run(agent: str, variant: str | None = None) -> int:
             _orca(["terminal", "close", "--terminal", t["handle"]])
         _orca(["terminal", "send", "--terminal", survivor["handle"], "--text", "/clear", "--enter"])
         time.sleep(1.0)  # let /clear settle before the skill lands
-        skill, _launch = _dispatch_command(agent, variant)
+        skill, _launch, _profile = _dispatch_command(agent, variant)
         _orca(["terminal", "send", "--terminal", survivor["handle"], "--text", skill, "--enter"])
         state.log_run(event, action="reused")
         tail = f"; closed {len(extras)} dup(s)" if extras else ""
