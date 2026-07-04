@@ -176,6 +176,12 @@ class TestMatrix(unittest.TestCase):
         with self.assertRaises(model.GuardError):
             model.check_move("reviewer", "In progress", "Validate")
 
+    def test_retro_moves_nothing(self):
+        with self.assertRaises(model.GuardError):
+            model.check_move("retro", "Идеи", "Ready")
+        with self.assertRaises(model.GuardError):
+            model.check_move("retro", "Validate", "Done")
+
     def test_po_cannot_touch_in_progress_side(self):
         with self.assertRaises(model.GuardError):
             model.check_move("po", "In progress", "Validate")
@@ -761,6 +767,27 @@ class TestReviewerIdea(PatchedBoardTest):
         self.assertEqual(board.metadata[out["id"]][model.META_SLUG], "found-a-bug")
 
 
+class TestRetroIdea(PatchedBoardTest):
+    def test_creates_card_in_ideas(self):
+        board = self.make_board()
+        out = ops.retro_idea("triggered-agents", "фейл-паттерн X", "детали")
+        self.assertEqual(out["column"], "Идеи")
+
+    def test_title_and_description_scrubbed(self):
+        board = self.make_board()
+        ops.retro_idea("triggered-agents", "секрет API_TOKEN=supersecretvalue123 в конфиге",
+                       "тело: KANBOARD_SECRET=anothersecretvalue999")
+        created = board.method_calls("createTask")
+        blob = created[0]["title"] + created[0].get("description", "")
+        self.assertNotIn("supersecretvalue123", blob)
+        self.assertNotIn("anothersecretvalue999", blob)
+
+    def test_slug_passed_through_to_metadata(self):
+        board = self.make_board()
+        out = ops.retro_idea("triggered-agents", "T", slug="retro-finding")
+        self.assertEqual(board.metadata[out["id"]][model.META_SLUG], "retro-finding")
+
+
 class TestCliSlug(PatchedBoardTest):
     """--slug reaches ops through the cli seam (create/idea), same exit-code contract as
     task_type/column: 0 on a valid slug, 3 (GuardError) on a bad one."""
@@ -885,6 +912,41 @@ class TestReviewerRole(unittest.TestCase):
         # claim is dispatcher-only, report worker-only — both rejected before any ops call.
         self.assertEqual(self._run(["--role", "reviewer", "claim", "--ref", "R", "--worker", "w"]), 2)
         self.assertEqual(self._run(["--role", "reviewer", "report", "--ref", "R", "--kind", "done"]), 2)
+        self.assertEqual(self.calls, [])
+
+
+class TestRetroRole(unittest.TestCase):
+    """Role guards for retro at the CLI seam: it may file an Идеи card (idea), but never move a
+    card, claim, report, verdict, or create anywhere else — same shape as TestReviewerRole."""
+
+    def setUp(self):
+        from triggered_agents.agents.pipeline import cli
+        self.cli = cli
+        self.calls = []
+        for name in ("retro_idea", "reviewer_idea", "claim_card", "report", "verdict"):
+            p = mock.patch(f"triggered_agents.agents.pipeline.ops.{name}",
+                           lambda *a, n=name, **k: self.calls.append((n, a, k)) or {"ok": n})
+            p.start()
+            self.addCleanup(p.stop)
+
+    def _run(self, argv):
+        return self.cli.main(argv)
+
+    def test_retro_idea_routes_to_retro_idea_op(self):
+        rc = self._run(["--role", "retro", "idea", "--project", "triggered-agents",
+                        "--title", "t", "--description", "d"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.calls[0][0], "retro_idea")
+        self.assertEqual(self.calls[0][2]["project"], "triggered-agents")
+
+    def test_retro_cannot_create_claim_report_or_verdict(self):
+        # create is po/steward-only, claim dispatcher-only, report worker-only, verdict
+        # reviewer-only — all rejected by _need_role before any ops call reaches the board.
+        self.assertEqual(self._run(["--role", "retro", "create", "--project", "p",
+                                    "--type", "code", "--title", "t"]), 2)
+        self.assertEqual(self._run(["--role", "retro", "claim", "--ref", "R", "--worker", "w"]), 2)
+        self.assertEqual(self._run(["--role", "retro", "report", "--ref", "R", "--kind", "done"]), 2)
+        self.assertEqual(self._run(["--role", "retro", "verdict", "--ref", "R", "--kind", "green"]), 2)
         self.assertEqual(self.calls, [])
 
 
