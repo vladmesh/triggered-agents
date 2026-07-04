@@ -206,6 +206,141 @@ class LaunchCmdTest(unittest.TestCase):
             skill, cmd = dispatch._launch_cmd("steward")
         self.assertIn("--model fable", cmd)
 
+    def test_card_ref_is_appended_to_the_skill_before_rendering(self):
+        """triggered-agents-255: the ref must land INSIDE the reprd prompt, not tacked onto the
+        rendered command afterward where it could fall outside the quoted argument."""
+        from triggered_agents.agents.pipeline import health as pipeline_health
+
+        with mock.patch.object(pipeline_health, "refresh", lambda: {"claude-sub": "green"}):
+            skill, cmd = dispatch._launch_cmd("steward", card_ref="triggered-agents-260")
+        self.assertEqual(skill, "/steward --card triggered-agents-260")
+        self.assertIn(repr(skill), cmd)
+
+    def test_card_ref_with_deep_sweep_variant(self):
+        from triggered_agents.agents.pipeline import health as pipeline_health
+
+        with mock.patch.object(pipeline_health, "refresh", lambda: {"claude-sub": "green"}):
+            skill, cmd = dispatch._launch_cmd("steward", "deep-sweep", card_ref="triggered-agents-261")
+        self.assertEqual(skill, "/steward deep-sweep --card triggered-agents-261")
+
+    def test_no_card_ref_leaves_skill_unchanged(self):
+        skill, cmd = dispatch._launch_cmd("curator")
+        self.assertEqual(skill, "/curate")
+
+
+class StewardReportCardDispatchTest(unittest.TestCase):
+    """dispatch.run() for the steward specifically (triggered-agents-255): a real dispatch must
+    create the wake-up report card and embed its reference in the skill text sent to the head; a
+    busy-skip tick must create none at all (nothing is being dispatched to close it)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self._state_patch = mock.patch("triggered_agents.runtime.state.STATE_ROOT", Path(self.tmp.name))
+        self._state_patch.start()
+        self.addCleanup(self._state_patch.stop)
+
+        self.terminals = []
+        self.idle = True
+        self.orca_calls = []
+        self.created_cards = []
+
+        def fake_create_report_card(project, title, slug, description=""):
+            ref = f"triggered-agents-{len(self.created_cards) + 1}"
+            self.created_cards.append({"project": project, "title": title, "slug": slug})
+            return {"action": "created", "id": len(self.created_cards), "reference": ref,
+                    "column": "In progress"}
+
+        from triggered_agents.agents.pipeline import ops as pipeline_ops
+        p = mock.patch.object(pipeline_ops, "create_report_card", fake_create_report_card)
+        p.start()
+        self.addCleanup(p.stop)
+
+        p = mock.patch.object(dispatch, "_workspace", lambda agent: "/ws/steward")
+        p.start()
+        self.addCleanup(p.stop)
+
+        p = mock.patch.object(dispatch, "_reap_ghosts", lambda ws: 0)
+        p.start()
+        self.addCleanup(p.stop)
+
+        def fake_orca_json(args):
+            if args[:2] == ["terminal", "list"]:
+                return {"terminals": self.terminals}
+            if args[:2] == ["terminal", "wait"]:
+                return {"wait": {"satisfied": self.idle}}
+            return {}
+
+        p = mock.patch.object(dispatch, "_orca_json", fake_orca_json)
+        p.start()
+        self.addCleanup(p.stop)
+
+        p = mock.patch.object(dispatch, "_orca", lambda args: self.orca_calls.append(args))
+        p.start()
+        self.addCleanup(p.stop)
+
+        p = mock.patch.object(dispatch, "_ensure_claude_ready", lambda ws: None)
+        p.start()
+        self.addCleanup(p.stop)
+
+        p = mock.patch("time.sleep", lambda s: None)
+        p.start()
+        self.addCleanup(p.stop)
+
+        # Keep _launch_cmd off the real head-resolution machinery entirely, same reasoning as
+        # LaunchCmdTest's broken-resolution case — this class only cares about the report-card
+        # wiring, not head resolution.
+        from triggered_agents.agents.pipeline import health as pipeline_health
+        p = mock.patch.object(pipeline_health, "refresh", side_effect=RuntimeError("not under test"))
+        p.start()
+        self.addCleanup(p.stop)
+
+    def _launch_command_sent(self):
+        creates = [c for c in self.orca_calls if c[:2] == ["terminal", "create"]]
+        self.assertEqual(len(creates), 1)
+        return creates[0][creates[0].index("--command") + 1]
+
+    def _skill_text_sent(self):
+        sends = [c for c in self.orca_calls if c[:2] == ["terminal", "send"] and c[-2] != "/clear"]
+        self.assertEqual(len(sends), 1)
+        return sends[0][sends[0].index("--text") + 1]
+
+    def test_fresh_dispatch_creates_a_report_card_and_embeds_its_ref(self):
+        self.terminals = []
+        dispatch.run("steward")
+        self.assertEqual(len(self.created_cards), 1)
+        self.assertEqual(self.created_cards[0]["project"], "triggered-agents")
+        self.assertIn("--card triggered-agents-1", self._launch_command_sent())
+
+    def test_deep_sweep_variant_names_itself_in_the_card_title(self):
+        self.terminals = []
+        dispatch.run("steward", "deep-sweep")
+        self.assertEqual(len(self.created_cards), 1)
+        self.assertIn("deep-sweep sweep", self.created_cards[0]["title"])
+        self.assertIn("--card triggered-agents-1", self._launch_command_sent())
+
+    def test_busy_and_fresh_skip_creates_no_card(self):
+        self.terminals = [{"handle": "h1", "title": "✳ Claude Code", "lastOutputAt": 1000}]
+        self.idle = False
+        with mock.patch.object(dispatch, "_quiet_seconds", lambda t, now: 5.0):
+            dispatch.run("steward")
+        self.assertEqual(self.created_cards, [])
+
+    def test_watchdog_restart_creates_a_card(self):
+        self.terminals = [{"handle": "h1", "title": "✳ Claude Code", "lastOutputAt": 1000}]
+        self.idle = False
+        with mock.patch.object(dispatch, "_quiet_seconds", lambda t, now: dispatch.WATCHDOG_SECONDS + 1):
+            dispatch.run("steward")
+        self.assertEqual(len(self.created_cards), 1)
+        self.assertIn("--card triggered-agents-1", self._launch_command_sent())
+
+    def test_idle_reuse_creates_a_card_and_sends_it_in_the_skill_text(self):
+        self.terminals = [{"handle": "h1", "title": "✳ Claude Code", "lastOutputAt": 1000}]
+        self.idle = True
+        dispatch.run("steward")
+        self.assertEqual(len(self.created_cards), 1)
+        self.assertIn("--card triggered-agents-1", self._skill_text_sent())
+
 
 if __name__ == "__main__":
     unittest.main()

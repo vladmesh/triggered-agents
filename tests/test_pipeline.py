@@ -196,7 +196,8 @@ class TestMatrix(unittest.TestCase):
             ("In progress", "Blocked"), ("Validate", "Blocked"),
         }
         self.assertEqual(model.TRANSITIONS["steward"],
-                         model.TRANSITIONS["po"] | {model.STEWARD_OVERRIDE} | steward_escalations)
+                         model.TRANSITIONS["po"] | {model.STEWARD_OVERRIDE}
+                         | {model.STEWARD_REPORT_DONE} | steward_escalations)
 
     def test_only_steward_may_move_blocked_to_done(self):
         model.check_move("steward", "Blocked", "Done")  # must not raise
@@ -306,6 +307,41 @@ class TestCreate(PatchedBoardTest):
         ops.create_card("personal_site", "code", "token KANBOARD_API_TOKEN=supersecretvalue123")
         created = board.method_calls("createTask")
         self.assertIn("supersecretvalue123", created[0]["title"])
+
+
+class TestCreateReportCard(PatchedBoardTest):
+    """ops.create_report_card — the steward's own wake-up report card (triggered-agents-255):
+    straight into In progress, already self-claimed, never through Ready/claim."""
+
+    def test_creates_directly_in_in_progress_already_claimed(self):
+        board = self.make_board()
+        out = ops.create_report_card("triggered-agents", "steward: hourly sweep 2026-07-04",
+                                     "steward-sweep-20260704-120000")
+        self.assertEqual(out["column"], model.IN_PROGRESS)
+        tid = out["id"]
+        self.assertEqual(board._column_title_for(tid), model.IN_PROGRESS)
+        meta = board.metadata[tid]
+        self.assertEqual(meta[model.META_TASK_TYPE], "research")
+        self.assertEqual(meta[model.META_PROJECT], "triggered-agents")
+        self.assertEqual(meta[model.META_SLUG], "steward-sweep-20260704-120000")
+        self.assertEqual(meta[model.META_CLAIM], "steward-sweep-20260704-120000")
+        self.assertEqual(meta[model.META_STEWARD_REPORT], "1")
+        self.assertEqual(board.method_calls("moveTaskPosition"), [])  # never through claim/Ready
+
+    def test_bad_slug_raises_and_creates_nothing(self):
+        board = self.make_board()
+        with self.assertRaises(model.GuardError):
+            ops.create_report_card("triggered-agents", "T", "Bad Slug!")
+        self.assertEqual(board.tasks, {})
+
+    def test_scrubs_title_and_description(self):
+        board = self.make_board()
+        out = ops.create_report_card(
+            "triggered-agents", "нашёл KANBOARD_API_TOKEN=supersecretvalue123",
+            "steward-sweep-1", description="тело: KANBOARD_SECRET=anothersecretvalue999")
+        task = board.tasks[out["id"]]
+        self.assertNotIn("supersecretvalue123", task["title"])
+        self.assertNotIn("anothersecretvalue999", task["description"])
 
 
 class TestUpdate(PatchedBoardTest):
@@ -562,6 +598,53 @@ class TestClaim(PatchedBoardTest):
         with self.assertRaises(KanboardError):
             ops.claim_card(ref, "w1")
 
+    def test_report_card_in_progress_does_not_block_a_code_claim_same_project(self):
+        """triggered-agents-255: the steward's wake-up report card sits In progress under the
+        triggered-agents project as a non-code type — the one-code-task-per-project guard must
+        never count it against a real code card of that same project."""
+        board = self.make_board()
+        ops.create_report_card("triggered-agents", "steward: hourly sweep", "steward-sweep-1")
+        ref = board.add_task("B", "Ready", meta={model.META_TASK_TYPE: "code",
+                                                 model.META_PROJECT: "triggered-agents"})
+        ops.claim_card(ref, "w1")  # must not raise
+        tid = next(t["id"] for t in board.tasks.values() if t["reference"] == ref)
+        self.assertEqual(board._column_title_for(tid), model.IN_PROGRESS)
+
+    def test_report_card_dragged_to_ready_by_hand_still_refuses_claim(self):
+        """The report card is born already claimed (its own slug) — even manually dragged to
+        Ready (a raw Kanboard-UI move, bypassing move_card entirely) it still fails claim_card's
+        ordinary "already claimed" guard, so it can never be picked up as ordinary work."""
+        board = self.make_board()
+        ref = board.add_task("steward: hourly sweep", "Ready",
+                             swimlane="triggered-agents",
+                             meta={model.META_TASK_TYPE: "research",
+                                   model.META_PROJECT: "triggered-agents",
+                                   model.META_SLUG: "steward-sweep-1",
+                                   model.META_CLAIM: "steward-sweep-1",
+                                   model.META_STEWARD_REPORT: "1"})
+        with self.assertRaises(model.GuardError):
+            ops.claim_card(ref, "w1")
+        # an ordinary code card of the same project still claims fine
+        code_ref = board.add_task("B", "Ready", swimlane="triggered-agents",
+                                  meta={model.META_TASK_TYPE: "code",
+                                        model.META_PROJECT: "triggered-agents"})
+        ops.claim_card(code_ref, "w2")  # must not raise
+
+    def test_report_cards_do_not_eat_the_global_wip_cap(self):
+        """triggered-agents-255 review (red, layer 3): a report card holds no worker session
+        (no bring-up, no workspace, _reconcile skips it) so it must not count toward WORKER_CAP
+        either — only the sibling per-project code guard excluded it before this fix. Three
+        piled-up (e.g. stale) report cards must still let an ordinary code claim through under
+        a cap that would otherwise be exhausted by them alone."""
+        board = self.make_board()
+        for i in range(3):
+            ops.create_report_card("triggered-agents", f"steward: sweep {i}", f"steward-sweep-{i}")
+        ref = board.add_task("B", "Ready", meta={model.META_TASK_TYPE: "code",
+                                                 model.META_PROJECT: "personal_site"})
+        ops.claim_card(ref, "w1", cap=1)  # must not raise despite 3 report cards In progress
+        tid = next(t["id"] for t in board.tasks.values() if t["reference"] == ref)
+        self.assertEqual(board._column_title_for(tid), model.IN_PROGRESS)
+
 
 class TestRetryState(PatchedBoardTest):
     """Watchdog retry bookkeeping (model.META_RETRY_*): reset on any arrival in Ready, restated by
@@ -664,6 +747,40 @@ class TestStewardOverride(PatchedBoardTest):
         tid = next(t["id"] for t in board.tasks.values() if t["reference"] == ref)
         self.assertEqual(board._column_title_for(tid), "Ready")
         self.assertEqual(board.method_calls("createComment"), [])
+
+
+class TestStewardReportDone(PatchedBoardTest):
+    """steward's In progress -> Done (model.STEWARD_REPORT_DONE, triggered-agents-255): legal only
+    for a card create_report_card actually made (META_STEWARD_REPORT="1"), never for an ordinary
+    code/research card sitting In progress."""
+
+    def test_moves_the_stewards_own_report_card(self):
+        board = self.make_board()
+        ref = ops.create_report_card("triggered-agents", "steward: hourly sweep",
+                                     "steward-sweep-1")["reference"]
+        out = ops.move_card("steward", ref, "Done")
+        self.assertEqual(out, {"action": "moved", "reference": ref,
+                               "from": model.IN_PROGRESS, "to": "Done"})
+        tid = next(t["id"] for t in board.tasks.values() if t["reference"] == ref)
+        self.assertEqual(board._column_title_for(tid), "Done")
+
+    def test_refuses_an_ordinary_card_even_for_steward(self):
+        board = self.make_board()
+        ref = board.add_task("A", "In progress", meta={model.META_TASK_TYPE: "code",
+                                                       model.META_PROJECT: "personal_site",
+                                                       model.META_CLAIM: "w1"})
+        with self.assertRaises(model.GuardError):
+            ops.move_card("steward", ref, "Done")
+        tid = next(t["id"] for t in board.tasks.values() if t["reference"] == ref)
+        self.assertEqual(board._column_title_for(tid), model.IN_PROGRESS)  # unmoved
+
+    def test_other_roles_still_forbidden(self):
+        board = self.make_board()
+        ref = ops.create_report_card("triggered-agents", "steward: hourly sweep",
+                                     "steward-sweep-1")["reference"]
+        for role in ("po", "dispatcher", "worker", "reviewer"):
+            with self.assertRaises(model.GuardError):
+                ops.move_card(role, ref, "Done")
 
 
 class TestAddComment(PatchedBoardTest):

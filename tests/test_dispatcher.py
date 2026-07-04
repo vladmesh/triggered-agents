@@ -722,6 +722,23 @@ class DispatcherTest(_DispatcherBase):
         self.assertIn(ref, records)
         self.assertEqual(records[ref]["workspace"], "/ws/w-old")
 
+    def test_reconcile_never_adopts_the_stewards_own_report_card(self):
+        """triggered-agents-255: create_report_card puts its card straight into In progress with
+        a claim already set — without the steward_report skip, _reconcile would adopt it as a lost
+        worker record, poll a workspace that never existed, and eventually watchdog-requeue it to
+        Ready with its claim cleared (letting a real worker get claimed against it)."""
+        ref = ops.create_report_card("triggered-agents", "steward: hourly sweep",
+                                     "steward-sweep-1")["reference"]
+        dispatcher.tick()
+        self.assertNotIn(ref, dispatcher._load_cards())
+        self.assertEqual(self._column(ref), model.IN_PROGRESS)  # untouched by reconcile
+        self.assertFalse(any(r["event"] == "reconcile" and r.get("reference") == ref
+                             for r in self._runs()))
+        # a real code card for the same project claims fine regardless of the report card
+        code_ref = self._ready_card("B", project="triggered-agents")
+        dispatcher.tick()
+        self.assertEqual(self._column(code_ref), model.IN_PROGRESS)
+
     def test_bringup_saves_records_before_tick_ends(self):
         # _save_cards runs inside _bring_up: a crash right after the head is up must still
         # find the record on disk. Simulate by crashing the tick right after _claim_next.

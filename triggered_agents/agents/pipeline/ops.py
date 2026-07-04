@@ -180,6 +180,37 @@ def create_card(project: str, task_type: str, title: str, description: str = "",
     return {"action": "created", "id": task_id, "reference": ref, "column": column}
 
 
+def create_report_card(project: str, title: str, slug: str, description: str = "") -> dict:
+    """Steward-only: its own wake-up report card (triggered-agents-255) — created straight in
+    'In progress', never through Ready/claim, and already claimed by itself in the same call
+    (META_CLAIM set to `slug`): even a card later dragged back to Ready by hand still fails
+    claim_card's "already claimed" guard, so it can never be picked up as ordinary work. task_type
+    is fixed to 'research' (non-'code') so the one-code-task-per-project claim guard never counts
+    it against a real code card of the same project. Scrubbed like every other steward-authored
+    text (title/description may quote a transcript/journalctl line) — same reasoning as
+    create_card's role="steward" path.
+    """
+    if not naming.SLUG_RE.match(slug):
+        raise model.GuardError(f"slug {slug!r} must match [a-z0-9-]{{1,30}}")
+    title = worker.scrub_secrets(title)
+    description = worker.scrub_secrets(description)
+    pid = board_id()
+    col_id = _column_id(pid, model.IN_PROGRESS)
+    sw_id = _ensure_swimlane(pid, project)
+    task_id = int(call("createTask", title=title, project_id=pid, column_id=col_id,
+                       swimlane_id=sw_id, description=description))
+    ref = f"{project}-{task_id}"
+    call("updateTask", id=task_id, reference=ref)
+    call("saveTaskMetadata", task_id=task_id, values={
+        model.META_TASK_TYPE: "research",
+        model.META_PROJECT: project,
+        model.META_SLUG: slug,
+        model.META_CLAIM: slug,
+        model.META_STEWARD_REPORT: "1",
+    })
+    return {"action": "created", "id": task_id, "reference": ref, "column": model.IN_PROGRESS}
+
+
 def update_card(role: str, reference: str, slug: str | None = None,
                 head: str | None = None, blocked_by: str | None = None) -> dict:
     """PO-only: patch slug/head/blocked_by metadata on an existing card. Only the fields
@@ -241,6 +272,11 @@ def move_card(role: str, reference: str, to_column: str, reason: str = "") -> di
     justification for skipping review) and is posted as a [steward:blocked-done] comment in this
     same call, right after the move succeeds — so a card never ends up in Done with the override
     used and no comment explaining why, and a rejected (empty-reason) call moves nothing.
+
+    model.STEWARD_REPORT_DONE (In progress -> Done) needs its own check beyond role/column: the
+    card must actually carry META_STEWARD_REPORT (set only by create_report_card) — otherwise any
+    steward could close an ordinary code/research card straight out of In progress, skipping
+    Validate/review entirely.
     """
     pid = board_id()
     task = _get_by_ref(reference)
@@ -251,6 +287,13 @@ def move_card(role: str, reference: str, to_column: str, reason: str = "") -> di
             "Blocked -> Done requires a non-empty justification comment (--reason), "
             "supplied in the same call"
         )
+    if (cur, to_column) == model.STEWARD_REPORT_DONE:
+        meta = call("getTaskMetadata", task_id=int(task["id"])) or {}
+        if meta.get(model.META_STEWARD_REPORT) != "1":
+            raise model.GuardError(
+                f"{reference!r}: In progress -> Done is only for the steward's own report card "
+                "(created via create_report_card); other cards go through Validate/review"
+            )
     if to_column == "Ready":
         call("saveTaskMetadata", task_id=int(task["id"]), values={
             model.META_CLAIM: "",
@@ -299,7 +342,8 @@ def claim_card(reference: str, worker: str, cap: int = 3) -> dict:
     predecessor, if any, is Done; if it is a code card, no other active code card for the
     same project sits in In progress or Validate (a Validate card still owns its worker
     session for rework, so it counts); and fewer than `cap` cards sit in In progress or
-    Validate (both hold a live worker session).
+    Validate (both hold a live worker session — a steward report card doesn't and is excluded
+    from this count, same as it is excluded from the per-project code guard).
 
     The whole thing runs under AgentState("pipeline").lock(): Kanboard offers no
     compare-and-swap, so with a single dispatcher the host-local lock is what closes the
@@ -331,23 +375,28 @@ def claim_card(reference: str, worker: str, cap: int = 3) -> dict:
         task_type = meta.get(model.META_TASK_TYPE)
         project = meta.get(model.META_PROJECT)
         actives = call("getAllTasks", project_id=pid, status_id=1) or []
-        if task_type == "code":
-            for t in actives:
-                if int(t["id"]) == tid:
-                    continue
-                col = _column_title(pid, int(t["column_id"]))
-                if col not in (model.IN_PROGRESS, "Validate"):
-                    continue
-                tmeta = call("getTaskMetadata", task_id=int(t["id"])) or {}
-                if tmeta.get(model.META_PROJECT) == project and tmeta.get(model.META_TASK_TYPE) == "code":
-                    raise model.GuardError(
-                        f"one code task per project: {t.get('reference') or t['id']!r} "
-                        f"({project}) is already in {col!r}"
-                    )
 
-        # Validate counts toward the cap too: a card there still owns its worker session.
-        wip = sum(1 for t in actives
-                  if _column_title(pid, int(t["column_id"])) in (model.IN_PROGRESS, "Validate"))
+        # Validate counts toward both guards too: a card there still owns its worker session.
+        wip = 0
+        for t in actives:
+            if int(t["id"]) == tid:
+                continue
+            col = _column_title(pid, int(t["column_id"]))
+            if col not in (model.IN_PROGRESS, "Validate"):
+                continue
+            tmeta = call("getTaskMetadata", task_id=int(t["id"])) or {}
+            if tmeta.get(model.META_STEWARD_REPORT) == "1":
+                # No bring-up, no workspace, no worker session — doesn't hold a WORKER_CAP
+                # slot and isn't a code card either.
+                continue
+            if task_type == "code" and tmeta.get(model.META_PROJECT) == project \
+                    and tmeta.get(model.META_TASK_TYPE) == "code":
+                raise model.GuardError(
+                    f"one code task per project: {t.get('reference') or t['id']!r} "
+                    f"({project}) is already in {col!r}"
+                )
+            wip += 1
+
         if wip >= cap:
             raise model.GuardError(f"cap reached: {wip} card(s) in In progress/Validate (cap {cap})")
 
@@ -454,6 +503,7 @@ def _card_view(pid: int, task: dict, cols: dict, lanes: dict) -> dict:
         "head": meta.get(model.META_HEAD, ""),
         "claim": meta.get(model.META_CLAIM, ""),
         "slug": meta.get(model.META_SLUG, ""),
+        "steward_report": meta.get(model.META_STEWARD_REPORT, ""),
     }
 
 

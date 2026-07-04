@@ -24,6 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))       # repo root
 
 from test_pipeline import FakeBoard  # noqa: E402
 
+from triggered_agents.agents.pipeline import model  # noqa: E402
 from triggered_agents.agents.steward import cli, signals  # noqa: E402
 from triggered_agents.runtime import state as runtime_state  # noqa: E402
 from triggered_agents.runtime.state import AgentState  # noqa: E402
@@ -226,6 +227,20 @@ class StaleSignalsTest(StewardTestBase):
         with mock.patch("time.time", return_value=future):
             batch = signals.scan()
         self.assertEqual([h["reference"] for h in batch["signals"]["stale"]], ["personal_site-1"])
+
+
+    def test_report_card_stuck_in_progress_is_caught_like_any_other_card(self):
+        """triggered-agents-255: a dead steward head leaves its own wake-up report card sitting
+        In progress forever — the generic stale detector must catch it exactly like an ordinary
+        stuck card, with no special-casing needed (STALE_COLUMNS already covers In progress)."""
+        self.board.add_task("steward: hourly sweep", "In progress", swimlane="triggered-agents",
+                            meta={"task_type": "research", "project": "triggered-agents",
+                                  "slug": "steward-sweep-1", "claim": "steward-sweep-1",
+                                  "steward_report": "1"})
+        self.board.tasks[1]["date_moved"] = int(time.time()) - int(signals.STALE_HOURS * 3600) - 10
+        batch = signals.scan()
+        self.assertEqual(len(batch["signals"]["stale"]), 1)
+        self.assertEqual(batch["signals"]["stale"][0]["column"], model.IN_PROGRESS)
 
 
 class ResourceSignalsTest(StewardTestBase):

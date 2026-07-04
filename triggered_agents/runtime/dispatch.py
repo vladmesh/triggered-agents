@@ -38,6 +38,7 @@ import os
 import shutil
 import subprocess
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import tomllib
@@ -69,7 +70,7 @@ def _workspace(agent: str) -> str:
     return os.environ.get("TA_WORKSPACE") or str(Path.home() / "orca/workspaces/triggered-agents" / agent)
 
 
-def _launch_cmd(agent: str, variant: str | None = None) -> tuple[str, str]:
+def _launch_cmd(agent: str, variant: str | None = None, card_ref: str | None = None) -> tuple[str, str]:
     """(skill, full claude launch command) from the agent's automation.toml.
 
     A spec naming a `head` (a profile id in pipeline/heads.toml, e.g. the steward's claude-fable)
@@ -83,9 +84,17 @@ def _launch_cmd(agent: str, variant: str | None = None) -> tuple[str, str]:
     `variant` (e.g. the steward's "deep-sweep", triggered-agents-254) reads `skill` from
     `spec["variants"][variant]` instead of the top-level one — a second, differently-scheduled
     mode of the same agent, same worktree/workspace/head, just a different prompt sent into it.
+
+    `card_ref` (triggered-agents-255) appends `--card <ref>` to the skill text BEFORE it is handed
+    to the head, the same way a hand-typed `/steward --card ...` would read — so the augmented text
+    is what actually gets sent/embedded (heads.render_command reprs the whole prompt as one shell
+    argument), not just tacked onto the rendered command afterward where it could land outside the
+    quoted prompt.
     """
     spec = tomllib.loads((_REPO_ROOT / "triggered_agents" / "agents" / agent / "automation.toml").read_text())
     skill = spec["variants"][variant]["skill"] if variant else spec["skill"]
+    if card_ref:
+        skill = f"{skill} --card {card_ref}"
     head = spec.get("head")
     if not head:
         return skill, f"claude --dangerously-skip-permissions {skill}"
@@ -97,6 +106,34 @@ def _launch_cmd(agent: str, variant: str | None = None) -> tuple[str, str]:
         return skill, pipeline_heads.render_command(resolved, role=agent, prompt=skill)
     except Exception:
         return skill, f"claude --dangerously-skip-permissions {skill}"
+
+
+def _steward_report_card(agent: str, variant: str | None) -> str | None:
+    """Create the steward's own wake-up report card (project triggered-agents, non-code type,
+    straight into In progress, already claimed by itself — see pipeline.ops.create_report_card)
+    right before a dispatch actually reaches the head. None for every agent but steward
+    (triggered-agents-255): the rest keep their existing dispatch untouched.
+    """
+    if agent != "steward":
+        return None
+    from ..agents.pipeline import ops as pipeline_ops
+    now = datetime.now(timezone.utc)
+    kind = variant or "hourly"
+    slug = f"steward-sweep-{now:%Y%m%d-%H%M%S}"
+    card = pipeline_ops.create_report_card(
+        project="triggered-agents",
+        title=f"steward: {kind} sweep {now:%Y-%m-%d %H:%M UTC}",
+        slug=slug,
+    )
+    return card["reference"]
+
+
+def _dispatch_command(agent: str, variant: str | None) -> tuple[str, str]:
+    """(skill, launch) for a dispatch about to actually reach the head — the one spot that also
+    creates the steward's report card, so every real dispatch (fresh create, watchdog restart,
+    idle reuse) carries one and a busy-skip tick never does (no card, nobody to close it)."""
+    card_ref = _steward_report_card(agent, variant)
+    return _launch_cmd(agent, variant, card_ref=card_ref) if card_ref else _launch_cmd(agent, variant)
 
 
 def _ensure_claude_ready(ws: str) -> None:
@@ -166,8 +203,12 @@ def run(agent: str, variant: str | None = None) -> int:
     """`variant` selects a differently-scheduled mode of the same agent (e.g. the steward's
     "deep-sweep", triggered-agents-254): a different prompt from `_launch_cmd`, and its own
     runs.jsonl event name (instead of the plain "dispatch" every hourly tick logs) so the two
-    wake-up kinds stay distinguishable in the agent's own telemetry."""
-    skill, launch = _launch_cmd(agent, variant)
+    wake-up kinds stay distinguishable in the agent's own telemetry.
+
+    `_dispatch_command` (not `_launch_cmd` directly) runs only in the three branches below that
+    actually put the skill in front of a head (fresh create, watchdog restart, idle reuse) — never
+    on a busy-skip, so a tick that dispatches nothing never creates the steward's report card
+    either (triggered-agents-255)."""
     ws = _workspace(agent)
     state = AgentState(agent)
     event = variant or "dispatch"
@@ -177,6 +218,7 @@ def run(agent: str, variant: str | None = None) -> int:
             print(f"dispatch[{agent}]: reaped {reaped} ghost tab(s)")
         terms = _agent_terminals(ws)
         if not terms:
+            skill, launch = _dispatch_command(agent, variant)
             _ensure_claude_ready(ws)
             _orca(["terminal", "create", "--worktree", f"path:{ws}", "--command", launch])
             state.log_run(event, action="created")
@@ -193,6 +235,7 @@ def run(agent: str, variant: str | None = None) -> int:
             # busy but silent too long -> stuck: sweep and restart (makes a ghost, but rare)
             _orca(["terminal", "stop", "--worktree", f"path:{ws}"])
             time.sleep(1.0)
+            skill, launch = _dispatch_command(agent, variant)
             _ensure_claude_ready(ws)
             _orca(["terminal", "create", "--worktree", f"path:{ws}", "--command", launch])
             state.log_run(event, action="watchdog-restart")
@@ -205,6 +248,7 @@ def run(agent: str, variant: str | None = None) -> int:
             _orca(["terminal", "close", "--terminal", t["handle"]])
         _orca(["terminal", "send", "--terminal", survivor["handle"], "--text", "/clear", "--enter"])
         time.sleep(1.0)  # let /clear settle before the skill lands
+        skill, _launch = _dispatch_command(agent, variant)
         _orca(["terminal", "send", "--terminal", survivor["handle"], "--text", skill, "--enter"])
         state.log_run(event, action="reused")
         tail = f"; closed {len(extras)} dup(s)" if extras else ""
