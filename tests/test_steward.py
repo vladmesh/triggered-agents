@@ -328,6 +328,14 @@ class OrphanSignalsTest(StewardTestBase):
         self.assertEqual(len(batch["signals"]["new_orphan_workspaces"]), 1)
         self.assertIn("218-other", batch["signals"]["new_orphan_workspaces"][0])
 
+    def test_manual_worktree_without_card_id_prefix_is_not_an_orphan(self):
+        """2026-07-04, steward run 267: a human-made worktree (dnd-simulator/hook-path-filter,
+        live session, uncommitted work) has no pipeline id-prefix at all — not an orphan, the
+        pipeline never created it."""
+        (self.ws_root / "personal_site" / "hook-path-filter").mkdir(parents=True)
+        batch = signals.scan()
+        self.assertEqual(batch["signals"]["new_orphan_workspaces"], [])
+
     def test_agent_worktrees_directory_is_excluded(self):
         (self.ws_root / "triggered-agents" / "curator").mkdir(parents=True)
         batch = signals.scan()

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -204,12 +205,21 @@ def _active_card_id_prefixes(project: str) -> set[str]:
     return prefixes
 
 
+# Only names the pipeline itself would have produced (naming.worker_workspace_base /
+# reviewer_workspace_base, `<id>-<slug>` / `review-<id>-<slug>`) are orphan candidates. A human
+# freely creates worktrees under the same project directory by hand (2026-07-04:
+# dnd-simulator/hook-path-filter etc., live sessions with uncommitted work) — those carry no
+# card-id prefix by construction, so flagging every non-matching name woke the steward on each
+# manual worktree.
+_PIPELINE_WS_RE = re.compile(r"^(review-)?\d+-")
+
+
 def _orphan_signals(mark: dict) -> tuple[list[str], list[str]]:
     """(new orphan workspace paths, every orphan path found this scan) — a directory under
-    WORKSPACES_ROOT/<project>/* whose name matches no active card of that project by id-prefix
-    (see _active_card_id_prefixes): a tick killed between workspace-create and the cards.json
-    save, a teardown that failed partway, a manual leftover, a workspace whose card left the board
-    entirely."""
+    WORKSPACES_ROOT/<project>/* that is named like a pipeline workspace (_PIPELINE_WS_RE) but
+    matches no active card of that project by id-prefix (see _active_card_id_prefixes): a tick
+    killed between workspace-create and the cards.json save, a teardown that failed partway, a
+    workspace whose card left the board entirely."""
     if not WORKSPACES_ROOT.is_dir():
         return [], []
     orphans = []
@@ -218,7 +228,8 @@ def _orphan_signals(mark: dict) -> tuple[list[str], list[str]]:
             continue
         prefixes = _active_card_id_prefixes(project_dir.name)
         for ws in sorted(project_dir.iterdir()):
-            if ws.is_dir() and not any(ws.name.startswith(p) for p in prefixes):
+            if (ws.is_dir() and _PIPELINE_WS_RE.match(ws.name)
+                    and not any(ws.name.startswith(p) for p in prefixes)):
                 orphans.append(str(ws))
     notified = set(mark["notified_orphans"])
     new = [o for o in orphans if o not in notified]
