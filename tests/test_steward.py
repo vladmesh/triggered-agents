@@ -43,8 +43,6 @@ class StewardTestBase(unittest.TestCase):
         board_patcher.start()
         self.addCleanup(board_patcher.stop)
 
-        self._patch(signals.pipeline_health, "refresh", lambda: {})
-
         # Give every test an isolated steward + pipeline state dir (tests share TA_STATE, so
         # a stale watermark/cards.json from an earlier test must never leak into the next one).
         self._tmp = tempfile.TemporaryDirectory()
@@ -53,18 +51,29 @@ class StewardTestBase(unittest.TestCase):
         # AgentState reads STATE_ROOT at construction time — patch it just long enough to build
         # fresh steward/pipeline state objects pointed at this test's tempdir, then rebind
         # signals.STATE/cli.STATE/PIPELINE_* to them explicitly (both modules bound their own
-        # copies against the real STATE_ROOT at import time).
+        # copies against the real STATE_ROOT at import time). signals.py itself never resolves
+        # PIPELINE_RUNS/PIPELINE_RESOURCE_HEALTH through STATE_ROOT any more (that was the prod
+        # bug — see CrossWorkspaceStateTest below) — this AgentState("pipeline") only exists here
+        # as a convenient throwaway directory for most tests to point PIPELINE_RUNS/
+        # PIPELINE_RESOURCE_HEALTH at explicitly.
         self._patch(runtime_state, "STATE_ROOT", root)
         new_steward_state = AgentState("steward")
         new_pipeline_state = AgentState("pipeline")
         self._patch(signals, "STATE", new_steward_state)
         self._patch(cli, "STATE", new_steward_state)
         self._patch(signals, "PIPELINE_RUNS", new_pipeline_state.dir / "runs.jsonl")
+        self._patch(signals, "PIPELINE_RESOURCE_HEALTH", new_pipeline_state.dir / "resource_health.json")
         self.pipeline_state = new_pipeline_state
 
         self.ws_root = root / "workspaces"
         self.ws_root.mkdir()
         self._patch(signals, "WORKSPACES_ROOT", self.ws_root)
+
+        # Default steady state for every test but LogSignalsTest's missing-file case: the
+        # dispatcher's runs.jsonl exists and is caught up, same as a live pipeline mid-tick — a
+        # test that doesn't care about the log signal shouldn't have to know a missing file is
+        # now itself a signal (triggered-agents-253).
+        self._write_pipeline_runs([])
 
     def _write_pipeline_runs(self, records: list[dict]) -> None:
         self.pipeline_state.ensure_dir()
@@ -72,12 +81,31 @@ class StewardTestBase(unittest.TestCase):
             for rec in records:
                 f.write(json.dumps(rec) + "\n")
 
+    def _write_resource_health(self, statuses: dict) -> None:
+        """`statuses` is the plain {resource_id: status} shape signals.py deals in — wrapped here
+        into the {resource_id: {"status": ..., "checked_at": ...}} shape pipeline/health.py's own
+        cache file actually uses on disk, since that's the format _resource_signals now reads."""
+        self.pipeline_state.ensure_dir()
+        cache = {rid: {"status": status, "checked_at": 0} for rid, status in statuses.items()}
+        signals.PIPELINE_RESOURCE_HEALTH.write_text(json.dumps(cache), encoding="utf-8")
+
 
 class LogSignalsTest(StewardTestBase):
-    def test_no_file_yet_is_no_signal(self):
+    def test_missing_file_is_a_warn_signal_not_silence(self):
+        """A missing PIPELINE_RUNS must never look like "checked, nothing new" — that ambiguity
+        is exactly what let the cross-workspace path bug (triggered-agents-253) go unnoticed."""
+        signals.PIPELINE_RUNS.unlink()  # setUp's default steady-state file — remove it for real
         batch = signals.scan()
-        self.assertEqual(batch["signals"]["log"], [])
+        self.assertEqual(len(batch["signals"]["log"]), 1)
+        self.assertEqual(batch["signals"]["log"][0]["level"], "warn")
         self.assertEqual(batch["pending"]["pipeline_log_lines"], 0)
+        self.assertTrue(signals.has_signal(batch))
+        # ... and it lands in the steward's OWN runs.jsonl too, not just this scan's in-memory batch.
+        own_runs = signals.STATE.dir / "runs.jsonl"
+        self.assertTrue(own_runs.is_file())
+        own_events = [json.loads(line) for line in own_runs.read_text(encoding="utf-8").splitlines()]
+        self.assertTrue(any(e.get("event") == "pipeline-log-missing" and e.get("level") == "warn"
+                             for e in own_events))
 
     def test_warn_and_error_and_health_flip_are_signals_plain_events_are_not(self):
         self._write_pipeline_runs([
@@ -201,23 +229,34 @@ class StaleSignalsTest(StewardTestBase):
 
 
 class ResourceSignalsTest(StewardTestBase):
+    """_resource_signals reads the pipeline dispatcher's own resource_health.json cache (staged
+    here via _write_resource_health) rather than probing itself — see signals.py's decision note
+    on why (triggered-agents-253)."""
+
     def test_flip_is_a_signal_steady_state_is_not(self):
-        with mock.patch.object(signals.pipeline_health, "refresh", lambda: {"claude-sub": "green"}):
-            signals.STATE.save_watermark(signals.scan()["pending"])
-        with mock.patch.object(signals.pipeline_health, "refresh", lambda: {"claude-sub": "red"}):
-            batch = signals.scan()
-            self.assertEqual(batch["signals"]["resource_flip"], {"claude-sub": "red"})
-        with mock.patch.object(signals.pipeline_health, "refresh", lambda: {"claude-sub": "red"}):
-            signals.STATE.save_watermark(signals.scan()["pending"])
-            batch = signals.scan()
-            self.assertEqual(batch["signals"]["resource_flip"], {})
+        self._write_resource_health({"claude-sub": "green"})
+        signals.STATE.save_watermark(signals.scan()["pending"])
+        self._write_resource_health({"claude-sub": "red"})
+        batch = signals.scan()
+        self.assertEqual(batch["signals"]["resource_flip"], {"claude-sub": "red"})
+        signals.STATE.save_watermark(batch["pending"])
+        batch = signals.scan()
+        self.assertEqual(batch["signals"]["resource_flip"], {})
 
     def test_recovery_flip_also_counts(self):
-        with mock.patch.object(signals.pipeline_health, "refresh", lambda: {"claude-sub": "red"}):
-            signals.STATE.save_watermark(signals.scan()["pending"])
-        with mock.patch.object(signals.pipeline_health, "refresh", lambda: {"claude-sub": "green"}):
-            batch = signals.scan()
-            self.assertEqual(batch["signals"]["resource_flip"], {"claude-sub": "green"})
+        self._write_resource_health({"claude-sub": "red"})
+        signals.STATE.save_watermark(signals.scan()["pending"])
+        self._write_resource_health({"claude-sub": "green"})
+        batch = signals.scan()
+        self.assertEqual(batch["signals"]["resource_flip"], {"claude-sub": "green"})
+
+    def test_missing_cache_file_keeps_previous_baseline(self):
+        self._write_resource_health({"claude-sub": "green"})
+        signals.STATE.save_watermark(signals.scan()["pending"])
+        signals.PIPELINE_RESOURCE_HEALTH.unlink()
+        batch = signals.scan()
+        self.assertEqual(batch["signals"]["resource_flip"], {})
+        self.assertEqual(batch["pending"]["resource_status"], {"claude-sub": "green"})
 
 
 class OrphanSignalsTest(StewardTestBase):
@@ -353,6 +392,78 @@ class CliTest(StewardTestBase):
         mark = signals.load_watermark()
         self.assertIn(ref, mark["notified_blocked"])
         self.assertEqual(cli.cmd_precheck(), 1)  # no fresh wake-up for the same card next hour
+
+
+class CrossWorkspaceStateTest(unittest.TestCase):
+    """Reproduces the actual prod layout (triggered-agents-253): the steward's own state root and
+    the pipeline dispatcher's live state root are two genuinely disjoint directory trees — not
+    nested subdirs of one shared tmp root like StewardTestBase's fixtures use for everything else
+    (that nesting is exactly why the bug never showed up in the rest of this file). Uses two
+    independent tempdirs instead, and never patches signals.PIPELINE_RUNS/PIPELINE_RESOURCE_HEALTH
+    directly, so it exercises the module's actual default resolution.
+
+    On the pre-fix code (PIPELINE_RUNS derived from AgentState("pipeline"), i.e. from STATE_ROOT)
+    this fails: STATE_ROOT/pipeline/runs.jsonl is empty/absent, so the warn line staged at the
+    real cross-workspace path is never seen and `scan()` reports no log signal at all.
+    """
+
+    def setUp(self):
+        board = FakeBoard()
+        board_patcher = mock.patch("triggered_agents.agents.pipeline.ops.call", board.call)
+        board_patcher.start()
+        self.addCleanup(board_patcher.stop)
+
+        self._state_root = tempfile.TemporaryDirectory()
+        self._workspaces_root = tempfile.TemporaryDirectory()
+        self.addCleanup(self._state_root.cleanup)
+        self.addCleanup(self._workspaces_root.cleanup)
+        state_root = Path(self._state_root.name)
+        workspaces_root = Path(self._workspaces_root.name)
+
+        patcher_state = mock.patch.object(runtime_state, "STATE_ROOT", state_root)
+        patcher_ws = mock.patch.object(signals, "WORKSPACES_ROOT", workspaces_root)
+        patcher_state.start()
+        patcher_ws.start()
+        self.addCleanup(patcher_state.stop)
+        self.addCleanup(patcher_ws.stop)
+
+        self.state_root = state_root
+        self.workspaces_root = workspaces_root
+        self._patch(signals, "STATE", AgentState("steward"))
+        self._patch(signals, "PIPELINE_RUNS", signals.resolve_pipeline_state_dir() / "runs.jsonl")
+        self._patch(signals, "PIPELINE_RESOURCE_HEALTH",
+                    signals.resolve_pipeline_state_dir() / "resource_health.json")
+
+    def _patch(self, target, attr, value) -> None:
+        p = mock.patch.object(target, attr, value)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_pipeline_state_dir_is_under_workspaces_root_not_state_root(self):
+        resolved = signals.resolve_pipeline_state_dir()
+        self.assertEqual(resolved, self.workspaces_root / "triggered-agents" / "pipeline" / "state" / "pipeline")
+        self.assertFalse(str(resolved).startswith(str(self.state_root)))
+
+    def test_scan_reads_the_dispatchers_log_at_its_real_cross_workspace_path(self):
+        # The old, wrong location this used to resolve to (AgentState("pipeline") under
+        # STATE_ROOT) — deliberately left empty/absent, simulating the live host where it "не
+        # существует и никогда не появится".
+        wrong = self.state_root / "pipeline" / "runs.jsonl"
+        self.assertFalse(wrong.exists())
+
+        # The real location: the pipeline agent's own named worktree, sibling of the steward's
+        # under the shared workspaces root — exactly where deploy/provision.py puts it and where
+        # the live dispatcher actually appends.
+        real = self.workspaces_root / "triggered-agents" / "pipeline" / "state" / "pipeline" / "runs.jsonl"
+        real.parent.mkdir(parents=True)
+        real.write_text(json.dumps({"ts": "t1", "event": "ff-agents", "result": "error",
+                                    "level": "warn", "error": "cross-workspace e2e"}) + "\n",
+                        encoding="utf-8")
+
+        batch = signals.scan()
+        self.assertTrue(signals.has_signal(batch))
+        self.assertEqual(len(batch["signals"]["log"]), 1)
+        self.assertEqual(batch["signals"]["log"][0]["error"], "cross-workspace e2e")
 
 
 if __name__ == "__main__":

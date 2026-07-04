@@ -27,7 +27,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from ...runtime.state import AgentState
-from ..pipeline import health as pipeline_health
 from ..pipeline import naming as pipeline_naming
 from ..pipeline import ops as pipeline_ops
 
@@ -39,13 +38,36 @@ STATE = AgentState("steward")
 STALE_COLUMNS = ("Ready", "In progress", "Validate", "Blocked")
 STALE_HOURS = float(os.environ.get("TA_STEWARD_STALE_HOURS", "24"))
 
-_PIPELINE_STATE = AgentState("pipeline")
-PIPELINE_RUNS = _PIPELINE_STATE.dir / "runs.jsonl"
-
 WORKSPACES_ROOT = Path(os.environ.get("TA_WORKSPACES_ROOT") or Path.home() / "orca" / "workspaces").resolve()
 # The runtime's own agent worktrees (board/curator/pipeline/retro/steward, one per agent, not one
 # per task) live under this reserved project name — never a workspace-orphan candidate.
 _AGENTS_PROJECT = "triggered-agents"
+
+# The pipeline dispatcher's own runs.jsonl/resource_health.json used to be reached through
+# AgentState("pipeline") — but that resolves STATE_ROOT (runtime/state.py) from the checkout
+# running the CURRENT process, and the steward's systemd unit runs entirely inside the steward's
+# OWN worktree, a different checkout from the dispatcher's. So that path pointed at a file that
+# can never exist there: `_log_signals` on a missing file returned no hits, indistinguishable
+# from "checked, nothing new" — the steward was permanently blind to the dispatcher's log
+# (triggered-agents-253). The dispatcher's real state lives in ITS OWN named worktree, a sibling
+# of the steward's under the same workspaces root — cross that boundary explicitly the same way
+# `_orphan_signals` already does for other agents' worktrees via WORKSPACES_ROOT, never through
+# AgentState/STATE_ROOT (those are per-process by design, not meant to reach another agent).
+# TA_PIPELINE_STATE_DIR overrides the whole thing for tests or a host where the layout diverges.
+# The worktree name "pipeline" is fixed by automation.toml and survives redeploy: provision.py
+# hard-resets each worktree's CODE to origin/main on every run but never touches the gitignored
+# state/ dir underneath it.
+def resolve_pipeline_state_dir() -> Path:
+    """Recomputed on every call (not baked into a constant at import time) so tests can patch
+    WORKSPACES_ROOT and see this follow, the same way _orphan_signals already does."""
+    override = os.environ.get("TA_PIPELINE_STATE_DIR")
+    if override:
+        return Path(override)
+    return WORKSPACES_ROOT / _AGENTS_PROJECT / "pipeline" / "state" / "pipeline"
+
+
+PIPELINE_RUNS = resolve_pipeline_state_dir() / "runs.jsonl"
+PIPELINE_RESOURCE_HEALTH = resolve_pipeline_state_dir() / "resource_health.json"
 
 
 def _empty_watermark() -> dict:
@@ -65,9 +87,19 @@ def load_watermark() -> dict:
 
 
 def _log_signals(mark: dict) -> tuple[list[dict], int]:
-    """(new warn/error/head-health lines past the watermark's cursor, new total line count)."""
+    """(new warn/error/head-health lines past the watermark's cursor, new total line count).
+
+    A missing PIPELINE_RUNS is NOT "nothing to report" — silently returning `[]` here would be
+    indistinguishable from the steady state "checked, no new lines since last time", which is
+    exactly the blindness this module exists to catch (a wrong path, the dispatcher's worktree
+    never having ticked, a layout change on redeploy). Report it as a synthetic warn hit, so
+    has_signal()/precheck wake the head, AND log it straight into the steward's OWN runs.jsonl so
+    the gap is durably visible there too, not just inside one scan's in-memory batch
+    (2026-07-04, triggered-agents-253)."""
     if not PIPELINE_RUNS.is_file():
-        return [], mark["pipeline_log_lines"]
+        STATE.log_run("pipeline-log-missing", level="warn", path=str(PIPELINE_RUNS))
+        return ([{"event": "pipeline-log-missing", "level": "warn", "path": str(PIPELINE_RUNS)}],
+                mark["pipeline_log_lines"])
     lines = PIPELINE_RUNS.read_text(encoding="utf-8").splitlines()
     start = min(mark["pipeline_log_lines"], len(lines))
     hits = []
@@ -130,14 +162,24 @@ def _resource_signals(mark: dict) -> tuple[dict, dict]:
     new baseline, not a flip — otherwise the very first cold-start scan would "flip" every
     currently-green resource and spawn a head for nothing to report.
 
-    A refresh() failure (broken heads.toml, transient I/O) keeps the PREVIOUS baseline rather than
-    resetting to {} — pipeline.dispatcher.tick() already logs its own head-health error to
-    runs.jsonl (caught by _log_signals), so this module doesn't need to double-report it, and
-    resetting to {} would silently erase whatever flip happened on the very next real probe
-    (2026-07-04 review, triggered-agents-244 note Z3)."""
+    Reads the pipeline dispatcher's OWN resource_health.json cache (PIPELINE_RESOURCE_HEALTH,
+    cross-workspace — same reasoning as PIPELINE_RUNS above) instead of calling
+    pipeline_health.refresh() to run a fresh probe from here: refresh() executes real
+    probes (a haiku CLI ping, an OpenRouter completion) that cost tokens/quota on a TTL, so a
+    second independent call from the steward's own worktree would both double that real-world
+    cost AND describe a probe the dispatcher itself never saw, on top of writing yet another
+    disconnected resource_health.json copy in the steward's own state dir. Reading the
+    dispatcher's cache file gives the exact status it actually acted on, for free (2026-07-04
+    decision, triggered-agents-253).
+
+    A missing/unreadable/malformed cache file (broken heads.toml, transient I/O, dispatcher never
+    ticked yet) keeps the PREVIOUS baseline rather than resetting to {} — same reasoning as the
+    old refresh()-failure fallback: resetting to {} would silently erase whatever flip happened on
+    the very next real read (2026-07-04 review, triggered-agents-244 note Z3)."""
     try:
-        current = pipeline_health.refresh()
-    except Exception:
+        cache = json.loads(PIPELINE_RESOURCE_HEALTH.read_text(encoding="utf-8"))
+        current = {rid: entry["status"] for rid, entry in cache.items()}
+    except (OSError, json.JSONDecodeError, KeyError, TypeError):
         current = dict(mark["resource_status"])
     prev = mark["resource_status"]
     changed = {r: s for r, s in current.items() if r in prev and prev[r] != s}
