@@ -3,18 +3,19 @@
 Retro scans recent head transcripts (harvest reused from the curator) and the memory-mcp
 search log for concrete failures — answered from a fact in panelmem WITHOUT a memory_search and
 got it wrong, repeated a known mistake, looped without progress, burned a session for nothing.
-Output is PROPOSALS only (backlog items or a skill-fix PR); retro merges nothing, pushes nothing
-to any main. All judgment lives in the /retro skill; Python only gathers and redacts.
+Output is PROPOSALS only — Идеи cards on the Pipeline board (never Ready, never a merge/push to
+any main). All judgment lives in the /retro skill; Python only gathers and redacts.
 
 Flow the agent follows each run:
   1. `python3 -m triggered_agents retro harvest`  -> redacted transcript batch (markdown) plus
                                      the search-log tail for the batch's time window on stdout;
                                      the pending watermark is cached on disk.
-  2. agent judges the batch, opens/updates the retro/proposals branch on control-panel (or
-     concludes there is nothing), optionally `retro log-proposal --url <pr>`.
+  2. agent judges the batch, files each proposal as an Идеи card on the Pipeline board
+     (`pipeline --role retro idea ...`) or concludes there is nothing, optionally
+     `retro log-proposal --ref <card reference> [--ref <card reference> ...]`.
   3. `python3 -m triggered_agents retro advance`  -> moves the watermark past step 1.
 
-Two-phase like the curator: a crash before the proposals are pushed re-harvests instead of
+Two-phase like the curator: a crash before the proposals are filed re-harvests instead of
 dropping turns. `harvest --json` emits the structured batch; `sessions` lists discovered sources;
 `status` shows the watermark; `precheck` exits non-zero when nothing is new (so the systemd gate
 can skip the run without spinning up a head).
@@ -81,10 +82,10 @@ def cmd_precheck() -> int:
     return 1
 
 
-def cmd_log_proposal(url: str) -> int:
-    """Record that this run produced a proposal (PR/branch url) in runs.jsonl."""
-    STATE.log_run("proposal", url=url)
-    print(f"retro: proposal logged ({url})")
+def cmd_log_proposal(refs: list[str]) -> int:
+    """Record that this run filed proposal card(s) (board references) in runs.jsonl."""
+    STATE.log_run("proposal", refs=",".join(refs))
+    print(f"retro: proposal logged ({', '.join(refs)})")
     return 0
 
 
@@ -119,9 +120,10 @@ def main(argv=None) -> int:
         import argparse
 
         p = argparse.ArgumentParser(prog="triggered_agents retro log-proposal")
-        p.add_argument("--url", required=True, help="PR or branch URL of the pushed proposals")
+        p.add_argument("--ref", required=True, action="append",
+                       help="board card reference filed this run (repeatable)")
         ns = p.parse_args(argv[1:])
-        return cmd_log_proposal(ns.url)
+        return cmd_log_proposal(ns.ref)
     print(__doc__)
     return 0 if cmd in ("help", "-h", "--help") else 2
 

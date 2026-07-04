@@ -7,8 +7,10 @@ to the transition matrix for the role, comment is open to any role (the role bec
 update accepts any role at this layer but is PO-only in ops (GuardError otherwise), same as
 move's per-role matrix. steward gets every po transition (via move/ready) plus one more: Blocked
 -> Done, which additionally needs `move --reason` (a non-empty justification, posted as a comment
-in the same call) — see model.STEWARD_OVERRIDE and ops.move_card. setup/list/show/probe need no
-role. Guards live in model/ops; this layer only wires argv to them and maps failures to exit codes.
+in the same call) — see model.STEWARD_OVERRIDE and ops.move_card. idea is reviewer- or retro-only
+(both file an Идеи-only card, never move anything — model.TRANSITIONS leaves each an empty set).
+setup/list/show/probe need no role. Guards live in model/ops; this layer only wires argv to them
+and maps failures to exit codes.
 
 `probe --resource <id>` exits 0/1 for green/red (see health.run_builtin_probe), not the generic
 KanboardError/GuardError table below — it is heads.toml's own probe command, run by
@@ -217,12 +219,14 @@ def main(argv=None) -> int:
                 return 2
             return _emit(ops.verdict(args.ref, args.kind, _text_arg(args.body, args.body_file)))
         if args.cmd == "idea":
-            if not _need_role(role, ("reviewer",)):
+            if not _need_role(role, ("reviewer", "retro")):
                 return 2
             # The reviewer's one code-creation exception: findings out of the card's scope go to
             # Идеи (never Ready) so they enter the queue only via a human, not the reviewer.
+            # retro's only board write is the same shape: a fail-pattern proposal, Идеи-only.
             desc = _text_arg(args.description, args.description_file)
-            return _emit(ops.reviewer_idea(
+            fn = ops.reviewer_idea if role == "reviewer" else ops.retro_idea
+            return _emit(fn(
                 project=args.project, task_type=args.task_type, title=args.title,
                 description=desc, ref=args.ref, head=args.head, slug=args.slug))
         if args.cmd == "comment":

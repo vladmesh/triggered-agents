@@ -410,6 +410,19 @@ def reviewer_idea(project: str, title: str, description: str = "", task_type: st
                        ref=ref, column="Идеи", head=head, slug=slug)
 
 
+def retro_idea(project: str, title: str, description: str = "", task_type: str = "code",
+               ref: str | None = None, head: str | None = None,
+               slug: str | None = None) -> dict:
+    """Retro-only: file a fail-pattern proposal as an Идеи card — retro's only board write,
+    same shape as reviewer_idea (never Ready, title/description scrubbed). Retro quotes redacted
+    transcript excerpts; the harvest step already strips secrets, but this scrubs again for the
+    same defense-in-depth reason add_comment does for steward."""
+    return create_card(project=project, task_type=task_type,
+                       title=worker.scrub_secrets(title),
+                       description=worker.scrub_secrets(description),
+                       ref=ref, column="Идеи", head=head, slug=slug)
+
+
 def feedback(reference: str, body: str) -> dict:
     """Worker-only: post a `[feedback]` comment on the spec/process; requires a non-empty body."""
     if not body.strip():

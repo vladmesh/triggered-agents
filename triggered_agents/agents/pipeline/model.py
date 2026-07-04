@@ -34,7 +34,7 @@ BOARD_NAME = os.environ.get("TA_PIPELINE_BOARD", "Pipeline")
 
 COLUMNS = ["Идеи", "Ready", "In progress", "Validate", "Blocked", "Done"]
 
-ROLES = ("po", "dispatcher", "worker", "reviewer", "steward")
+ROLES = ("po", "dispatcher", "worker", "reviewer", "steward", "retro")
 
 TASK_TYPES = ("code", "research", "debug")
 
@@ -84,6 +84,9 @@ TRANSITIONS: dict[str, set[tuple[str, str]]] = {
     # The layer-3 reviewer never moves cards (the dispatcher acts on its verdict, like it does on
     # a worker report). Its only artifacts are the verdict comment and Идеи cards.
     "reviewer": set(),
+    # retro (the daily fail-pattern scan) never moves a card either, same reasoning as reviewer:
+    # its only board write is an Идеи card (ops.retro_idea) for a proposal, never Ready or beyond.
+    "retro": set(),
     # steward gets every po transition plus one override: Blocked -> Done, a legal replacement for
     # the raw-API Blocked->Done edits seen on agent-kanban-232/235 and triggered-agents-230. That
     # override is only safe with a paper trail, so check_move alone does not gate it — ops.move_card
