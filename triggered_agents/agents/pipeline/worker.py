@@ -675,6 +675,17 @@ def pr_branch(pr_url: str) -> str | None:
     return data.get("headRefName") or None
 
 
+def pr_base_branch(pr_url: str) -> str | None:
+    """The PR's actual base branch via gh, or None if gh cannot answer (same contract as poll_pr) —
+    read by validate._review_green right before merge_pr, to catch a PR opened against the wrong
+    base (e.g. a sprint-shim card whose worker ignored TASK.md and let `gh pr create` default to
+    main) instead of silently squash-merging it there."""
+    data = _gh_json(["pr", "view", pr_url, "--json", "baseRefName"])
+    if not isinstance(data, dict):
+        return None
+    return data.get("baseRefName") or None
+
+
 def run_stand(project: str, branch: str, cfg: dict) -> dict | None:
     """Deploy `branch` to the project's stand and run e2e. Returns stand.run's result dict, or
     None on an unexpected host error (treated as 'unknown, retry next tick', never a verdict)."""
