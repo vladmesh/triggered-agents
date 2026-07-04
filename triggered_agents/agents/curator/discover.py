@@ -35,7 +35,7 @@ HERMES_MEMORY_DIR = HERMES_HOME / "memories"
 # triggered-agent (curator included) harvests itself or its siblings:
 #   ~/curator                              legacy pre-rename base checkout
 #   ~/triggered-agents                     current base checkout (dev/provision cwd)
-#   ~/orca/workspaces/triggered-agents     per-agent Orca worktrees (curator/, board/, …)
+#   ~/orca/workspaces/triggered-agents     per-agent Orca worktrees (curator/, pipeline/, …)
 _DEFAULT_EXCLUDE = ":".join([
     str(Path.home() / "curator"),
     str(Path.home() / "triggered-agents"),

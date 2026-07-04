@@ -51,7 +51,7 @@ skill = "/steward deep-sweep"
 
 [variants.deep-sweep.systemd]
 # Fixed, deliberately not-round time so it never coincides with retro's daily pass (00:00 +
-# <=5min jitter, see retro/automation.toml) or the hourly :00-:03 crowd (curator/board/pipeline).
+# <=5min jitter, see retro/automation.toml) or the hourly :00-:03 crowd (curator/pipeline).
 # Time-only systemd OnCalendar shorthand (no date field, so no internal space — provision.py's
 # `_timer_unit` splits `calendar` on whitespace to emit one OnCalendar line per space-separated
 # spec, the same convention pipeline/automation.toml uses for its two-offset 3-min cadence; a

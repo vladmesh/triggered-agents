@@ -1,11 +1,12 @@
 """Kanboard JSON-RPC transport — thin, stdlib-only, credentials from env.
 
 App-level access is HTTP Basic `jsonrpc:$KANBOARD_API_TOKEN` against the endpoint in
-`$KANBOARD_URL` (`.../jsonrpc.php`). Injected by the Orca automation; for manual PoC runs
-the board agent sources `control-panel/.env` first.
+`$KANBOARD_URL` (`.../jsonrpc.php`). Injected by the Orca automation; for manual runs
+source `control-panel/.env` first.
 
 `call(method, **params)` returns the JSON-RPC `result` or raises KanboardError on a
-transport failure or an RPC-level error. Higher-level board operations live in board.py.
+transport failure or an RPC-level error. Higher-level board operations live in
+agents/pipeline/ops.py.
 """
 from __future__ import annotations
 

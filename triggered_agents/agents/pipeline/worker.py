@@ -157,7 +157,7 @@ def is_contrib(project: str) -> bool:
     return bool(_load_manifest(project).get("workspace", {}).get("contrib", False))
 
 
-# --- Agent worktrees (board/curator/pipeline/retro's own worktrees, not a task workspace) -----
+# --- Agent worktrees (curator/pipeline/retro/steward's own worktrees, not a task workspace) ---
 # Each triggered-agent gets its own named Orca worktree under AGENTS_ROOT (deploy/provision.py
 # creates it, pinned to origin/main at provision time). Agents never commit to this repo, so from
 # then on the worktree only needs to move forward with origin — the dispatcher's precheck does

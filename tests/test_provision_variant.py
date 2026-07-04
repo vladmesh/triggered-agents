@@ -47,7 +47,7 @@ class TimerUnitLabelTest(unittest.TestCase):
 
 class StewardSpecScheduleTest(unittest.TestCase):
     """The steward's real automation.toml — the deep-sweep timer must not collide with the
-    hourly :00-:03 crowd (curator/board/pipeline) or retro's daily ~00:00-00:05 pass."""
+    hourly :00-:03 crowd (curator/pipeline) or retro's daily ~00:00-00:05 pass."""
 
     def setUp(self):
         self.spec = tomllib.loads((REPO_ROOT / "triggered_agents" / "agents" / "steward"

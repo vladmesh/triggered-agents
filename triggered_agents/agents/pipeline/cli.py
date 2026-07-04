@@ -151,7 +151,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv=None) -> int:
-    from ..board.kanboard import KanboardError
+    from ...runtime.kanboard import KanboardError
     from . import ops
 
     parser = _build_parser()

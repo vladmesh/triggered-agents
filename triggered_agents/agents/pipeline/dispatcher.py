@@ -24,7 +24,7 @@ Per-tick order:
                 no head; success -> drop TASK.md and launch the worker head. One claim per tick.
 
 precheck (the gate a systemd unit run always calls, board state or not) also fast-forwards every
-triggered-agent's own worktree — board/curator/pipeline/retro — to origin/main
+triggered-agent's own worktree — curator/pipeline/retro/steward — to origin/main
 (_ff_agent_worktrees), replacing the manual "push, then go ff every agent worktree by hand" step.
 Strictly --ff-only per worktree; a warn with the worktree's name on anything that can't
 fast-forward, never a reset.
@@ -165,7 +165,7 @@ def _worker_id(card: dict) -> str:
 
 
 def _ff_agent_worktrees() -> None:
-    """Fast-forward every triggered-agent's own worktree (board/curator/pipeline/retro/...) to
+    """Fast-forward every triggered-agent's own worktree (curator/pipeline/retro/steward/...) to
     origin/main — the manual step this replaces ("push to triggered-agents, then go ff every
     agent worktree by hand or the automations keep running stale code"). Runs on every precheck,
     independent of board state, so a quiet board (the common case) never leaves it undone: this

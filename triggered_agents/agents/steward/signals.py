@@ -40,7 +40,7 @@ STALE_COLUMNS = ("Ready", "In progress", "Validate", "Blocked")
 STALE_HOURS = float(os.environ.get("TA_STEWARD_STALE_HOURS", "24"))
 
 WORKSPACES_ROOT = Path(os.environ.get("TA_WORKSPACES_ROOT") or Path.home() / "orca" / "workspaces").resolve()
-# The runtime's own agent worktrees (board/curator/pipeline/retro/steward, one per agent, not one
+# The runtime's own agent worktrees (curator/pipeline/retro/steward, one per agent, not one
 # per task) live under this reserved project name — never a workspace-orphan candidate.
 _AGENTS_PROJECT = "triggered-agents"
 
