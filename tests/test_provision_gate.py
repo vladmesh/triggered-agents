@@ -11,6 +11,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # repo root
 
+import deploy.provision as provision  # noqa: E402
 from deploy.provision import _precheck_gate  # noqa: E402
 
 
@@ -39,6 +40,39 @@ class PrecheckGateTest(unittest.TestCase):
         self.assertEqual(p.returncode, 2)  # propagated, not swallowed — the unit itself fails
         self.assertNotIn("DISPATCHED", p.stdout)
         self.assertIn("ERROR", p.stderr)
+
+
+class CanonicalRootGuardTest(unittest.TestCase):
+    """main() must refuse to provision from a checkout other than ~/triggered-agents: run from a
+    task workspace it registers that checkout as a new Orca repo and repoints the live ta-* units
+    at worktrees forked off it (2026-07-04, card triggered-agents-257)."""
+
+    def setUp(self):
+        self.calls = []
+        self._root = provision.REPO_ROOT
+        self._provision = provision.provision
+        provision.provision = lambda a: self.calls.append(a)
+
+    def tearDown(self):
+        provision.REPO_ROOT = self._root
+        provision.provision = self._provision
+
+    def test_non_canonical_root_refuses_and_provisions_nothing(self):
+        provision.REPO_ROOT = Path("/home/dev/orca/workspaces/triggered-agents/257-drop-board-agent")
+        with self.assertRaises(SystemExit) as ctx:
+            provision.main(["steward"])
+        self.assertIn("non-canonical checkout", str(ctx.exception))
+        self.assertEqual(self.calls, [])
+
+    def test_unsafe_root_flag_overrides(self):
+        provision.REPO_ROOT = Path("/somewhere/else")
+        provision.main(["steward", "--unsafe-root"])
+        self.assertEqual(self.calls, ["steward"])
+
+    def test_canonical_root_proceeds(self):
+        provision.REPO_ROOT = provision.CANONICAL_ROOT
+        provision.main(["steward"])
+        self.assertEqual(self.calls, ["steward"])
 
 
 if __name__ == "__main__":

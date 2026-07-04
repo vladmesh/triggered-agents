@@ -26,6 +26,11 @@ import tomllib
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+# The only checkout provisioning may bind host state to. Run from anywhere else (a task
+# workspace, an agent worktree) and ensure_repo_registered would register THAT checkout as a
+# new Orca repo, fork agent worktrees off it and repoint the live ta-* units at them —
+# 2026-07-04 a worker did exactly this from its card workspace and hijacked the whole runtime.
+CANONICAL_ROOT = Path.home() / "triggered-agents"
 AGENTS_DIR = REPO_ROOT / "triggered_agents" / "agents"
 CLAUDE_JSON = Path.home() / ".claude.json"
 SYSTEMD_DIR = Path("/etc/systemd/system")
@@ -317,6 +322,14 @@ def provision(agent: str) -> None:
 
 
 def main(argv: list[str]) -> int:
+    unsafe = "--unsafe-root" in argv
+    argv = [a for a in argv if a != "--unsafe-root"]
+    if REPO_ROOT != CANONICAL_ROOT and not unsafe:
+        raise SystemExit(
+            f"[provision] refusing to run from non-canonical checkout {REPO_ROOT}: this would "
+            f"register it as a new Orca repo and repoint live ta-* units at worktrees forked "
+            f"off it. Run from {CANONICAL_ROOT}, or pass --unsafe-root to override."
+        )
     agents = argv or sorted(p.name for p in AGENTS_DIR.iterdir() if (p / "automation.toml").is_file())
     if not agents:
         log("no agent specs found")
