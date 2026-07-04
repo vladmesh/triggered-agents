@@ -206,12 +206,13 @@ Environment=HOME=/home/dev
 """
 
 
-def _timer_unit(agent: str, calendar: str, delay: int) -> str:
+def _timer_unit(label: str, calendar: str, delay: int) -> str:
     # `calendar` may hold several whitespace-separated specs (systemd cannot express
-    # sub-minute periods like "every 90s" in one OnCalendar line).
+    # sub-minute periods like "every 90s" in one OnCalendar line). `label` is descriptive text
+    # only (e.g. "steward" or "steward deep-sweep") — the unit filename is chosen by the caller.
     on_calendar = "\n".join(f"OnCalendar={c}" for c in calendar.split())
     return f"""[Unit]
-Description=triggered-agents: {agent} {calendar} sweep
+Description=triggered-agents: {label} {calendar} sweep
 
 [Timer]
 {on_calendar}
@@ -220,6 +221,30 @@ RandomizedDelaySec={delay}
 
 [Install]
 WantedBy=timers.target
+"""
+
+
+def _variant_service_unit(agent: str, variant: str, calendar: str, workspace: Path, env_file: str = "") -> str:
+    """Unconditional dispatch — no precheck gate at all (triggered-agents-254: the whole point of
+    a second, differently-scheduled mode is to wake the head even when the deterministic signals
+    stayed quiet, including the case where the signals themselves are blind). ExecStart runs
+    `dispatch <variant>` directly; dispatch.py's own busy/idle check still protects it from
+    colliding with a live hourly-tick session in the same workspace."""
+    dispatch = f"python3 -m triggered_agents {agent} dispatch {variant}"
+    env_line = f"EnvironmentFile={env_file}\n" if env_file else ""
+    return f"""[Unit]
+Description=triggered-agents: {agent} {variant} {calendar} unconditional sweep (no precheck gate)
+Documentation=file:///home/dev/control-panel/docs/ARCHITECTURE.md
+After=orca-server.service network-online.target
+Wants=orca-server.service
+
+[Service]
+Type=oneshot
+User=dev
+Group=dev
+WorkingDirectory={workspace}
+Environment=HOME=/home/dev
+{env_line}ExecStart=/bin/bash -lc 'exec {dispatch}'
 """
 
 
@@ -239,6 +264,22 @@ def remove_legacy_unit(legacy: str) -> None:
         run(["sudo", "rm", "-f", str(SYSTEMD_DIR / f"{legacy}.{suffix}")], check=False)
 
 
+def ensure_variant_systemd(agent: str, variant: str, vspec: dict, workspace: Path) -> None:
+    """A second, differently-scheduled mode of the same agent (spec's `[variants.<name>]` table,
+    e.g. the steward's "deep-sweep") — same worktree/workspace, its own systemd unit pair, no
+    precheck gate (see _variant_service_unit)."""
+    vsysd = vspec.get("systemd", {})
+    calendar = vsysd.get("calendar", "daily")
+    delay = int(vsysd.get("randomized_delay_sec", 0))
+    unit = f"ta-{agent}-{variant}"
+    _sudo_write(SYSTEMD_DIR / f"{unit}.service",
+                _variant_service_unit(agent, variant, calendar, workspace, vsysd.get("env_file", "")))
+    _sudo_write(SYSTEMD_DIR / f"{unit}.timer", _timer_unit(f"{agent} {variant}", calendar, delay))
+    run(["sudo", "systemctl", "daemon-reload"])
+    run(["sudo", "systemctl", "enable", "--now", f"{unit}.timer"])
+    log(f"systemd unit active: {unit}.timer ({calendar})")
+
+
 def ensure_systemd(agent: str, spec: dict, workspace: Path) -> None:
     sysd = spec.get("systemd", {})
     calendar = sysd.get("calendar", "hourly")
@@ -252,6 +293,9 @@ def ensure_systemd(agent: str, spec: dict, workspace: Path) -> None:
     run(["sudo", "systemctl", "daemon-reload"])
     run(["sudo", "systemctl", "enable", "--now", f"{unit}.timer"])
     log(f"systemd unit active: {unit}.timer ({calendar})")
+
+    for variant, vspec in spec.get("variants", {}).items():
+        ensure_variant_systemd(agent, variant, vspec, workspace)
 
 
 def provision(agent: str) -> None:

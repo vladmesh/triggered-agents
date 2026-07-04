@@ -15,16 +15,30 @@ Flow the agent follows each run:
 Two-phase like curator/retro: a crash before advance re-scans instead of dropping a signal.
 `scan --json` emits the structured batch; `precheck` exits non-zero when there is no signal (so
 the systemd gate can skip the run, zero LLM cost); `status` shows the watermark.
+
+Second, unconditional mode (triggered-agents-254): `deep-sweep-since`/`deep-sweep-advance` keep
+a separate watermark — just a timestamp, not a per-kind dedup like signals.py's — for the daily
+whole-system audit that runs with no precheck gate at all (deploy/provision.py's second
+ta-steward-deep-sweep timer). Kept independent on purpose: the signal gate must not swallow an
+anomaly the daily sweep hasn't looked at yet, and vice versa.
 """
 from __future__ import annotations
 
 import json
 import sys
+from datetime import datetime, timezone
 
 from . import signals
 from ..pipeline import worker as pipeline_worker
 
 STATE = signals.STATE
+
+
+def _deep_sweep_file():
+    """Recomputed on every call (not a module-level constant) so a test that patches `STATE`
+    (or a variant timer resolving a different agent's state dir) sees it follow, same reasoning
+    as signals.resolve_pipeline_state_dir()."""
+    return STATE.dir / "deep_sweep_watermark.json"
 
 
 def cmd_scan(as_json: bool) -> int:
@@ -87,6 +101,34 @@ def cmd_status() -> int:
     return 0
 
 
+def cmd_deep_sweep_since() -> int:
+    """Print the last unconditional-sweep timestamp (or null on a first-ever run) as JSON — the
+    window the deep-sweep skill section should look back over. A malformed file (never expected,
+    but the signal watermark has the same defensive read) is treated as null rather than raised,
+    so a corrupt file degrades to "look back further", not a crashed run."""
+    path = _deep_sweep_file()
+    last = None
+    if path.is_file():
+        try:
+            last = json.loads(path.read_text(encoding="utf-8")).get("last_run")
+        except json.JSONDecodeError:
+            last = None
+    print(json.dumps({"last_deep_sweep": last}, ensure_ascii=False))
+    return 0
+
+
+def cmd_deep_sweep_advance() -> int:
+    """Stamp now() as the last unconditional sweep. Independent of `advance` above (signals.py's
+    per-kind watermark) on purpose — see module docstring."""
+    now = datetime.now(timezone.utc).isoformat()
+    with STATE.lock():
+        STATE.ensure_dir()
+        _deep_sweep_file().write_text(json.dumps({"last_run": now}, ensure_ascii=False), encoding="utf-8")
+    STATE.log_run("deep-sweep-advance", last_run=now)
+    print(f"steward: deep-sweep watermark advanced to {now}")
+    return 0
+
+
 def main(argv=None) -> int:
     argv = list(argv or [])
     cmd = argv[0] if argv else "help"
@@ -98,6 +140,10 @@ def main(argv=None) -> int:
         return cmd_precheck()
     if cmd == "status":
         return cmd_status()
+    if cmd == "deep-sweep-since":
+        return cmd_deep_sweep_since()
+    if cmd == "deep-sweep-advance":
+        return cmd_deep_sweep_advance()
     print(__doc__)
     return 0 if cmd in ("help", "-h", "--help") else 2
 
