@@ -32,6 +32,7 @@ class AgentState:
         self.watermark_file = self.dir / "watermark.json"
         self.pending_file = self.dir / "pending.json"
         self.lockfile = self.dir / "lock"
+        self.head_profile_file = self.dir / "head_profile.json"
 
     def ensure_dir(self) -> None:
         self.dir.mkdir(parents=True, exist_ok=True)
@@ -49,6 +50,28 @@ class AgentState:
         tmp = self.watermark_file.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(mark, indent=2, ensure_ascii=False), encoding="utf-8")
         tmp.replace(self.watermark_file)
+
+    def load_head_profile(self) -> str | None:
+        """The heads.toml profile id the agent's live terminal was actually launched with, or
+        None if it was never recorded (agent has no `head`, or predates this tracking) — a warm
+        terminal keeps whatever profile it started on and never re-resolves on its own, so
+        idle-reuse needs this to check the resource the terminal is really running against
+        instead of the agent's static preferred head (triggered-agents-275)."""
+        if not self.head_profile_file.is_file():
+            return None
+        try:
+            return json.loads(self.head_profile_file.read_text(encoding="utf-8")).get("profile")
+        except json.JSONDecodeError:
+            return None
+
+    def save_head_profile(self, profile: str | None) -> None:
+        """Record `profile` as the one the just-(re)spawned terminal is running on. Called after
+        every fresh create / watchdog restart / red-fallback relaunch, never after a plain warm
+        reuse (the terminal's profile hasn't changed)."""
+        self.ensure_dir()
+        tmp = self.head_profile_file.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps({"profile": profile}, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(self.head_profile_file)
 
     def log_run(self, event: str, **fields) -> None:
         """Append a run-telemetry line to runs.jsonl. Best-effort: a logging failure
