@@ -7,9 +7,12 @@ nothing leaves the process.
 """
 from __future__ import annotations
 
+import fcntl
 import os
+import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -192,8 +195,7 @@ class _DispatcherBase(unittest.TestCase):
 
         dispatcher.STATE.ensure_dir()
         for f in (dispatcher.CARDS_FILE, dispatcher.STATE.dir / "runs.jsonl",
-                  dispatcher.STATE.dir / "dispatch.lock", dispatcher.STATE.dir / "dispatch.lock.mutex",
-                  dispatcher.STATE.dir / "lock"):
+                  dispatcher.STATE.dir / "dispatch.lock", dispatcher.STATE.dir / "lock"):
             if f.exists():
                 f.unlink()
         self._orig_watchdog = dispatcher.WATCHDOG_SECONDS
@@ -811,59 +813,47 @@ class DispatcherTest(_DispatcherBase):
                 dispatcher.tick()
         self.assertIn(ref, dispatcher._load_cards())
 
-    # stale tick lock (review #2) ---------------------------------------------
-    def test_stale_lock_is_reclaimed(self):
-        import subprocess
-        p = subprocess.Popen(["true"])
-        p.wait()
+    # tick lock: flock on dispatch.lock itself, held for the whole tick (triggered-agents-236) ---
+    def test_dead_holder_lock_released_by_kernel(self):
+        # No more pid-liveness bookkeeping: a process that dies while holding the flock has the
+        # kernel drop it immediately, so the very next tick just acquires it like any free lock —
+        # there is nothing left to reclaim.
         lockfile = dispatcher.STATE.dir / "dispatch.lock"
-        lockfile.write_text(str(p.pid))
+        script = (
+            "import fcntl\n"
+            f"f = open({str(lockfile)!r}, 'w')\n"
+            "fcntl.flock(f.fileno(), fcntl.LOCK_EX)\n"
+            "f.write('99999')\n"
+            "f.flush()\n"
+        )
+        subprocess.run([sys.executable, "-c", script], check=True)
         ref = self._ready_card("A")
-        dispatcher.tick()  # must not SystemExit
+        dispatcher.tick()  # must not SystemExit — the dead process's flock is already gone
         self.assertEqual(self._column(ref), model.IN_PROGRESS)
-        self.assertFalse(lockfile.exists())
-        self.assertTrue(any(r["event"] == "lock-reclaimed" for r in self._runs()))
-
-    def test_garbled_lock_is_reclaimed(self):
-        lockfile = dispatcher.STATE.dir / "dispatch.lock"
-        lockfile.write_text("not-a-pid")
-        dispatcher.tick()
-        self.assertFalse(lockfile.exists())
 
     def test_live_lock_skips_with_exit_zero(self):
         # A busy lock (a long stand run holding the tick while the timer fires again) is a skip,
-        # not a failure: it must exit 0 so systemd doesn't log a run of unit failures.
+        # not a failure: it must exit 0 so systemd doesn't log a run of unit failures. Simulated
+        # with a real held flock, not just a pid written to the file — content alone means
+        # nothing to the new lock now.
         lockfile = dispatcher.STATE.dir / "dispatch.lock"
-        lockfile.write_text(str(os.getpid()))
-        with self.assertRaises(SystemExit) as cm:
-            dispatcher.tick()
-        self.assertEqual(cm.exception.code, 0)
-        lockfile.unlink()
+        holder_fd = os.open(lockfile, os.O_CREAT | os.O_RDWR)
+        fcntl.flock(holder_fd, fcntl.LOCK_EX)
+        os.write(holder_fd, b"424242")
+        try:
+            with self.assertRaises(SystemExit) as cm:
+                dispatcher.tick()
+            self.assertEqual(cm.exception.code, 0)
+        finally:
+            fcntl.flock(holder_fd, fcntl.LOCK_UN)
+            os.close(holder_fd)
 
-    # tick-lock TOCTOU (triggered-agents-229) ----------------------------------
-    def test_concurrent_stale_reclaim_only_one_wins(self):
-        # Two ticks racing over the same stale lock must not both conclude "stale" and both
-        # reclaim it: exactly one wins, the other sees a live lock and skips without acting.
-        import subprocess
-        import threading
-
-        p = subprocess.Popen(["true"])
-        p.wait()
-        lockfile = dispatcher.STATE.dir / "dispatch.lock"
-        lockfile.write_text(str(p.pid))
-
-        orig_stale = dispatcher._lock_stale
-
-        def slow_stale(path):
-            # Widen the stale-check window so a would-be racer has time to interleave while this
-            # is mid-decision — the mutex around the whole decide-and-reclaim span must block it.
-            result = orig_stale(path)
-            time.sleep(0.1)
-            return result
-
+    def test_concurrent_ticks_only_one_holds_lock(self):
+        # Two ticks racing for dispatch.lock never both enter: the OS flock on the lock file
+        # itself is the only serialization needed now, no companion mutex file.
         results = []
         results_lock = threading.Lock()
-        resolved = threading.Semaphore(0)  # released once per thread, after its outcome is final
+        first_entered = threading.Event()
         release = threading.Event()
 
         def contend():
@@ -871,95 +861,24 @@ class DispatcherTest(_DispatcherBase):
                 with dispatcher._tick_lock():
                     with results_lock:
                         results.append("entered")
-                        hold = len(results) == 1  # the first to enter is the winner
-                    resolved.release()
-                    if hold:
-                        # Keep the reclaimed lock visibly live until BOTH sides have resolved,
-                        # instead of racing to unlink it the instant we're done — otherwise the
-                        # loser might not even get a chance to observe it as live.
+                        first = len(results) == 1
+                    if first:
+                        first_entered.set()
                         release.wait(timeout=5)
             except SystemExit:
                 with results_lock:
                     results.append("skipped")
-                resolved.release()
 
-        with mock.patch.object(dispatcher, "_lock_stale", slow_stale):
-            t1 = threading.Thread(target=contend)
-            t2 = threading.Thread(target=contend)
-            t1.start()
-            t2.start()
-            self.assertTrue(resolved.acquire(timeout=5))
-            self.assertTrue(resolved.acquire(timeout=5))
-            release.set()
-            t1.join(timeout=5)
-            t2.join(timeout=5)
+        t1 = threading.Thread(target=contend)
+        t1.start()
+        self.assertTrue(first_entered.wait(timeout=5))
+        t2 = threading.Thread(target=contend)
+        t2.start()
+        t2.join(timeout=5)
+        release.set()
+        t1.join(timeout=5)
 
         self.assertEqual(sorted(results), ["entered", "skipped"])
-        reclaimed = [r for r in self._runs() if r["event"] == "lock-reclaimed"]
-        self.assertEqual(len(reclaimed), 1)
-
-    def test_concurrent_lock_creation_window_blocks_reader(self):
-        # A lock file that exists but has no pid written yet (the O_EXCL-create-then-write gap)
-        # must not be observable by a concurrent tick as stale/garbled — the writer holds the
-        # decide-and-create span exclusively until the pid is in place.
-        import threading
-
-        orig_write = os.write
-        write_started = threading.Event()
-        release_write = threading.Event()
-        paused = {"done": False}
-
-        def paused_write(fd, data):
-            if not paused["done"]:
-                paused["done"] = True
-                write_started.set()
-                release_write.wait(timeout=5)
-            return orig_write(fd, data)
-
-        entered = []
-        holder_ready = threading.Event()
-        release_holder = threading.Event()
-
-        def holder():
-            with mock.patch.object(dispatcher.os, "write", paused_write):
-                with dispatcher._tick_lock():
-                    entered.append("holder")
-                    holder_ready.set()
-                    # Keep holding the now fully-written lock live until the contender has
-                    # resolved, instead of racing to unlink it the instant we're done.
-                    release_holder.wait(timeout=5)
-
-        t1 = threading.Thread(target=holder)
-        t1.start()
-        self.assertTrue(write_started.wait(timeout=5))  # lockfile created, pid not written yet
-
-        contender_done = threading.Event()
-        contender_outcome = []
-
-        def contender():
-            try:
-                with dispatcher._tick_lock():
-                    entered.append("contender")
-                    contender_outcome.append("entered")
-            except SystemExit:
-                contender_outcome.append("skipped")
-            contender_done.set()
-
-        t2 = threading.Thread(target=contender)
-        t2.start()
-        self.assertFalse(contender_done.wait(timeout=0.2))  # blocked behind the mutex, not racing in
-
-        release_write.set()  # holder finishes writing its pid and enters its body
-        self.assertTrue(holder_ready.wait(timeout=5))
-        # The contender must now observe holder's fully-written, still-live lock (never the
-        # empty pre-write file) and skip — never barge in and clobber it.
-        self.assertTrue(contender_done.wait(timeout=5))
-        release_holder.set()
-        t1.join(timeout=5)
-        t2.join(timeout=5)
-
-        self.assertEqual(contender_outcome, ["skipped"])
-        self.assertEqual(entered, ["holder"])
 
     # secret scrubbing before board comments (review #3) ----------------------
     def test_smoke_fail_comment_is_scrubbed(self):
