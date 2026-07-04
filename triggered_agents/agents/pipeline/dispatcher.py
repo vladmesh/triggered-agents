@@ -765,7 +765,7 @@ def tick() -> int:
             statuses = {}
         changed = _reconcile(records)
         changed = _advance(records, statuses) or changed
-        changed = validate.run(records, WATCHDOG_SECONDS, _save_cards) or changed
+        changed = validate.run(records, WATCHDOG_SECONDS, _save_cards, statuses) or changed
         before = json.dumps(records, sort_keys=True)
         _claim_next(records, statuses)
         if changed or json.dumps(records, sort_keys=True) != before:

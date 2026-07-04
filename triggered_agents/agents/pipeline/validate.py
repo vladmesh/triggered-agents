@@ -33,13 +33,14 @@ layer 3 (independent review, every project): once the lower layers are green, sp
     this to waiting for a human merge, no redeploy needed.
     Green on a contrib card has nothing to wait for (no PR in this pipeline) and goes straight to
     Done with the worker workspace torn down. A reviewer that goes silent without a verdict is
-    caught by the same watchdog threshold as a worker head.
+    caught by the same watchdog threshold as a worker head, frozen the same way while its resource
+    sits red (_review_watchdog).
 
-`run(records, watchdog_seconds, save_cards)` is the single entry point dispatcher.tick calls once
-per tick; every other name here is private. `watchdog_seconds` and `save_cards` are threaded in
-rather than imported from dispatcher — dispatcher owns WATCHDOG_SECONDS (also driving the
-In-progress worker watchdog) and cards.json persistence, and importing them back here would be a
-circular import.
+`run(records, watchdog_seconds, save_cards, statuses)` is the single entry point dispatcher.tick
+calls once per tick; every other name here is private. `watchdog_seconds`, `save_cards` and
+`statuses` are threaded in rather than imported from dispatcher — dispatcher owns WATCHDOG_SECONDS
+(also driving the In-progress worker watchdog), cards.json persistence and health.refresh's
+per-tick result, and importing them back here would be a circular import.
 """
 from __future__ import annotations
 
@@ -48,7 +49,7 @@ import re
 import time
 
 from ...runtime.state import AgentState
-from . import model, naming, ops, reviewer, worker
+from . import health, model, naming, ops, reviewer, worker
 
 STATE = AgentState("pipeline")
 # Layer-3 rework cap: a card may be returned by red reviewer verdicts at most this many times over
@@ -183,10 +184,12 @@ def _stand_gate(ref: str, pr: str, card: dict, cfg: dict, records: dict, view: d
     return rec is not None
 
 
-def run(records: dict, watchdog_seconds: int, save_cards) -> bool:
-    """Drive each Validate card (zero LLM below layer 3). The dispatcher merges a green-reviewed
-    PR itself (_review_green; TA_AUTOMERGE=off reverts merging to a human); below layer 3 it only
-    reacts to what gh and the stand report:
+def run(records: dict, watchdog_seconds: int, save_cards, statuses: dict[str, str]) -> bool:
+    """Drive each Validate card (zero LLM below layer 3). `statuses` is this tick's resource health
+    from health.refresh, threaded through to _review_watchdog to freeze the layer-3 reviewer's
+    clock the same way dispatcher._advance freezes the worker's (see _review_watchdog). The
+    dispatcher merges a green-reviewed PR itself (_review_green; TA_AUTOMERGE=off reverts merging
+    to a human); below layer 3 it only reacts to what gh and the stand report:
       merged  -> worker workspace torn down, Done, record dropped (the worker session is over);
       closed without a merge -> Blocked with the reason, record dropped (a human closed it, or it
         went stale — the card must not sit in Validate forever waiting for a merge that won't come);
@@ -212,13 +215,14 @@ def run(records: dict, watchdog_seconds: int, save_cards) -> bool:
     changed = False
     for card in ops.list_cards(column="Validate"):
         try:
-            changed = _validate_card(card, records, watchdog_seconds, save_cards) or changed
+            changed = _validate_card(card, records, watchdog_seconds, save_cards, statuses) or changed
         except Exception as e:  # noqa: BLE001 — one bad card must not abort the whole tick
             _validate_error(card["reference"], e)
     return changed
 
 
-def _validate_card(card: dict, records: dict, watchdog_seconds: int, save_cards) -> bool:
+def _validate_card(card: dict, records: dict, watchdog_seconds: int, save_cards,
+                   statuses: dict[str, str]) -> bool:
     """Drive one Validate card by its PR (and, for stand projects, the stand). Returns whether
     `records` changed. Raises only on an unexpected failure, which run() localizes.
 
@@ -228,7 +232,8 @@ def _validate_card(card: dict, records: dict, watchdog_seconds: int, save_cards)
     rec = records.get(ref)
     view = ops.show_card(ref)
     if worker.is_contrib(card.get("project") or ""):
-        return _validate_contrib_card(ref, card, rec, records, view, watchdog_seconds, save_cards)
+        return _validate_contrib_card(ref, card, rec, records, view, watchdog_seconds, save_cards,
+                                      statuses)
     pr = _pr_url(view)
     if not pr:
         return _validate_stall(ref, "no-pr-ref", rec, records)
@@ -314,12 +319,12 @@ def _validate_card(card: dict, records: dict, watchdog_seconds: int, save_cards)
         # stand_cfg was already resolved above — pass its presence down instead of re-reading the
         # manifest a second time in the green-review path.
         return _review_gate(ref, pr, card, records, view, stand_cfg is not None,
-                            watchdog_seconds, save_cards) or changed
+                            watchdog_seconds, save_cards, statuses) or changed
     return _ci_pending_watchdog(ref, rec, records, pr, status["rollup"]) or changed
 
 
 def _validate_contrib_card(ref: str, card: dict, rec: dict | None, records: dict, view: dict,
-                           watchdog_seconds: int, save_cards) -> bool:
+                           watchdog_seconds: int, save_cards, statuses: dict[str, str]) -> bool:
     """Validate a contrib (fork) card: it has no PR in this pipeline by definition (a human opens
     it against upstream from the pushed branch afterward, out of scope) — so layer 1 is just the
     worker's own report (local tests, already in its report:done; no CI to poll — CI-in-fork is
@@ -369,7 +374,7 @@ def _validate_contrib_card(ref: str, card: dict, rec: dict | None, records: dict
         view = ops.show_card(ref)
     return _review_gate(ref, None, card, records, view, is_stand=False,
                         watchdog_seconds=watchdog_seconds, save_cards=save_cards,
-                        contrib=(branch, sha)) or changed
+                        statuses=statuses, contrib=(branch, sha)) or changed
 
 
 def _validate_stall(ref: str, reason: str, rec: dict | None, records: dict, **log_fields) -> bool:
@@ -508,7 +513,8 @@ def _review_verdict(view: dict, baseline: int) -> str | None:
 
 
 def _review_gate(ref: str, pr: str | None, card: dict, records: dict, view: dict, is_stand: bool,
-                 watchdog_seconds: int, save_cards, contrib: tuple[str, str] | None = None) -> bool:
+                 watchdog_seconds: int, save_cards, statuses: dict[str, str],
+                 contrib: tuple[str, str] | None = None) -> bool:
     """Drive layer 3 for a card whose lower layers are green. Returns whether `records` changed.
     `is_stand` is the caller's already-resolved stand_cfg presence — passed through rather than
     re-read here, since `_review_green` needs it too. `contrib` is (branch, head sha) for a
@@ -523,7 +529,7 @@ def _review_gate(ref: str, pr: str | None, card: dict, records: dict, view: dict
         return _spawn_reviewer(ref, pr, card, rec, records, save_cards, contrib)
     verdict = _review_verdict(view, int(rec["review_baseline"]))
     if verdict is None:
-        return _review_watchdog(ref, rec, records, watchdog_seconds)
+        return _review_watchdog(ref, rec, records, watchdog_seconds, statuses)
     if verdict == "green":
         return _review_green(ref, pr, card, is_stand, rec, records, contrib)
     return _review_red(ref, pr, rec, records, contrib)
@@ -584,9 +590,20 @@ def _spawn_reviewer(ref: str, pr: str | None, card: dict, rec: dict, records: di
     return True
 
 
-def _review_watchdog(ref: str, rec: dict, records: dict, watchdog_seconds: int) -> bool:
+def _review_watchdog(ref: str, rec: dict, records: dict, watchdog_seconds: int,
+                     statuses: dict[str, str]) -> bool:
     """No verdict yet: track the reviewer head's output and, if it goes silent past the threshold,
-    Block the card до vladmesh — a dead reviewer must never leave the card stuck in Validate."""
+    Block the card до vladmesh — a dead reviewer must never leave the card stuck in Validate.
+
+    `statuses` (this tick's resource health, from health.refresh) freezes this clock the same way
+    dispatcher._advance freezes the worker's: the reviewer head is spawned under
+    worker.REVIEWER_HEAD, a config knob rather than a per-card field, so its resource is resolved
+    through health.resource_of(worker.REVIEWER_HEAD) rather than a stored head id. While that
+    resource is red, silence is "the subscription/key is down right now", not "the reviewer died"
+    (2026-07-04 incident — same 5h subscription limit as #31, this time silencing the reviewer
+    instead of a worker). Frozen means review_activity keeps sliding to now every tick the
+    resource stays red, so once it turns green again the card gets a full fresh watchdog_seconds
+    window rather than an instantly-expired one."""
     ws = rec.get("review_ws")
     changed = False
     worker.rename_terminal(rec.get("review_handle", ""), rec.get("review_title", ""))
@@ -594,6 +611,10 @@ def _review_watchdog(ref: str, rec: dict, records: dict, watchdog_seconds: int) 
     if last and last > rec.get("review_activity", 0):
         rec["review_activity"] = last
         changed = True
+    resource = health.resource_of(worker.REVIEWER_HEAD)
+    if resource and statuses.get(resource) == health.RED:
+        rec["review_activity"] = time.time()
+        return True
     silent = time.time() - rec.get("review_activity", time.time())
     if silent <= watchdog_seconds:
         return changed

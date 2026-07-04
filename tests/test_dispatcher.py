@@ -1917,6 +1917,40 @@ class ValidateReviewTest(_DispatcherBase):
         self.assertEqual(self._rev_ws_torndown(), [])           # reviewer ws left for a human
         self.assertTrue(any(r.get("reason") == "review-watchdog" for r in self._runs()))
 
+    def test_review_watchdog_frozen_while_reviewer_resource_is_red(self):
+        # triggered-agents-241: the reviewer head (claude-opus) sits on the same claude-sub
+        # resource as any worker — a subscription-limit red must freeze this clock too, not just
+        # dispatcher._advance's worker-side one (#31).
+        ref = self._spawned()
+        self.worker.activity_ts = None
+        dispatcher.WATCHDOG_SECONDS = -1
+        self.statuses["claude-sub"] = "red"
+        dispatcher.tick()
+        self.assertEqual(self._column(ref), "Validate")   # frozen, not Blocked
+        self.assertEqual(self._rev_ws_torndown(), [])
+
+    def test_review_watchdog_resumes_once_reviewer_resource_goes_green_again(self):
+        ref = self._spawned()
+        self.worker.activity_ts = None
+        dispatcher.WATCHDOG_SECONDS = -1
+        self.statuses["claude-sub"] = "red"
+        dispatcher.tick()
+        self.assertEqual(self._column(ref), "Validate")   # still frozen
+        self.statuses["claude-sub"] = "green"
+        dispatcher.tick()   # clock resumes from the last frozen tick, still silent -> fires
+        self.assertEqual(self._column(ref), "Blocked")
+        self.assertTrue(any(r.get("reason") == "review-watchdog" for r in self._runs()))
+
+    def test_review_watchdog_unfrozen_still_holds_when_reviewer_is_actually_active(self):
+        ref = self._spawned()
+        self.statuses["claude-sub"] = "red"
+        dispatcher.WATCHDOG_SECONDS = 600
+        dispatcher.tick()   # frozen tick
+        self.statuses["claude-sub"] = "green"
+        self.worker.activity_ts = time.time()   # fresh output once the resource recovers
+        dispatcher.tick()
+        self.assertEqual(self._column(ref), "Validate")
+
     def test_spawn_failure_is_retried_next_tick(self):
         ref = self._to_validate()
         self._ci_green()
