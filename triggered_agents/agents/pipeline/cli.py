@@ -14,6 +14,12 @@ in the same call) — see model.STEWARD_OVERRIDE and ops.move_card. idea is revi
 setup/list/show/probe need no role. Guards live in model/ops; this layer only wires argv to them
 and maps failures to exit codes.
 
+pause/resume (triggered-agents-281) are po-/steward-only — toggle the persistent flag in
+`state/pipeline/pause.json` (see dispatcher.pause/resume, pause.py) that dispatcher.tick checks
+before claiming or (in hard mode) before touching any head at all, and runtime/dispatch.py checks
+before dispatching steward/curator/retro. pause-status needs no role, same as list/show — it only
+reads the flag.
+
 `probe --resource <id>` exits 0/1 for green/red (see health.run_builtin_probe), not the generic
 KanboardError/GuardError table below — it is heads.toml's own probe command, run by
 health.refresh, never touching the board at all.
@@ -69,6 +75,11 @@ def _build_parser() -> argparse.ArgumentParser:
     sub.add_parser("setup")
     sub.add_parser("tick")       # dispatcher: one deterministic tick (claim/advance)
     sub.add_parser("precheck")   # dispatcher: exit 0 if there is work, non-zero to skip
+
+    p_pause = sub.add_parser("pause")     # po/steward: soft (claims off) or hard (heads stopped)
+    p_pause.add_argument("--mode", required=True, choices=("soft", "hard"))
+    sub.add_parser("resume")              # po/steward: undo pause, idempotent if not paused
+    sub.add_parser("pause-status")        # any role: current pause state, read-only
 
     p_probe = sub.add_parser("probe")   # heads.toml's own probe command for a resource
     p_probe.add_argument("--resource", required=True)
@@ -170,6 +181,19 @@ def main(argv=None) -> int:
         if args.cmd in ("tick", "precheck"):
             from . import dispatcher
             return dispatcher.tick() if args.cmd == "tick" else dispatcher.precheck()
+        if args.cmd == "pause":
+            if not _need_role(role, ("po", "steward")):
+                return 2
+            from . import dispatcher
+            return _emit(dispatcher.pause(args.mode))
+        if args.cmd == "resume":
+            if not _need_role(role, ("po", "steward")):
+                return 2
+            from . import dispatcher
+            return _emit(dispatcher.resume())
+        if args.cmd == "pause-status":
+            from . import dispatcher
+            return _emit(dispatcher.pause_status())
         if args.cmd == "probe":
             from . import health
             try:

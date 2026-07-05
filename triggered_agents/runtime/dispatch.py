@@ -82,6 +82,23 @@ def _load_spec(agent: str) -> dict:
     return tomllib.loads((_REPO_ROOT / "triggered_agents" / "agents" / agent / "automation.toml").read_text())
 
 
+def _pipeline_paused() -> bool:
+    """Whether the pipeline-wide pause flag (triggered-agents-281, agents/pipeline/pause.py) is
+    set — checked first thing in run(), before the ghost reap or any of the four dispatch branches,
+    so a paused pipeline never spends a token on steward/curator/retro either: none of them carry
+    an in-flight card of their own the way a worker/reviewer head does, so pause has no "let it
+    finish its cycle" case here in either mode, soft or hard. Lazy import, same reason as
+    _reuse_head_is_red's own agents.pipeline.health import just below — this module is imported at
+    process start by every agent, so a top-level import back into agents.pipeline would risk a
+    circular import the first time either side changes its own imports. Best-effort: any failure
+    (pause.py itself broken) defaults to not-paused rather than silently wedging every agent."""
+    try:
+        from ..agents.pipeline import pause as pipeline_pause
+        return pipeline_pause.is_paused()
+    except Exception:
+        return False
+
+
 def _reuse_head_is_red(agent: str, state: AgentState) -> bool:
     """Whether the profile the idle terminal was ACTUALLY launched with is currently sitting on a
     red resource — the check idle-reuse needs before sending into an already-warm terminal, since
@@ -264,6 +281,10 @@ def run(agent: str, variant: str | None = None) -> int:
     state = AgentState(agent)
     event = variant or "dispatch"
     with state.lock():
+        if _pipeline_paused():
+            state.log_run(event, action="paused")
+            print(f"dispatch[{agent}]: pipeline paused — no dispatch")
+            return 0
         reaped = _reap_ghosts(ws)  # prune dead-pty tabs so ghosts never accumulate
         if reaped:
             print(f"dispatch[{agent}]: reaped {reaped} ghost tab(s)")
