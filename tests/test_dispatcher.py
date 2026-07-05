@@ -2555,6 +2555,22 @@ class PipelinePauseTest(_DispatcherBase):
         with self.assertRaises(model.GuardError):
             dispatcher.pause("nonsense")
 
+    def test_corrupt_pause_file_fails_open_but_logs_a_warn(self):
+        pause.STATE.ensure_dir()
+        pause.PAUSE_FILE.write_text("{not json", encoding="utf-8")
+        self.assertEqual(dispatcher.pause_status(), {"paused": False})
+        runs = [r for r in self._runs() if r["event"] == "pause-flag"]
+        self.assertTrue(runs and runs[-1]["result"] == "corrupt" and runs[-1]["level"] == "warn")
+
+    def test_resume_relaunch_failure_is_localized_not_a_crash(self):
+        ref = self._claim_one(head="claude-opus")
+        dispatcher.pause("hard")
+        with mock.patch.object(worker, "launch_worker", side_effect=RuntimeError("orca timeout")):
+            result = dispatcher.resume()   # must not raise despite the relaunch failing
+        self.assertEqual(result, {"paused": False})   # still cleared, not stuck paused forever
+        runs = [r for r in self._runs() if r["event"] == "resume" and r.get("result") == "relaunch-failed"]
+        self.assertTrue(any(r.get("reference") == ref for r in runs))
+
     # --- soft: claims off, everything claimed rides its cycle -------------------------------
     def test_soft_pause_blocks_new_claims(self):
         dispatcher.pause("soft")
@@ -2674,12 +2690,58 @@ class PipelinePauseTest(_DispatcherBase):
         ref = self._to_validate_with_reviewer()
         review_ws = dispatcher._load_cards()[ref]["review_ws"]
         dispatcher.pause("hard")
+        launched_before = len(self.worker.launched)
         dispatcher.resume()
         self.assertEqual(len(self.worker.relaunched_reviewers), 1)
         self.assertEqual(self.worker.relaunched_reviewers[0]["ws"], review_ws)
         rec = dispatcher._load_cards()[ref]
         self.assertEqual(rec["review_handle"], self.worker.relaunched_reviewers[0]
                           and f"resumed-rev-handle-{rec['worker']}")
+        # blocker B1 (review): the parked worker (kept only for a CI-red nudge) must NOT get a
+        # fresh head while the reviewer is independently reviewing this exact branch.
+        self.assertEqual(self.worker.launched[launched_before:], [])
+        self.assertEqual(rec["handle"], "")
+
+    def test_hard_resume_parks_rather_than_relaunches_a_validate_workers_terminal(self):
+        ref = self._to_validate_with_reviewer()
+        launched_before = len(self.worker.launched)
+        dispatcher.pause("hard")
+        dispatcher.resume()
+        self.assertEqual(self.worker.launched[launched_before:], [])
+        self.assertEqual(dispatcher._load_cards()[ref]["handle"], "")
+        runs = [r for r in self._runs() if r["event"] == "resume"]
+        self.assertIn(f"{ref}:worker", runs[-1]["parked"])
+
+    def test_ci_red_after_hard_pause_relaunches_the_parked_worker_before_notifying(self):
+        ref = self._to_validate_with_reviewer()
+        dispatcher.pause("hard")
+        dispatcher.resume()
+        self.assertEqual(dispatcher._load_cards()[ref]["handle"], "")   # parked, not relaunched
+        launched_before = len(self.worker.launched)
+        self.worker.pr_status = {"merged": False, "state": "OPEN", "rollup": "FAILURE",
+                                 "failed_job": "tests", "failed_log": "boom"}
+        dispatcher.tick()
+        self.assertEqual(self._column(ref), model.IN_PROGRESS)
+        new_launches = self.worker.launched[launched_before:]
+        self.assertEqual(len(new_launches), 1)                    # lazily relaunched right here
+        rec = dispatcher._load_cards()[ref]
+        expected_handle = f"handle-{new_launches[0]['worker']}"
+        self.assertEqual(rec["handle"], expected_handle)
+        self.assertEqual(self.worker.notified[-1][0], expected_handle)   # notified the fresh head
+
+    def test_review_red_after_hard_pause_relaunches_the_parked_worker_before_notifying(self):
+        ref = self._to_validate_with_reviewer()
+        dispatcher.pause("hard")
+        dispatcher.resume()
+        self.assertEqual(dispatcher._load_cards()[ref]["handle"], "")   # parked, not relaunched
+        launched_before = len(self.worker.launched)
+        ops.verdict(ref, "red", "блокер: не так")
+        dispatcher.tick()
+        self.assertEqual(self._column(ref), model.IN_PROGRESS)
+        new_launches = self.worker.launched[launched_before:]
+        self.assertEqual(len(new_launches), 1)                    # lazily relaunched right here
+        rec = dispatcher._load_cards()[ref]
+        self.assertNotEqual(rec["handle"], "")
 
     def test_hard_resume_gives_the_reviewer_watchdog_a_fresh_window(self):
         ref = self._to_validate_with_reviewer()

@@ -28,11 +28,17 @@ MODES = ("soft", "hard")
 
 
 def load() -> dict:
+    """{} (not paused) when the file is absent or unreadable. A corrupt file fails toward "not
+    paused" rather than wedging every caller (precheck/tick/dispatch.run all call this on every
+    single tick) — but that fail-open is exactly backwards from the pause flag's own purpose, so
+    it's not silent: logged as a warn every time it's hit, same discipline as any other
+    recurring-until-fixed condition here (e.g. precheck's own head-health probe failure)."""
     if not PAUSE_FILE.is_file():
         return {}
     try:
         return json.loads(PAUSE_FILE.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as e:
+        STATE.log_run("pause-flag", result="corrupt", level="warn", error=str(e))
         return {}
 
 

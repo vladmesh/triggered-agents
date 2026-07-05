@@ -845,15 +845,24 @@ def pause(requested_mode: str) -> dict:
 def resume() -> dict:
     """Undo pause(). Not paused at all is a no-op (still logged). A soft pause never stopped
     anything, so lifting it is just dropping the flag — the very next tick claims and ticks
-    normally again. A hard pause relaunches every head pause() stopped, in the exact same
-    workspace with the exact same TASK.md/REVIEW.md pause() left untouched (worker.launch_worker/
-    worker.relaunch_reviewer only ever create a fresh terminal, never the workspace itself), and
-    resets its watchdog clock to now — last_activity/review_activity the same way a fresh claim/
-    spawn always does, ci_pending_since dropped so a card still on a non-terminal CI rollup gets a
-    fresh CI_PENDING_STALL_SECONDS window instead of one that already expired during the pause.
-    A card pause() stopped but that no longer wants a head when resume() runs (moved on, or its
-    record vanished) is skipped with a warn rather than relaunched into a state nobody is waiting
-    on."""
+    normally again. A hard pause relaunches every stopped head that was actually WORKING, in the
+    exact same workspace with the exact same TASK.md/REVIEW.md pause() left untouched
+    (worker.launch_worker/worker.relaunch_reviewer only ever create a fresh terminal, never the
+    workspace itself), and resets its watchdog clock to now — last_activity/review_activity the
+    same way a fresh claim/spawn always does.
+
+    A worker stopped while its card sat In progress is relaunched exactly this way. A worker
+    stopped while its card sat in Validate is NOT: that worker was already just parked (kept alive
+    only for a CI-red nudge, see validate.py), and an independent reviewer may be reviewing this
+    exact branch right now — a fresh worker head reading TASK.md from scratch would start a new
+    turn and risk pushing commits under it, branch drift under review (triggered-agents-281
+    review). Its handle is cleared instead, so nothing mistakes it for live; validate.py relaunches
+    it lazily (_ensure_worker_alive), only if/when a CI-red or review-red return actually hands the
+    card back for rework. Either way ci_pending_since is dropped for a Validate card, so one still
+    on a non-terminal CI rollup gets a fresh CI_PENDING_STALL_SECONDS window instead of one that
+    already expired during the pause. A card pause() stopped but that no longer wants a head when
+    resume() runs (moved on, or its record vanished) is skipped rather than relaunched into a state
+    nobody is waiting on."""
     with _admin_lock():
         state = pause_flag.load()
         if not state:
@@ -863,25 +872,42 @@ def resume() -> dict:
             records = _load_cards()
             by_ref = {c["reference"]: c for c in ops.list_cards()}
             relaunched: list[str] = []
+            parked: list[str] = []
             skipped: list[str] = []
             for ref in state.get("stopped_worker") or []:
                 rec = records.get(ref)
                 card = by_ref.get(ref)
-                if (rec is None or card is None or not rec.get("workspace")
-                        or card["column"] not in (model.IN_PROGRESS, "Validate")):
+                if rec is None or card is None or not rec.get("workspace"):
                     skipped.append(f"{ref}:worker")
                     continue
-                rec["handle"] = worker.launch_worker(rec["workspace"], rec.get("head"),
-                                                     rec["worker"], rec.get("title", ref))
-                rec["last_activity"] = time.time()
-                if card["column"] == "Validate":
-                    # A parked worker (kept for CI rework) has no watchdog of its own here, but
-                    # ci_pending_since is a plain wall-clock stall timer with no head to reset it —
-                    # drop it too so a card still on a non-terminal CI rollup gets a fresh
-                    # CI_PENDING_STALL_SECONDS window instead of one that already elapsed during
-                    # the pause.
+                if card["column"] == model.IN_PROGRESS:
+                    try:
+                        rec["handle"] = worker.launch_worker(rec["workspace"], rec.get("head"),
+                                                             rec["worker"], rec.get("title", ref))
+                    except Exception as e:  # noqa: BLE001 — one bad relaunch must not lose the rest
+                        skipped.append(f"{ref}:worker")
+                        STATE.log_run("resume", reference=ref, result="relaunch-failed",
+                                      level="warn", error=worker.scrub_secrets(str(e)))
+                        continue
+                    rec["last_activity"] = time.time()
+                    relaunched.append(f"{ref}:worker")
+                elif card["column"] == "Validate":
+                    # A parked Validate worker (kept for CI rework) must NOT be actively
+                    # relaunched here: an independent reviewer may be reviewing this exact branch
+                    # right now, and a fresh worker head reading TASK.md from scratch would start
+                    # a new turn and risk pushing commits under it — branch drift under review
+                    # (triggered-agents-281 review, blocker B1). Leave it stopped (handle cleared,
+                    # so nothing mistakes it for live); validate.py relaunches it lazily, only if/
+                    # when a CI-red or review-red return actually hands the card back for rework
+                    # (see _ensure_worker_alive there). ci_pending_since is still dropped — a
+                    # plain wall-clock stall timer with no head to reset it, so a card still on a
+                    # non-terminal CI rollup gets a fresh CI_PENDING_STALL_SECONDS window instead
+                    # of one that already elapsed during the pause.
+                    rec["handle"] = ""
                     rec.pop("ci_pending_since", None)
-                relaunched.append(f"{ref}:worker")
+                    parked.append(f"{ref}:worker")
+                else:
+                    skipped.append(f"{ref}:worker")
             for ref in state.get("stopped_reviewer") or []:
                 rec = records.get(ref)
                 card = by_ref.get(ref)
@@ -889,13 +915,20 @@ def resume() -> dict:
                         or not rec.get("review_ws")):
                     skipped.append(f"{ref}:reviewer")
                     continue
-                rec["review_handle"] = worker.relaunch_reviewer(
-                    rec["review_ws"], rec.get("worker", ref), rec.get("review_title", ref))
+                try:
+                    rec["review_handle"] = worker.relaunch_reviewer(
+                        rec["review_ws"], rec.get("worker", ref), rec.get("review_title", ref))
+                except Exception as e:  # noqa: BLE001 — one bad relaunch must not lose the rest
+                    skipped.append(f"{ref}:reviewer")
+                    STATE.log_run("resume", reference=ref, result="relaunch-failed",
+                                  level="warn", error=worker.scrub_secrets(str(e)))
+                    continue
                 rec["review_activity"] = time.time()
                 rec.pop("ci_pending_since", None)
                 relaunched.append(f"{ref}:reviewer")
             _save_cards(records)
-            STATE.log_run("resume", mode="hard", relaunched=relaunched, skipped=skipped)
+            STATE.log_run("resume", mode="hard", relaunched=relaunched, parked=parked,
+                          skipped=skipped)
         else:
             STATE.log_run("resume", mode="soft")
         pause_flag.clear()

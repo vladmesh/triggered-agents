@@ -137,6 +137,22 @@ def _count_marker(view: dict, marker: str) -> int:
     return sum(1 for c in view["comments"] if f"[{marker}]" in c.get("text", ""))
 
 
+def _ensure_worker_alive(rec: dict) -> None:
+    """Relaunch the worker head in its own (never-torn-down) workspace if it was left parked with
+    no live terminal — `rec["handle"]` cleared, the mark dispatcher.resume() leaves on a hard-pause
+    Validate card instead of eagerly relaunching it (triggered-agents-281 review, blocker B1: an
+    eager relaunch there could start a fresh worker turn, pushing commits under a reviewer that may
+    still be reviewing this exact branch). A CI-red or review-red return to In progress is the one
+    moment that parked worker is actually needed again, so this is called right there, lazily —
+    never on resume itself. A no-op when the handle is already live (the ordinary case, no pause
+    ever involved) or there is no workspace to relaunch into at all."""
+    if rec.get("handle") or not rec.get("workspace"):
+        return
+    rec["handle"] = worker.launch_worker(rec["workspace"], rec.get("head"),
+                                         rec.get("worker", ""), rec.get("title") or "")
+    rec["last_activity"] = time.time()
+
+
 def _stand_gate(ref: str, pr: str, card: dict, cfg: dict, records: dict, view: dict) -> bool:
     """Validate layer 2 for a card whose CI (layer 1) is green: deploy the PR branch to the
     project's stand and run e2e. Green -> a one-time stand-green verdict (the pre-merge signal for
@@ -293,6 +309,7 @@ def _validate_card(card: dict, records: dict, watchdog_seconds: int, save_cards,
             rec["last_activity"] = time.time()
             rec["stand_fails"] = 0
             rec.pop("ci_pending_since", None)
+            _ensure_worker_alive(rec)
             worker.notify(rec.get("handle", ""),
                           f"CI по {pr} красный — джоба «{job}» упала, карточка вернулась в "
                           f"In progress. Разбор в комментарии карточки, почини и снова report done.")
@@ -809,6 +826,7 @@ def _review_red(ref: str, pr: str | None, rec: dict, records: dict,
     rec["last_activity"] = time.time()
     rec["stand_fails"] = 0
     rec.pop("ci_pending_since", None)
+    _ensure_worker_alive(rec)
     worker.notify(rec.get("handle", ""),
                   f"Ревью по {phrase} красное — есть блокеры (слой 3). Карточка вернулась в "
                   f"In progress. Разбор в вердикте на карточке, почини и снова report done.")
