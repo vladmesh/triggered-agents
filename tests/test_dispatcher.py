@@ -27,7 +27,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))       # repo root
 
 from test_pipeline import FakeBoard  # noqa: E402
 
-from triggered_agents.agents.pipeline import dispatcher, health, heads, model, ops, validate, worker  # noqa: E402
+from triggered_agents.agents.pipeline import (  # noqa: E402
+    dispatcher, health, heads, model, ops, pause, validate, worker,
+)
 
 
 class FakeWorker:
@@ -69,6 +71,7 @@ class FakeWorker:
         self.pr_files_calls = []         # PR urls pr_files was asked about
         self.apply_provision_result = {"ok": True, "log": "provisioned"}
         self.apply_provision_calls = []  # each `agents` list apply_provision was called with
+        self.relaunched_reviewers = []   # {"ws", "worker", "title"} each relaunch_reviewer call
         self._n = 0
 
     def read_base_branch(self, project):
@@ -170,6 +173,10 @@ class FakeWorker:
     def stop_terminals(self, workspace):
         self.stopped_terminals.append(workspace)
 
+    def relaunch_reviewer(self, workspace, worker_id, title):
+        self.relaunched_reviewers.append({"ws": workspace, "worker": worker_id, "title": title})
+        return f"resumed-rev-handle-{worker_id}"
+
 
 class _DispatcherBase(unittest.TestCase):
     """Board+host fakes and helpers shared by the dispatcher test cases."""
@@ -187,7 +194,7 @@ class _DispatcherBase(unittest.TestCase):
                      "read_stand_config", "pr_branch", "run_stand", "spawn_reviewer",
                      "workspace_exists", "workspace_path", "rename_terminal", "merge_pr",
                      "pr_base_branch", "list_agent_worktrees", "ff_worktree", "remote_head_sha",
-                     "stop_terminals", "pr_files", "apply_provision"):
+                     "stop_terminals", "pr_files", "apply_provision", "relaunch_reviewer"):
             wp = mock.patch(f"triggered_agents.agents.pipeline.worker.{name}",
                             getattr(self.worker, name))
             wp.start()
@@ -195,7 +202,8 @@ class _DispatcherBase(unittest.TestCase):
 
         dispatcher.STATE.ensure_dir()
         for f in (dispatcher.CARDS_FILE, dispatcher.STATE.dir / "runs.jsonl",
-                  dispatcher.STATE.dir / "dispatch.lock", dispatcher.STATE.dir / "lock"):
+                  dispatcher.STATE.dir / "dispatch.lock", dispatcher.STATE.dir / "lock",
+                  pause.PAUSE_FILE):
             if f.exists():
                 f.unlink()
         self._orig_watchdog = dispatcher.WATCHDOG_SECONDS
@@ -2485,6 +2493,319 @@ class AutomergeTest(_DispatcherBase):
         dispatcher.tick()
         self.assertEqual(self.worker.merged, [])
         self.assertEqual(self._column(no_stand_ref), "Validate")
+
+
+class PipelinePauseTest(_DispatcherBase):
+    """triggered-agents-281: the pause/resume API. Soft only turns off new claims — everything
+    already claimed rides its normal cycle. Hard also stops every live worker/reviewer terminal and
+    freezes the whole tick, so resume() has to relaunch each stopped head and reset its watchdog
+    clock, never letting the paused stretch itself read as silence."""
+
+    PR = "https://github.com/vladmesh/personal_site/pull/9"
+
+    def _markers(self, ref):
+        tid = next(t["id"] for t in self.board.tasks.values() if t["reference"] == ref)
+        return " ".join(c["comment"] for c in self.board.comments.get(tid, []))
+
+    def _to_validate_with_reviewer(self):
+        """A card In progress -> Validate (report:done) -> reviewer spawned (CI green, no stand)."""
+        ref = self._claim_one()
+        ops.report(ref, "done", f"готово\nPR: {self.PR}")
+        self.worker.pr_status = None
+        dispatcher.tick()
+        self.worker.pr_status = {"merged": False, "state": "OPEN", "rollup": "SUCCESS",
+                                 "failed_job": None, "failed_log": None}
+        dispatcher.tick()
+        self.assertEqual(self._column(ref), "Validate")
+        self.assertEqual(len(self.worker.reviewer_spawns), 1)
+        return ref
+
+    # --- flag primitives / idempotency -----------------------------------------------------
+    def test_pause_status_reports_running_when_no_flag(self):
+        self.assertEqual(dispatcher.pause_status(), {"paused": False})
+
+    def test_soft_pause_then_status_then_resume(self):
+        result = dispatcher.pause("soft")
+        self.assertEqual(result["paused"], True)
+        self.assertEqual(result["mode"], "soft")
+        self.assertEqual(dispatcher.pause_status()["mode"], "soft")
+        result = dispatcher.resume()
+        self.assertEqual(result, {"paused": False})
+        self.assertEqual(dispatcher.pause_status(), {"paused": False})
+
+    def test_repeated_pause_same_mode_is_idempotent_noop(self):
+        dispatcher.pause("soft")
+        dispatcher.pause("soft")   # must not raise, must not re-log a fresh "paused" transition
+        actions = [r.get("action") for r in self._runs() if r["event"] == "pause"]
+        self.assertEqual(actions, ["paused", "noop"])
+
+    def test_pause_other_mode_while_already_paused_is_a_guard_error(self):
+        dispatcher.pause("soft")
+        with self.assertRaises(model.GuardError):
+            dispatcher.pause("hard")
+        self.assertEqual(dispatcher.pause_status()["mode"], "soft")   # unchanged
+
+    def test_resume_when_not_paused_is_a_noop(self):
+        result = dispatcher.resume()
+        self.assertEqual(result, {"paused": False})
+        actions = [r.get("action") for r in self._runs() if r["event"] == "resume"]
+        self.assertEqual(actions, ["noop"])
+
+    def test_unknown_mode_is_a_guard_error(self):
+        with self.assertRaises(model.GuardError):
+            dispatcher.pause("nonsense")
+
+    def test_corrupt_pause_file_fails_open_but_logs_a_warn(self):
+        pause.STATE.ensure_dir()
+        pause.PAUSE_FILE.write_text("{not json", encoding="utf-8")
+        self.assertEqual(dispatcher.pause_status(), {"paused": False})
+        runs = [r for r in self._runs() if r["event"] == "pause-flag"]
+        self.assertTrue(runs and runs[-1]["result"] == "corrupt" and runs[-1]["level"] == "warn")
+
+    def test_resume_relaunch_failure_is_localized_not_a_crash(self):
+        ref = self._claim_one(head="claude-opus")
+        dispatcher.pause("hard")
+        with mock.patch.object(worker, "launch_worker", side_effect=RuntimeError("orca timeout")):
+            result = dispatcher.resume()   # must not raise despite the relaunch failing
+        self.assertEqual(result, {"paused": False})   # still cleared, not stuck paused forever
+        runs = [r for r in self._runs() if r["event"] == "resume" and r.get("result") == "relaunch-failed"]
+        self.assertTrue(any(r.get("reference") == ref for r in runs))
+
+    # --- soft: claims off, everything claimed rides its cycle -------------------------------
+    def test_soft_pause_blocks_new_claims(self):
+        dispatcher.pause("soft")
+        ref = self._ready_card("A")
+        dispatcher.tick()
+        self.assertEqual(self._column(ref), "Ready")
+        self.assertEqual(self.worker.launched, [])
+        runs = [r for r in self._runs() if r["event"] == "claim-skip" and r.get("mode") == "soft"]
+        self.assertTrue(runs)
+
+    def test_soft_pause_still_advances_a_claimed_card_to_validate(self):
+        ref = self._claim_one()
+        dispatcher.pause("soft")
+        ops.report(ref, "done", f"готово\nPR: {self.PR}")
+        dispatcher.tick()
+        self.assertEqual(self._column(ref), "Validate")
+
+    def test_soft_pause_still_runs_review_and_automerge(self):
+        ref = self._to_validate_with_reviewer()
+        dispatcher.pause("soft")
+        ops.verdict(ref, "green", "каждый criterion выполнен")
+        dispatcher.tick()
+        self.assertEqual(self.worker.merged, [self.PR])
+
+    def test_soft_pause_does_not_stop_any_live_terminal(self):
+        ref = self._claim_one()
+        dispatcher.pause("soft")
+        self.assertEqual(self.worker.stopped_terminals, [])
+        self.assertEqual(dispatcher._load_cards()[ref]["handle"], f"handle-{self.worker.launched[0]['worker']}")
+
+    # --- hard: everything stops, tick freezes solid ------------------------------------------
+    def test_hard_pause_stops_the_in_progress_worker_terminal(self):
+        ref = self._claim_one()
+        ws = dispatcher._load_cards()[ref]["workspace"]
+        dispatcher.pause("hard")
+        self.assertIn(ws, self.worker.stopped_terminals)
+        self.assertEqual(dispatcher.pause_status()["stopped_worker"], [ref])
+
+    def test_hard_pause_stops_the_live_reviewer_terminal_too(self):
+        ref = self._to_validate_with_reviewer()
+        review_ws = dispatcher._load_cards()[ref]["review_ws"]
+        dispatcher.pause("hard")
+        self.assertIn(review_ws, self.worker.stopped_terminals)
+        self.assertEqual(dispatcher.pause_status()["stopped_reviewer"], [ref])
+
+    def test_hard_pause_freezes_the_tick_entirely(self):
+        ref = self._claim_one()
+        dispatcher.pause("hard")
+        ops.report(ref, "done", f"готово\nPR: {self.PR}")   # a report lands while hard-paused
+        dispatcher.tick()
+        self.assertEqual(self._column(ref), model.IN_PROGRESS)   # not advanced — tick never ran
+        runs = [r for r in self._runs() if r["event"] == "tick" and r.get("result") == "paused"]
+        self.assertTrue(runs)
+
+    def test_hard_pause_leaves_ready_cards_unclaimed(self):
+        dispatcher.pause("hard")
+        ref = self._ready_card("A")
+        dispatcher.tick()
+        self.assertEqual(self._column(ref), "Ready")
+        self.assertEqual(self.worker.launched, [])
+
+    def test_precheck_hard_paused_skips_before_listing_the_board(self):
+        dispatcher.pause("hard")
+        rc = dispatcher.precheck()
+        self.assertEqual(rc, 1)
+        runs = [r for r in self._runs() if r["event"] == "precheck"]
+        self.assertEqual(runs[-1]["result"], "paused")
+        self.assertEqual(runs[-1]["mode"], "hard")
+
+    def test_precheck_soft_paused_with_inflight_card_still_dispatches(self):
+        self._claim_one()
+        dispatcher.pause("soft")
+        rc = dispatcher.precheck()
+        self.assertEqual(rc, 0)
+        runs = [r for r in self._runs() if r["event"] == "precheck"]
+        self.assertEqual(runs[-1]["result"], "dispatched")
+
+    def test_precheck_soft_paused_with_nothing_inflight_skips_as_paused(self):
+        dispatcher.pause("soft")
+        rc = dispatcher.precheck()
+        self.assertEqual(rc, 1)
+        runs = [r for r in self._runs() if r["event"] == "precheck"]
+        self.assertEqual(runs[-1]["result"], "paused")
+
+    def test_precheck_soft_paused_ignores_ready_cards_as_a_reason_to_dispatch(self):
+        self._ready_card("A")   # a Ready card alone must not count as work while soft-paused
+        dispatcher.pause("soft")
+        rc = dispatcher.precheck()
+        self.assertEqual(rc, 1)
+
+    # --- hard resume: relaunch + fresh watchdog clock ----------------------------------------
+    def test_hard_resume_relaunches_the_worker_in_the_same_workspace(self):
+        ref = self._claim_one(head="claude-opus")
+        rec_before = dispatcher._load_cards()[ref]
+        ws, head, worker_id = rec_before["workspace"], rec_before["head"], rec_before["worker"]
+        dispatcher.pause("hard")
+        self.worker.launched.clear()
+        dispatcher.resume()
+        self.assertEqual(len(self.worker.launched), 1)
+        self.assertEqual(self.worker.launched[0]["ws"], ws)
+        self.assertEqual(self.worker.launched[0]["head"], head)
+        self.assertEqual(self.worker.launched[0]["worker"], worker_id)
+        self.assertEqual(dispatcher.pause_status(), {"paused": False})
+
+    def test_hard_resume_gives_the_worker_watchdog_a_fresh_window(self):
+        ref = self._claim_one(head="claude-opus")
+        records = dispatcher._load_cards()
+        records[ref]["last_activity"] = time.time() - 10_000   # simulate the paused stretch
+        dispatcher._save_cards(records)
+        dispatcher.pause("hard")
+        before_resume = time.time()
+        dispatcher.resume()
+        rec_after = dispatcher._load_cards()[ref]
+        self.assertGreaterEqual(rec_after["last_activity"], before_resume)   # reset, not stale
+
+    def test_hard_resume_relaunches_the_reviewer_in_the_same_workspace(self):
+        ref = self._to_validate_with_reviewer()
+        review_ws = dispatcher._load_cards()[ref]["review_ws"]
+        dispatcher.pause("hard")
+        launched_before = len(self.worker.launched)
+        dispatcher.resume()
+        self.assertEqual(len(self.worker.relaunched_reviewers), 1)
+        self.assertEqual(self.worker.relaunched_reviewers[0]["ws"], review_ws)
+        rec = dispatcher._load_cards()[ref]
+        self.assertEqual(rec["review_handle"], self.worker.relaunched_reviewers[0]
+                          and f"resumed-rev-handle-{rec['worker']}")
+        # blocker B1 (review): the parked worker (kept only for a CI-red nudge) must NOT get a
+        # fresh head while the reviewer is independently reviewing this exact branch.
+        self.assertEqual(self.worker.launched[launched_before:], [])
+        self.assertEqual(rec["handle"], "")
+
+    def test_hard_resume_parks_rather_than_relaunches_a_validate_workers_terminal(self):
+        ref = self._to_validate_with_reviewer()
+        launched_before = len(self.worker.launched)
+        dispatcher.pause("hard")
+        dispatcher.resume()
+        self.assertEqual(self.worker.launched[launched_before:], [])
+        self.assertEqual(dispatcher._load_cards()[ref]["handle"], "")
+        runs = [r for r in self._runs() if r["event"] == "resume"]
+        self.assertIn(f"{ref}:worker", runs[-1]["parked"])
+
+    def test_ci_red_after_hard_pause_relaunches_the_parked_worker_before_notifying(self):
+        ref = self._to_validate_with_reviewer()
+        dispatcher.pause("hard")
+        dispatcher.resume()
+        self.assertEqual(dispatcher._load_cards()[ref]["handle"], "")   # parked, not relaunched
+        launched_before = len(self.worker.launched)
+        self.worker.pr_status = {"merged": False, "state": "OPEN", "rollup": "FAILURE",
+                                 "failed_job": "tests", "failed_log": "boom"}
+        dispatcher.tick()
+        self.assertEqual(self._column(ref), model.IN_PROGRESS)
+        new_launches = self.worker.launched[launched_before:]
+        self.assertEqual(len(new_launches), 1)                    # lazily relaunched right here
+        rec = dispatcher._load_cards()[ref]
+        expected_handle = f"handle-{new_launches[0]['worker']}"
+        self.assertEqual(rec["handle"], expected_handle)
+        self.assertEqual(self.worker.notified[-1][0], expected_handle)   # notified the fresh head
+
+    def test_review_red_after_hard_pause_relaunches_the_parked_worker_before_notifying(self):
+        ref = self._to_validate_with_reviewer()
+        dispatcher.pause("hard")
+        dispatcher.resume()
+        self.assertEqual(dispatcher._load_cards()[ref]["handle"], "")   # parked, not relaunched
+        launched_before = len(self.worker.launched)
+        ops.verdict(ref, "red", "блокер: не так")
+        dispatcher.tick()
+        self.assertEqual(self._column(ref), model.IN_PROGRESS)
+        new_launches = self.worker.launched[launched_before:]
+        self.assertEqual(len(new_launches), 1)                    # lazily relaunched right here
+        rec = dispatcher._load_cards()[ref]
+        self.assertNotEqual(rec["handle"], "")
+
+    def test_hard_resume_gives_the_reviewer_watchdog_a_fresh_window(self):
+        ref = self._to_validate_with_reviewer()
+        records = dispatcher._load_cards()
+        records[ref]["review_activity"] = time.time() - 10_000   # simulate the paused stretch
+        dispatcher._save_cards(records)
+        dispatcher.pause("hard")
+        before_resume = time.time()
+        dispatcher.resume()
+        rec_after = dispatcher._load_cards()[ref]
+        self.assertGreaterEqual(rec_after["review_activity"], before_resume)   # reset, not stale
+
+    def test_hard_resume_drops_stale_ci_pending_clock(self):
+        ref = self._claim_one()
+        ops.report(ref, "done", f"готово\nPR: {self.PR}")
+        self.worker.pr_status = None
+        dispatcher.tick()
+        self.worker.pr_status = {"merged": False, "state": "OPEN", "rollup": "PENDING",
+                                 "failed_job": None, "failed_log": None}
+        dispatcher.tick()   # starts the ci_pending_since clock
+        self.assertIn("ci_pending_since", dispatcher._load_cards()[ref])
+        dispatcher.pause("hard")
+        dispatcher.resume()
+        self.assertNotIn("ci_pending_since", dispatcher._load_cards()[ref])
+        validate.CI_PENDING_STALL_SECONDS = -1   # would escalate instantly on a stale clock
+        dispatcher.tick()
+        self.assertEqual(self._column(ref), "Validate")   # not Blocked by ci-pending-stall
+
+    def test_hard_resume_skips_a_card_that_moved_on_while_paused(self):
+        # A card pause() stopped whose column no longer matches once resume() runs (e.g. a human
+        # moved it to Blocked by hand while paused) must not get a head relaunched into it.
+        ref = self._claim_one()
+        dispatcher.pause("hard")
+        ops.move_card("steward", ref, "Blocked")   # escalation happens outside a dispatcher tick
+        self.worker.launched.clear()
+        dispatcher.resume()
+        self.assertEqual(self.worker.launched, [])
+        runs = [r for r in self._runs() if r["event"] == "resume"]
+        self.assertIn(f"{ref}:worker", runs[-1]["skipped"])
+
+    # --- role guard ---------------------------------------------------------------------------
+    def test_cli_pause_needs_po_or_steward_role(self):
+        from triggered_agents.agents.pipeline import cli
+        rc = cli.main(["--role", "worker", "pause", "--mode", "soft"])
+        self.assertEqual(rc, 2)
+        self.assertEqual(dispatcher.pause_status(), {"paused": False})
+        rc = cli.main(["--role", "po", "pause", "--mode", "soft"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(dispatcher.pause_status()["mode"], "soft")
+
+    def test_cli_resume_needs_po_or_steward_role(self):
+        dispatcher.pause("hard")
+        from triggered_agents.agents.pipeline import cli
+        rc = cli.main(["--role", "reviewer", "resume"])
+        self.assertEqual(rc, 2)
+        self.assertEqual(dispatcher.pause_status()["mode"], "hard")
+        rc = cli.main(["--role", "steward", "resume"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(dispatcher.pause_status(), {"paused": False})
+
+    def test_cli_pause_status_needs_no_role(self):
+        from triggered_agents.agents.pipeline import cli
+        rc = cli.main(["pause-status"])
+        self.assertEqual(rc, 0)
 
 
 class OrcaJsonTimeoutTest(unittest.TestCase):

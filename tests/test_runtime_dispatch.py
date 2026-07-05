@@ -209,6 +209,48 @@ class DispatchRunTest(_DispatchBase):
         self.assertEqual(len(create_calls), 1)
 
 
+class PipelinePauseGateTest(_DispatchBase):
+    """triggered-agents-281: steward/curator/retro dispatch must not spend a token while the
+    pipeline is paused, in either mode — none of them carry an in-flight card the way a worker/
+    reviewer head does, so there is no "let it finish" case here. Patches dispatch._pipeline_paused
+    directly (rather than writing a real pause.json) so this stays independent of which
+    agents.pipeline.pause.STATE happens to already be bound in a shared test process."""
+
+    def test_paused_skips_every_dispatch_branch(self):
+        self.terminals = []
+        with mock.patch.object(dispatch, "_pipeline_paused", lambda: True):
+            dispatch.run("agent")
+        self.assertEqual(self.ready_calls, [])
+        self.assertEqual(self.orca_calls, [])
+
+    def test_paused_logs_a_distinct_action_not_created(self):
+        import json
+
+        from triggered_agents.runtime.state import AgentState
+
+        self.terminals = []
+        with mock.patch.object(dispatch, "_pipeline_paused", lambda: True):
+            dispatch.run("agent")
+        runs = AgentState("agent").dir / "runs.jsonl"
+        actions = [json.loads(l)["action"] for l in runs.read_text(encoding="utf-8").splitlines()]
+        self.assertEqual(actions, ["paused"])
+
+    def test_paused_skips_even_a_busy_stuck_watchdog_restart(self):
+        self.terminals = [{"handle": "h1", "title": "✳ Claude Code", "lastOutputAt": 1000}]
+        self.idle = False
+        with mock.patch.object(dispatch, "_quiet_seconds", lambda t, now: dispatch.WATCHDOG_SECONDS + 1), \
+             mock.patch.object(dispatch, "_pipeline_paused", lambda: True):
+            dispatch.run("agent")
+        self.assertEqual(self.orca_calls, [])
+
+    def test_not_paused_dispatches_normally(self):
+        self.terminals = []
+        with mock.patch.object(dispatch, "_pipeline_paused", lambda: False):
+            dispatch.run("agent")
+        create_calls = [c for c in self.orca_calls if c[:2] == ["terminal", "create"]]
+        self.assertEqual(len(create_calls), 1)
+
+
 class LaunchCmdTest(unittest.TestCase):
     """_launch_cmd against the real automation.toml files on disk (no mocked spec) — curator has
     no `head` field (bare claude), steward names claude-fable and must resolve it through

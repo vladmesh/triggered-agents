@@ -513,6 +513,23 @@ def spawn_reviewer(project: str, worker_id: str, base_branch: str, review_md: st
     return ws, handle
 
 
+def relaunch_reviewer(workspace: str, worker_id: str, title: str) -> str:
+    """Re-spawn just the reviewer head's terminal in an already-provisioned review workspace —
+    used by dispatcher.resume() to continue a hard-paused reviewer: the worktree and REVIEW.md are
+    exactly as spawn_reviewer left them (stop_terminals never touches either), so there is nothing
+    left to redo but launch_worker's own tail (ensure_trust/ensure_theme, terminal create, close
+    orphans) against the reviewer's own command instead of the worker's."""
+    ensure_trust(workspace)
+    ensure_theme()
+    data = _orca_json(["terminal", "create", "--worktree", f"path:{workspace}",
+                       "--title", title,
+                       "--command", _reviewer_command(worker_id)])
+    term = data.get("terminal", data)
+    handle = term.get("handle") or term.get("id") or ""
+    _close_orphan_terminals(workspace, handle)
+    return handle
+
+
 def activity(workspace: str) -> float | None:
     """Latest terminal output time in the workspace, epoch seconds, or None if unknown."""
     try:

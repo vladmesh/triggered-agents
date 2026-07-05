@@ -44,7 +44,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 
 from ...runtime.state import AgentState
-from . import health, heads, model, naming, ops, validate, worker
+from . import health, heads, model, naming, ops, pause as pause_flag, validate, worker
 # Re-exported so dispatcher.<NAME> keeps resolving for existing callers/tests — validate.py owns
 # these now (its layer-3 rework/spawn/stall caps), dispatcher just orchestrates the tick.
 from .validate import (  # noqa: F401
@@ -98,6 +98,25 @@ def _tick_lock():
     os.ftruncate(fd, 0)
     os.write(fd, str(os.getpid()).encode())
     try:
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+@contextmanager
+def _admin_lock():
+    """Same file as _tick_lock, but blocking (no LOCK_NB): pause()/resume() must never race a live
+    tick's view of cards.json, and unlike a timer's own tick — which should skip rather than queue
+    behind a slow stand run — an explicit admin pause/resume call should simply wait its turn for
+    whatever tick is already in flight, then run against a settled state."""
+    STATE.ensure_dir()
+    lockfile = STATE.dir / "dispatch.lock"
+    fd = os.open(lockfile, os.O_CREAT | os.O_RDWR)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        os.ftruncate(fd, 0)
+        os.write(fd, str(os.getpid()).encode())
         yield
     finally:
         fcntl.flock(fd, fcntl.LOCK_UN)
@@ -180,12 +199,25 @@ def precheck() -> int:
     never affect the return value below. health.refresh is the same kind of best-effort side
     step: it re-probes any resource whose TTL lapsed and logs a red<->green flip; a broken
     heads.toml must not crash precheck over this, so a raise here is caught and logged same as a
-    bad ff-agents worktree."""
+    bad ff-agents worktree.
+
+    A hard pause skips before even listing the board: nothing can be claimed, advanced, or
+    reviewed while paused this way (tick() itself freezes solid — see tick()'s own docstring), so
+    there is nothing left for a board list to tell us. A soft pause still needs the list: new
+    claims are off (Ready never counts as work), but a card already In progress or in Validate must
+    keep ticking to ride its cycle to completion, so it still counts. Either way the runs.jsonl
+    result is `paused`, distinct from the ordinary `nothing-to-do` skip, so a paused pipeline never
+    reads as a dead or idle one in the logs."""
     _ff_agent_worktrees()
     try:
         health.refresh()
     except Exception as e:  # noqa: BLE001 — must never break precheck's own board check
         STATE.log_run("head-health", result="error", level="warn", error=worker.scrub_secrets(str(e)))
+    paused = pause_flag.load()
+    if paused and paused.get("mode") == "hard":
+        STATE.log_run("precheck", result="paused", mode="hard")
+        print("pipeline: hard-paused — SKIP", file=sys.stderr)
+        return 1
     try:
         cards = ops.list_cards()
     except Exception as e:  # noqa: BLE001 — any precheck failure must be logged, not just KanboardError
@@ -193,15 +225,18 @@ def precheck() -> int:
         STATE.log_run("precheck", result="error", error_class=type(e).__name__, error=scrubbed)
         print(f"pipeline: precheck failed ({type(e).__name__}): {scrubbed}", file=sys.stderr)
         return 2
-    ready = [c for c in cards if c["column"] == "Ready"]
+    soft = bool(paused)  # hard already returned above
+    ready = [] if soft else [c for c in cards if c["column"] == "Ready"]
     inflight = [c for c in cards if c["column"] == model.IN_PROGRESS and c["claim"]]
     validating = [c for c in cards if c["column"] == "Validate"]
     if ready or inflight or validating:
         STATE.log_run("precheck", result="dispatched", ready=len(ready), inflight=len(inflight),
-                      validating=len(validating))
+                      validating=len(validating), **({"paused": "soft"} if soft else {}))
         return 0
-    STATE.log_run("precheck", result="nothing-to-do")
-    print("pipeline: nothing Ready, in flight or validating — SKIP", file=sys.stderr)
+    STATE.log_run("precheck", result="paused" if soft else "nothing-to-do",
+                  **({"mode": "soft"} if soft else {}))
+    print("pipeline: " + ("soft-paused, nothing in flight — SKIP" if soft else
+                          "nothing Ready, in flight or validating — SKIP"), file=sys.stderr)
     return 1
 
 
@@ -724,7 +759,19 @@ def _claim_next(records: dict, statuses: dict[str, str]) -> None:
 
 
 def tick() -> int:
+    """One dispatcher tick — see the module docstring for the per-tick order. A hard pause freezes
+    this solid: reconcile/advance/validate/claim all touch a head or the board on the pipeline's
+    behalf, and every head that would need touching was already stopped by pause() itself, so there
+    is nothing safe left to do until resume() relaunches them — running any of these against a
+    stopped head would either hang on a dead terminal or silently accumulate watchdog silence,
+    exactly what resume()'s clock reset exists to avoid needing in the first place. A soft pause
+    only turns off _claim_next: every claimed card keeps riding its normal cycle (advance, CI/stand,
+    layer-3 review, automerge) untouched, so Ready cards are the only thing that doesn't move."""
     with _tick_lock():
+        paused = pause_flag.load()
+        if paused and paused.get("mode") == "hard":
+            STATE.log_run("tick", result="paused", mode="hard")
+            return 0
         records = _load_cards()
         try:
             statuses = health.refresh()
@@ -735,7 +782,158 @@ def tick() -> int:
         changed = _advance(records, statuses) or changed
         changed = validate.run(records, WATCHDOG_SECONDS, _save_cards, statuses) or changed
         before = json.dumps(records, sort_keys=True)
-        _claim_next(records, statuses)
+        if paused:
+            STATE.log_run("claim-skip", result="paused", mode="soft")
+        else:
+            _claim_next(records, statuses)
         if changed or json.dumps(records, sort_keys=True) != before:
             _save_cards(records)
     return 0
+
+
+def pause(requested_mode: str) -> dict:
+    """Pause the pipeline (triggered-agents-281) — the built-in replacement for the 2026-07-04
+    workaround: hand-moving Ready cards to Blocked, disabling ta-pipeline.timer, killing terminals
+    by hand. `soft` stops new worker claims and steward/curator/retro dispatch (runtime/dispatch.py
+    checks the same flag), but every card already In progress or in Validate keeps riding its
+    normal cycle untouched — advance, CI/stand, layer-3 review, automerge, all of it. `hard` also
+    stops every live worker/reviewer terminal right now (worker.stop_terminals only — it never
+    removes a worktree, so the branch/uncommitted work stays exactly as the head left it) and
+    freezes the whole tick (see tick()): nothing advances, nothing is claimed, no watchdog can fire
+    on a head that was stopped on purpose, not one that died. resume() relaunches each stopped head
+    in its own untouched workspace and gives it a fresh watchdog window, so the paused stretch never
+    reads as silence once ticking resumes.
+
+    Idempotent: pausing again in the same mode is a no-op (still logged, so repeated calls are
+    visible in runs.jsonl). Pausing in the other mode while already paused is a GuardError — resume
+    first, then pause in the new mode, so a mode switch is never a silent partial transition (a
+    soft pause quietly upgraded to hard mid-call could stop a head whose card the caller still
+    expects to be riding its cycle unattended)."""
+    if requested_mode not in pause_flag.MODES:
+        raise model.GuardError(f"unknown pause mode {requested_mode!r} (one of {pause_flag.MODES})")
+    with _admin_lock():
+        state = pause_flag.load()
+        if state:
+            if state.get("mode") == requested_mode:
+                STATE.log_run("pause", mode=requested_mode, action="noop")
+                return pause_flag.status()
+            raise model.GuardError(
+                f"pipeline already paused ({state.get('mode')}) — resume before pausing "
+                f"{requested_mode!r}")
+        stopped_worker: list[str] = []
+        stopped_reviewer: list[str] = []
+        if requested_mode == "hard":
+            records = _load_cards()
+            by_ref = {c["reference"]: c for c in ops.list_cards()}
+            for ref, rec in records.items():
+                card = by_ref.get(ref)
+                if card is None:
+                    continue
+                if card["column"] in (model.IN_PROGRESS, "Validate") and rec.get("workspace"):
+                    worker.stop_terminals(rec["workspace"])
+                    stopped_worker.append(ref)
+                if card["column"] == "Validate" and rec.get("review_ws"):
+                    worker.stop_terminals(rec["review_ws"])
+                    stopped_reviewer.append(ref)
+        pause_flag.save(requested_mode, stopped_worker=stopped_worker,
+                        stopped_reviewer=stopped_reviewer)
+        STATE.log_run("pause", mode=requested_mode, action="paused",
+                      stopped_worker=len(stopped_worker), stopped_reviewer=len(stopped_reviewer))
+        return pause_flag.status()
+
+
+def resume() -> dict:
+    """Undo pause(). Not paused at all is a no-op (still logged). A soft pause never stopped
+    anything, so lifting it is just dropping the flag — the very next tick claims and ticks
+    normally again. A hard pause relaunches every stopped head that was actually WORKING, in the
+    exact same workspace with the exact same TASK.md/REVIEW.md pause() left untouched
+    (worker.launch_worker/worker.relaunch_reviewer only ever create a fresh terminal, never the
+    workspace itself), and resets its watchdog clock to now — last_activity/review_activity the
+    same way a fresh claim/spawn always does.
+
+    A worker stopped while its card sat In progress is relaunched exactly this way. A worker
+    stopped while its card sat in Validate is NOT: that worker was already just parked (kept alive
+    only for a CI-red nudge, see validate.py), and an independent reviewer may be reviewing this
+    exact branch right now — a fresh worker head reading TASK.md from scratch would start a new
+    turn and risk pushing commits under it, branch drift under review (triggered-agents-281
+    review). Its handle is cleared instead, so nothing mistakes it for live; validate.py relaunches
+    it lazily (_ensure_worker_alive), only if/when a CI-red or review-red return actually hands the
+    card back for rework. Either way ci_pending_since is dropped for a Validate card, so one still
+    on a non-terminal CI rollup gets a fresh CI_PENDING_STALL_SECONDS window instead of one that
+    already expired during the pause. A card pause() stopped but that no longer wants a head when
+    resume() runs (moved on, or its record vanished) is skipped rather than relaunched into a state
+    nobody is waiting on."""
+    with _admin_lock():
+        state = pause_flag.load()
+        if not state:
+            STATE.log_run("resume", action="noop")
+            return pause_flag.status()
+        if state.get("mode") == "hard":
+            records = _load_cards()
+            by_ref = {c["reference"]: c for c in ops.list_cards()}
+            relaunched: list[str] = []
+            parked: list[str] = []
+            skipped: list[str] = []
+            for ref in state.get("stopped_worker") or []:
+                rec = records.get(ref)
+                card = by_ref.get(ref)
+                if rec is None or card is None or not rec.get("workspace"):
+                    skipped.append(f"{ref}:worker")
+                    continue
+                if card["column"] == model.IN_PROGRESS:
+                    try:
+                        rec["handle"] = worker.launch_worker(rec["workspace"], rec.get("head"),
+                                                             rec["worker"], rec.get("title", ref))
+                    except Exception as e:  # noqa: BLE001 — one bad relaunch must not lose the rest
+                        skipped.append(f"{ref}:worker")
+                        STATE.log_run("resume", reference=ref, result="relaunch-failed",
+                                      level="warn", error=worker.scrub_secrets(str(e)))
+                        continue
+                    rec["last_activity"] = time.time()
+                    relaunched.append(f"{ref}:worker")
+                elif card["column"] == "Validate":
+                    # A parked Validate worker (kept for CI rework) must NOT be actively
+                    # relaunched here: an independent reviewer may be reviewing this exact branch
+                    # right now, and a fresh worker head reading TASK.md from scratch would start
+                    # a new turn and risk pushing commits under it — branch drift under review
+                    # (triggered-agents-281 review, blocker B1). Leave it stopped (handle cleared,
+                    # so nothing mistakes it for live); validate.py relaunches it lazily, only if/
+                    # when a CI-red or review-red return actually hands the card back for rework
+                    # (see _ensure_worker_alive there). ci_pending_since is still dropped — a
+                    # plain wall-clock stall timer with no head to reset it, so a card still on a
+                    # non-terminal CI rollup gets a fresh CI_PENDING_STALL_SECONDS window instead
+                    # of one that already elapsed during the pause.
+                    rec["handle"] = ""
+                    rec.pop("ci_pending_since", None)
+                    parked.append(f"{ref}:worker")
+                else:
+                    skipped.append(f"{ref}:worker")
+            for ref in state.get("stopped_reviewer") or []:
+                rec = records.get(ref)
+                card = by_ref.get(ref)
+                if (rec is None or card is None or card["column"] != "Validate"
+                        or not rec.get("review_ws")):
+                    skipped.append(f"{ref}:reviewer")
+                    continue
+                try:
+                    rec["review_handle"] = worker.relaunch_reviewer(
+                        rec["review_ws"], rec.get("worker", ref), rec.get("review_title", ref))
+                except Exception as e:  # noqa: BLE001 — one bad relaunch must not lose the rest
+                    skipped.append(f"{ref}:reviewer")
+                    STATE.log_run("resume", reference=ref, result="relaunch-failed",
+                                  level="warn", error=worker.scrub_secrets(str(e)))
+                    continue
+                rec["review_activity"] = time.time()
+                rec.pop("ci_pending_since", None)
+                relaunched.append(f"{ref}:reviewer")
+            _save_cards(records)
+            STATE.log_run("resume", mode="hard", relaunched=relaunched, parked=parked,
+                          skipped=skipped)
+        else:
+            STATE.log_run("resume", mode="soft")
+        pause_flag.clear()
+        return pause_flag.status()
+
+
+def pause_status() -> dict:
+    return pause_flag.status()
