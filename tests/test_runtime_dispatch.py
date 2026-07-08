@@ -1,9 +1,9 @@
 """Unit tests for the singleton terminal driver (runtime/dispatch.py) — no network, no Orca.
 
-Focus: every path that spawns a NEW claude process (fresh create, watchdog restart) must
+Focus: every path that spawns a NEW process (fresh create, watchdog restart) must
 pre-answer folder trust + the onboarding theme picker first (`_ensure_claude_ready`), so a fresh
-head never lands on an interactive prompt and becomes an orphan invisible to the "Claude"-in-
-title match. Warm reuse sends into an already-answered terminal, so it must not re-run prep.
+Claude head never lands on an interactive prompt and becomes an orphan invisible to the terminal
+match. Warm reuse sends into an already-answered terminal, so it must not re-run prep.
 """
 from __future__ import annotations
 
@@ -92,6 +92,8 @@ class DispatchRunTest(_DispatchBase):
         self.assertEqual(self.ready_calls, ["/ws/agent"])
         create_calls = [c for c in self.orca_calls if c[:2] == ["terminal", "create"]]
         self.assertEqual(len(create_calls), 1)
+        self.assertIn("--title", create_calls[0])
+        self.assertIn("triggered-agent:agent", create_calls[0])
 
     def test_fresh_create_records_resolved_profile(self):
         """triggered-agents-275: idle-reuse needs to know which profile a live terminal is
@@ -252,25 +254,39 @@ class PipelinePauseGateTest(_DispatchBase):
 
 
 class LaunchCmdTest(unittest.TestCase):
-    """_launch_cmd against the real automation.toml files on disk (no mocked spec) — curator has
-    no `head` field (bare claude), steward names claude-fable and must resolve it through
-    pipeline.health/heads, falling back to the bare invocation if that resolution blows up."""
+    """_launch_cmd against the real automation.toml files on disk (no mocked spec)."""
 
-    def test_agent_without_head_field_gets_bare_claude(self):
-        skill, cmd, profile = dispatch._launch_cmd("curator")
+    def test_curator_prefers_codex_with_claude_default_fallback(self):
+        from triggered_agents.agents.pipeline import health as pipeline_health
+
+        with mock.patch.object(pipeline_health, "refresh", lambda: {"openai-sub": "green"}):
+            skill, cmd, profile = dispatch._launch_cmd("curator")
         self.assertEqual(skill, "/curate")
-        self.assertEqual(cmd, "claude --dangerously-skip-permissions /curate")
-        self.assertIsNone(profile)
+        self.assertIn("BOARD_ROLE=curator", cmd)
+        self.assertIn("codex exec", cmd)
+        self.assertIn("-m gpt-5.5", cmd)
+        self.assertIn("model_reasoning_effort=\"xhigh\"", cmd)
+        self.assertEqual(profile, "codex-curator")
+
+    def test_curator_falls_back_to_bare_claude_when_openai_red(self):
+        from triggered_agents.agents.pipeline import health as pipeline_health
+
+        with mock.patch.object(pipeline_health, "refresh", lambda: {"openai-sub": "red", "claude-sub": "green"}):
+            skill, cmd, profile = dispatch._launch_cmd("curator")
+        self.assertEqual(skill, "/curate")
+        self.assertEqual(cmd, "BOARD_ROLE=curator claude --dangerously-skip-permissions '/curate'")
+        self.assertEqual(profile, "claude-default")
 
     def test_steward_head_resolves_through_pipeline_health_and_heads(self):
         from triggered_agents.agents.pipeline import health as pipeline_health
 
-        with mock.patch.object(pipeline_health, "refresh", lambda: {"claude-sub": "green"}):
+        with mock.patch.object(pipeline_health, "refresh", lambda: {"openai-sub": "green"}):
             skill, cmd, profile = dispatch._launch_cmd("steward")
         self.assertEqual(skill, "/steward")
         self.assertIn("BOARD_ROLE=steward", cmd)
-        self.assertIn("--model fable", cmd)
-        self.assertEqual(profile, "claude-fable")
+        self.assertIn("codex exec", cmd)
+        self.assertIn("model_reasoning_effort=\"xhigh\"", cmd)
+        self.assertEqual(profile, "codex-steward")
 
     def test_steward_head_falls_back_to_bare_claude_on_broken_resolution(self):
         from triggered_agents.agents.pipeline import health as pipeline_health
@@ -284,46 +300,40 @@ class LaunchCmdTest(unittest.TestCase):
     def test_steward_head_falls_back_to_next_profile_when_resource_red(self):
         from triggered_agents.agents.pipeline import health as pipeline_health
 
-        # claude-fable's chain is claude-opus (same claude-sub resource) then hermes (a
-        # different, openrouter resource) — see heads.toml, PR #38: the steward is the watcher of
-        # last resort and must wake even when the whole claude-sub resource is red. With claude-sub
-        # red and openrouter unmentioned (defaults green — heads.health.resolve_head), resolution
-        # walks past claude-opus (same red resource) onto hermes.
-        with mock.patch.object(pipeline_health, "refresh", lambda: {"claude-sub": "red"}):
+        # codex-steward falls back to the previous steward chain. With openai-sub red and
+        # claude-sub green, resolution lands on claude-fable.
+        with mock.patch.object(pipeline_health, "refresh", lambda: {"openai-sub": "red", "claude-sub": "green"}):
             skill, cmd, profile = dispatch._launch_cmd("steward")
         self.assertIn("BOARD_ROLE=steward", cmd)
-        self.assertIn("hermes", cmd)
-        self.assertIn("openai/gpt-5.5", cmd)
-        self.assertEqual(profile, "hermes")
+        self.assertIn("--model fable", cmd)
+        self.assertEqual(profile, "claude-fable")
 
     def test_steward_deep_sweep_variant_resolves_its_own_skill_through_the_same_head(self):
         from triggered_agents.agents.pipeline import health as pipeline_health
 
-        with mock.patch.object(pipeline_health, "refresh", lambda: {"claude-sub": "green"}):
+        with mock.patch.object(pipeline_health, "refresh", lambda: {"openai-sub": "green"}):
             skill, cmd, profile = dispatch._launch_cmd("steward", "deep-sweep")
         self.assertEqual(skill, "/steward deep-sweep")
         self.assertIn("BOARD_ROLE=steward", cmd)
-        self.assertIn("--model fable", cmd)
-        self.assertEqual(profile, "claude-fable")
+        self.assertEqual(profile, "codex-steward")
 
     def test_steward_head_keeps_original_name_when_the_whole_chain_is_red(self):
         from triggered_agents.agents.pipeline import health as pipeline_health
 
-        # Every resource claude-fable's chain can reach (claude-sub, openrouter) is red -> nothing
-        # to fall back onto; _launch_cmd must keep the originally-named profile rather than
-        # silently downgrading to no model at all.
+        # Every resource codex-steward's chain can reach (openai-sub, claude-sub, openrouter) is
+        # red -> nothing to fall back onto; _launch_cmd must keep the originally-named profile.
         with mock.patch.object(pipeline_health, "refresh",
-                               lambda: {"claude-sub": "red", "openrouter": "red"}):
+                               lambda: {"openai-sub": "red", "claude-sub": "red", "openrouter": "red"}):
             skill, cmd, profile = dispatch._launch_cmd("steward")
-        self.assertIn("--model fable", cmd)
-        self.assertEqual(profile, "claude-fable")
+        self.assertIn("codex exec", cmd)
+        self.assertEqual(profile, "codex-steward")
 
     def test_card_ref_is_appended_to_the_skill_before_rendering(self):
         """triggered-agents-255: the ref must land INSIDE the reprd prompt, not tacked onto the
         rendered command afterward where it could fall outside the quoted argument."""
         from triggered_agents.agents.pipeline import health as pipeline_health
 
-        with mock.patch.object(pipeline_health, "refresh", lambda: {"claude-sub": "green"}):
+        with mock.patch.object(pipeline_health, "refresh", lambda: {"openai-sub": "green"}):
             skill, cmd, profile = dispatch._launch_cmd("steward", card_ref="triggered-agents-260")
         self.assertEqual(skill, "/steward --card triggered-agents-260")
         self.assertIn(repr(skill), cmd)
@@ -331,7 +341,7 @@ class LaunchCmdTest(unittest.TestCase):
     def test_card_ref_with_deep_sweep_variant(self):
         from triggered_agents.agents.pipeline import health as pipeline_health
 
-        with mock.patch.object(pipeline_health, "refresh", lambda: {"claude-sub": "green"}):
+        with mock.patch.object(pipeline_health, "refresh", lambda: {"openai-sub": "green"}):
             skill, cmd, profile = dispatch._launch_cmd("steward", "deep-sweep", card_ref="triggered-agents-261")
         self.assertEqual(skill, "/steward deep-sweep --card triggered-agents-261")
 
@@ -382,14 +392,15 @@ class ReuseHeadIsRedTest(unittest.TestCase):
         self.addCleanup(self._state_patch.stop)
 
     def test_agent_without_head_field_is_never_red(self):
-        state = dispatch.AgentState("curator")
-        self.assertFalse(dispatch._reuse_head_is_red("curator", state))
+        state = dispatch.AgentState("agent")
+        with mock.patch.object(dispatch, "_load_spec", lambda agent: {"skill": "/agent"}):
+            self.assertFalse(dispatch._reuse_head_is_red("agent", state))
 
     def test_no_recorded_profile_falls_back_to_static_preferred_head_green(self):
         from triggered_agents.agents.pipeline import health as pipeline_health
 
         state = dispatch.AgentState("steward")
-        with mock.patch.object(pipeline_health, "refresh", lambda: {"claude-sub": "green"}):
+        with mock.patch.object(pipeline_health, "refresh", lambda: {"openai-sub": "green"}):
             self.assertFalse(dispatch._reuse_head_is_red("steward", state))
 
     def test_no_recorded_profile_falls_back_to_static_preferred_head_red(self):
@@ -399,7 +410,7 @@ class ReuseHeadIsRedTest(unittest.TestCase):
         from triggered_agents.agents.pipeline import health as pipeline_health
 
         state = dispatch.AgentState("steward")
-        with mock.patch.object(pipeline_health, "refresh", lambda: {"claude-sub": "red"}):
+        with mock.patch.object(pipeline_health, "refresh", lambda: {"openai-sub": "red"}):
             self.assertTrue(dispatch._reuse_head_is_red("steward", state))
 
     def test_broken_resolution_defaults_to_not_red(self):
@@ -411,28 +422,28 @@ class ReuseHeadIsRedTest(unittest.TestCase):
 
     def test_stored_fallback_profile_red_even_though_preferred_head_recovered(self):
         """triggered-agents-275: the terminal is actually running on hermes -- a fallback it was
-        launched onto while claude-sub was red. claude-sub has since recovered, but openrouter
+        launched onto while openai-sub/claude-sub were red. Those have since recovered, but openrouter
         (hermes's own resource) is now red. Checking only the static preferred head
-        (claude-fable/claude-sub, as triggered-agents-274 did) would miss this: the terminal is
+        (codex-steward/openai-sub, as triggered-agents-274 did) would miss this: the terminal is
         still dead even though its preferred resource looks green."""
         from triggered_agents.agents.pipeline import health as pipeline_health
 
         state = dispatch.AgentState("steward")
         state.save_head_profile("hermes")
         with mock.patch.object(pipeline_health, "refresh",
-                               lambda: {"claude-sub": "green", "openrouter": "red"}):
+                               lambda: {"openai-sub": "green", "claude-sub": "green", "openrouter": "red"}):
             self.assertTrue(dispatch._reuse_head_is_red("steward", state))
 
     def test_stored_preferred_profile_green_even_though_its_own_fallback_is_red(self):
-        """Counterpart: the terminal is running on the preferred claude-fable profile
-        (claude-sub green) — a red openrouter (only hermes's resource, never reached) must not
+        """Counterpart: the terminal is running on the preferred codex-steward profile
+        (openai-sub green) — a red openrouter (only hermes's resource, never reached) must not
         divert a perfectly live terminal."""
         from triggered_agents.agents.pipeline import health as pipeline_health
 
         state = dispatch.AgentState("steward")
-        state.save_head_profile("claude-fable")
+        state.save_head_profile("codex-steward")
         with mock.patch.object(pipeline_health, "refresh",
-                               lambda: {"claude-sub": "green", "openrouter": "red"}):
+                               lambda: {"openai-sub": "green", "openrouter": "red"}):
             self.assertFalse(dispatch._reuse_head_is_red("steward", state))
 
 

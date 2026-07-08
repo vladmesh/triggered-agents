@@ -30,10 +30,12 @@ class RealRegistryTest(unittest.TestCase):
 
     def test_starting_profiles_present(self):
         self.assertEqual(set(self.reg.known()),
-                         {"claude-sonnet", "claude-opus", "claude-fable", "hermes", "codex"})
+                         {"claude-default", "claude-sonnet", "claude-opus", "claude-fable",
+                          "hermes", "codex", "codex-high", "codex-extra", "codex-reviewer",
+                          "codex-curator", "codex-steward", "codex-retro"})
 
     def test_claude_profiles_share_the_subscription_resource(self):
-        for pid in ("claude-sonnet", "claude-opus", "claude-fable"):
+        for pid in ("claude-default", "claude-sonnet", "claude-opus", "claude-fable"):
             self.assertEqual(self.reg.profile(pid)["resource"], "claude-sub")
 
     def test_claude_fable_falls_back_to_opus_then_hermes(self):
@@ -49,6 +51,14 @@ class RealRegistryTest(unittest.TestCase):
         # stays only in the steward's claude-fable chain above.
         self.assertEqual(self.reg.profile("claude-sonnet").get("fallback") or [], [])
         self.assertEqual(self.reg.profile("claude-opus").get("fallback") or [], [])
+        self.assertEqual(self.reg.profile("codex").get("fallback") or [], [])
+        self.assertEqual(self.reg.profile("codex-high").get("fallback") or [], [])
+        self.assertEqual(self.reg.profile("codex-extra").get("fallback") or [], [])
+
+    def test_codex_role_profiles_keep_claude_second_priority(self):
+        self.assertEqual(self.reg.profile("codex-curator").get("fallback"), ["claude-default"])
+        self.assertEqual(self.reg.profile("codex-steward").get("fallback"), ["claude-fable"])
+        self.assertEqual(self.reg.profile("codex-reviewer").get("fallback"), ["claude-opus"])
 
     def test_hermes_is_on_its_own_resource(self):
         self.assertEqual(self.reg.profile("hermes")["resource"], "openrouter")
@@ -130,7 +140,13 @@ class RenderCodexTest(unittest.TestCase):
         self.assertIn("--dangerously-bypass-approvals-and-sandbox", cmd)
         self.assertIn("--skip-git-repo-check", cmd)
         self.assertIn("-m gpt-5.5", cmd)
+        self.assertNotIn("model_reasoning_effort", cmd)
         self.assertIn(repr("ping"), cmd)
+
+    def test_renders_codex_effort(self):
+        cmd = heads.render_command("codex-extra", role="worker", prompt="ping", registry=self.reg)
+        self.assertIn("-m gpt-5.5", cmd)
+        self.assertIn("model_reasoning_effort=\"xhigh\"", cmd)
 
     def test_profile_codex_home_overrides_pin(self):
         prof = dict(self.reg.profile("codex"), codex_home="/tmp/throwaway-home")
@@ -190,6 +206,21 @@ fallback = ["p2"]
         with self.assertRaises(heads.HeadRegistryError) as ctx:
             heads.load_registry(path)
         self.assertIn("p2", str(ctx.exception))
+
+    def test_codex_profile_with_unknown_effort_raises(self):
+        path = self._write("""
+[resources.openai-sub]
+probe = "true"
+[profiles.p1]
+resource = "openai-sub"
+adapter = "codex"
+model = "gpt-5.5"
+effort = "too-much"
+fallback = []
+""")
+        with self.assertRaises(heads.HeadRegistryError) as ctx:
+            heads.load_registry(path)
+        self.assertIn("too-much", str(ctx.exception))
 
 
 if __name__ == "__main__":

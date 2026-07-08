@@ -41,7 +41,7 @@ _GH_LOG_TAIL_LINES = 40
 # Head profile for the layer-3 reviewer. A plain config knob (not a per-card choice): the reviewer
 # is independent of the worker, so the card's `head` field is not reused here — this names a
 # profile in heads.toml, same registry every worker head resolves against.
-REVIEWER_HEAD = os.environ.get("TA_REVIEWER_HEAD", "claude-opus")
+REVIEWER_HEAD = os.environ.get("TA_REVIEWER_HEAD", "codex-reviewer")
 
 
 class WorkspaceError(RuntimeError):
