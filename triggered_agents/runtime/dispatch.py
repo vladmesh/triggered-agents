@@ -204,6 +204,31 @@ def _dispatch_command(agent: str, variant: str | None) -> tuple[str, str, str | 
     return _launch_cmd(agent, variant, card_ref=card_ref) if card_ref else _launch_cmd(agent, variant)
 
 
+def _fresh_steward_report_in_progress(agent: str, now: float) -> dict | None:
+    """A secondary run guard for steward dispatch.
+
+    Orca terminal creation is not immediately visible in `terminal list` on every host. If two
+    timers fire close together, the second dispatch can miss the first terminal and create a
+    second report card/head. The report card is already the durable "this run exists" marker, so
+    use it as a short-circuit while it is still younger than the steward stale threshold. Once it
+    is stale, a later steward run must be allowed through to investigate and close/escalate it.
+    """
+    if agent != "steward":
+        return None
+    try:
+        from ..agents.pipeline import ops as pipeline_ops
+        from ..agents.steward import signals as steward_signals
+
+        threshold = steward_signals.STALE_HOURS * 3600
+        for card in pipeline_ops.list_cards(column="In progress", project="triggered-agents"):
+            moved = card.get("date_moved")
+            if card.get("steward_report") == "1" and moved and now - moved < threshold:
+                return card
+    except Exception:
+        return None
+    return None
+
+
 def _ensure_claude_ready(ws: str) -> None:
     """Pre-answer folder trust + the onboarding theme picker before a fresh `claude` spawns.
 
@@ -290,6 +315,14 @@ def run(agent: str, variant: str | None = None) -> int:
         if _pipeline_paused():
             state.log_run(event, action="paused")
             print(f"dispatch[{agent}]: pipeline paused — no dispatch")
+            return 0
+        active_report = _fresh_steward_report_in_progress(agent, time.time())
+        if active_report:
+            state.log_run(event, action="active-report-skip", reference=active_report["reference"])
+            print(
+                f"dispatch[{agent}]: active steward report {active_report['reference']} "
+                "is still fresh — no dispatch"
+            )
             return 0
         reaped = _reap_ghosts(ws)  # prune dead-pty tabs so ghosts never accumulate
         if reaped:

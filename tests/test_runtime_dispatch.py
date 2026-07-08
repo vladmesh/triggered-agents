@@ -463,6 +463,7 @@ class StewardReportCardDispatchTest(unittest.TestCase):
         self.idle = True
         self.orca_calls = []
         self.created_cards = []
+        self.active_report_cards = []
 
         def fake_create_report_card(project, title, slug, description=""):
             ref = f"triggered-agents-{len(self.created_cards) + 1}"
@@ -472,6 +473,10 @@ class StewardReportCardDispatchTest(unittest.TestCase):
 
         from triggered_agents.agents.pipeline import ops as pipeline_ops
         p = mock.patch.object(pipeline_ops, "create_report_card", fake_create_report_card)
+        p.start()
+        self.addCleanup(p.stop)
+
+        p = mock.patch.object(pipeline_ops, "list_cards", lambda column=None, project=None: self.active_report_cards)
         p.start()
         self.addCleanup(p.stop)
 
@@ -529,6 +534,39 @@ class StewardReportCardDispatchTest(unittest.TestCase):
         dispatch.run("steward")
         self.assertEqual(len(self.created_cards), 1)
         self.assertEqual(self.created_cards[0]["project"], "triggered-agents")
+        self.assertIn("--card triggered-agents-1", self._launch_command_sent())
+
+    def test_fresh_active_report_card_skips_dispatch_without_creating_a_second_card(self):
+        from triggered_agents.runtime.state import AgentState
+
+        self.terminals = []
+        self.active_report_cards = [{
+            "reference": "triggered-agents-299",
+            "date_moved": 1234,
+            "steward_report": "1",
+        }]
+        with mock.patch("time.time", lambda: 1235):
+            dispatch.run("steward", "deep-sweep")
+        self.assertEqual(self.created_cards, [])
+        self.assertEqual([c for c in self.orca_calls if c[:2] == ["terminal", "create"]], [])
+
+        runs = AgentState("steward").dir / "runs.jsonl"
+        self.assertIn("active-report-skip", runs.read_text(encoding="utf-8"))
+        self.assertIn("triggered-agents-299", runs.read_text(encoding="utf-8"))
+
+    def test_stale_active_report_card_does_not_skip_dispatch(self):
+        from triggered_agents.agents.steward import signals as steward_signals
+
+        self.terminals = []
+        self.active_report_cards = [{
+            "reference": "triggered-agents-299",
+            "date_moved": 1000,
+            "steward_report": "1",
+        }]
+        now = 1000 + int(steward_signals.STALE_HOURS * 3600) + 1
+        with mock.patch("time.time", lambda: now):
+            dispatch.run("steward", "deep-sweep")
+        self.assertEqual(len(self.created_cards), 1)
         self.assertIn("--card triggered-agents-1", self._launch_command_sent())
 
     def test_deep_sweep_variant_names_itself_in_the_card_title(self):
