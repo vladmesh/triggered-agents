@@ -43,10 +43,12 @@ class FakeWorker:
     def __init__(self):
         self.provision_ok = True
         self.provision_log = "[provision] done\n"
+        self.provision_calls = []
         self.create_raises = None
         self.activity_ts = None          # None -> dispatcher falls back to stored last_activity
         self.activity_polled = []        # every workspace worker.activity() was asked about
         self.launched = []
+        self.provisioners_launched = []
         self.tasks_written = []
         self.torn_down = []
         self.pr_status = None            # dict returned by poll_pr, or None for gh-unavailable
@@ -72,6 +74,7 @@ class FakeWorker:
         self.remote_head_shas = {}       # branch -> sha remote_head_sha returns; missing -> None
         self.stopped_terminals = []      # workspaces stop_terminals was asked to stop (no rm)
         self.workspace_calls = []        # (project, name, base_branch) every create_workspace call
+        self.manifest_statuses = {}      # (project, base) or project -> manifest_status dict
         self.pr_files_result = None      # list[str] | None returned by pr_files (None -> gh down)
         self.pr_files_calls = []         # PR urls pr_files was asked about
         self.apply_provision_result = {"ok": True, "log": "provisioned"}
@@ -103,6 +106,7 @@ class FakeWorker:
         self.branches_set.append((workspace, branch))
 
     def provision(self, workspace):
+        self.provision_calls.append(workspace)
         return self.provision_ok, self.provision_log
 
     def write_task(self, workspace, content):
@@ -112,6 +116,24 @@ class FakeWorker:
     def launch_worker(self, workspace, head, worker_id, title):
         self.launched.append({"ws": workspace, "head": head, "worker": worker_id, "title": title})
         return f"handle-{worker_id}"
+
+    def launch_provisioner(self, workspace, head, worker_id, title):
+        self.provisioners_launched.append(
+            {"ws": workspace, "head": head, "worker": worker_id, "title": title})
+        return f"handle-{worker_id}"
+
+    def manifest_status(self, project, base_branch=None):
+        key = (project, base_branch or "main")
+        return self.manifest_statuses.get(
+            key,
+            self.manifest_statuses.get(
+                project,
+                {"present": True, "kind": "local", "path": f"/projects/{project}/workspace.toml"},
+            ),
+        )
+
+    def has_manifest(self, project, base_branch=None):
+        return bool(self.manifest_status(project, base_branch).get("present"))
 
     def workspace_exists(self, project, name):
         return (project, name) in self.existing_workspaces
@@ -195,7 +217,8 @@ class _DispatcherBase(unittest.TestCase):
 
         self.worker = FakeWorker()
         for name in ("read_base_branch", "is_contrib", "create_workspace", "set_branch", "provision",
-                     "write_task", "launch_worker", "activity", "poll_pr", "notify", "teardown",
+                     "write_task", "launch_worker", "launch_provisioner", "activity", "poll_pr",
+                     "notify", "teardown", "manifest_status", "has_manifest",
                      "read_stand_config", "pr_branch", "run_stand", "spawn_reviewer",
                      "workspace_exists", "workspace_path", "rename_terminal", "merge_pr",
                      "pr_base_branch", "list_agent_worktrees", "ff_worktree", "remote_head_sha",
@@ -391,6 +414,72 @@ class DispatcherTest(_DispatcherBase):
         self.assertEqual(self._column(ref), "Blocked")
         self.assertEqual(self.worker.launched, [])
 
+    def test_missing_manifest_claim_launches_provisioner(self):
+        ref = self._ready_card("A", project="new_project")
+        self.worker.manifest_statuses["new_project"] = {"present": False, "kind": "", "path": ""}
+        dispatcher.tick()
+        self.assertEqual(self._column(ref), model.IN_PROGRESS)
+        self.assertEqual(self.worker.provision_calls, [])      # no setup without a recipe
+        self.assertEqual(self.worker.launched, [])
+        self.assertEqual(len(self.worker.provisioners_launched), 1)
+        self.assertEqual(self.worker.provisioners_launched[0]["head"], "codex-extra")
+        self.assertEqual(self.worker.branches_set[0][1], f"provision/{ref}")
+        rec = dispatcher._load_cards()[ref]
+        self.assertEqual(rec["mode"], "provision")
+        task_md = self.worker.tasks_written[0][1]
+        self.assertIn("Не реализуй исходную продуктовую задачу", task_md)
+        self.assertIn("manifest:", task_md)
+        posted = " ".join(c["comment"] for cl in self.board.comments.values() for c in cl)
+        self.assertIn(f"[{model.MARKER_PROVISION_REQUEST}]", posted)
+
+    def test_provision_done_returns_to_ready_when_manifest_visible(self):
+        ref = self._ready_card("A", project="new_project")
+        self.worker.manifest_statuses["new_project"] = {"present": False, "kind": "", "path": ""}
+        dispatcher.tick()
+        self.worker.manifest_statuses["new_project"] = {
+            "present": True, "kind": "local", "path": "/projects/new_project/workspace.toml",
+        }
+        ops.report(ref, "done", "manifest: workspace.toml\npr: merged\nsmoke: passed")
+        dispatcher.tick()
+        self.assertEqual(self._column(ref), model.IN_PROGRESS)  # same tick reclaims ordinary worker
+        self.assertEqual(len(self.worker.launched), 1)
+        self.assertNotEqual(dispatcher._load_cards()[ref].get("mode"), "provision")
+        posted = " ".join(c["comment"] for cl in self.board.comments.values() for c in cl)
+        self.assertIn(f"[{model.MARKER_PROVISION_DONE}]", posted)
+        self.assertIn("/projects/new_project/workspace.toml", posted)
+
+    def test_provision_done_blocks_when_manifest_still_not_visible(self):
+        ref = self._ready_card("A", project="new_project")
+        self.worker.manifest_statuses["new_project"] = {"present": False, "kind": "", "path": ""}
+        dispatcher.tick()
+        ops.report(ref, "done", "manifest: workspace.toml\npr: https://example/pr/1\nsmoke: passed")
+        dispatcher.tick()
+        self.assertEqual(self._column(ref), "Blocked")
+        self.assertNotIn(ref, dispatcher._load_cards())
+        posted = " ".join(c["comment"] for cl in self.board.comments.values() for c in cl)
+        self.assertIn("не видит workspace.toml", posted)
+        self.assertIn("https://example/pr/1", posted)
+
+    def test_worker_environment_escalation_requeues_to_provisioner(self):
+        ref = self._claim_one()
+        first_ws = dispatcher._load_cards()[ref]["workspace"]
+        ops.report(ref, "blocked", "environment: broken\nsetup now fails after dependency drift")
+        dispatcher.tick()
+        self.assertEqual(self._column(ref), model.IN_PROGRESS)
+        self.assertIn(first_ws, self.worker.stopped_terminals)
+        self.assertEqual(len(self.worker.provisioners_launched), 1)
+        self.assertEqual(dispatcher._load_cards()[ref]["mode"], "provision")
+        posted = " ".join(c["comment"] for cl in self.board.comments.values() for c in cl)
+        self.assertIn(f"[{model.MARKER_PROVISION_REQUEST}]", posted)
+
+    def test_manual_provision_request_claims_provisioner_even_with_manifest(self):
+        ref = self._ready_card("A")
+        ops.add_comment("steward", ref, f"[{model.MARKER_PROVISION_REQUEST}]\nrepair manifest")
+        dispatcher.tick()
+        self.assertEqual(self._column(ref), model.IN_PROGRESS)
+        self.assertEqual(self.worker.launched, [])
+        self.assertEqual(len(self.worker.provisioners_launched), 1)
+
     # card-level base_branch override (triggered-agents-260) ----------------
     def test_no_base_branch_uses_manifest_default(self):
         # unchanged behavior: no card override -> the project's manifest lookup (stubbed "main").
@@ -401,7 +490,7 @@ class DispatcherTest(_DispatcherBase):
         self.assertEqual((project, base), ("personal_site", "main"))
         task_md = self.worker.tasks_written[0][1]
         self.assertIn("- база: main", task_md)
-        self.assertIn("base — `main`", task_md)
+        self.assertIn("base: `main`", task_md)
 
     def test_card_base_branch_overrides_manifest_at_bring_up(self):
         self.worker.remote_head_shas["sprint/007-dnd"] = "deadbeef"
@@ -414,7 +503,7 @@ class DispatcherTest(_DispatcherBase):
         self.assertEqual(self._column(ref), model.IN_PROGRESS)
         task_md = self.worker.tasks_written[0][1]
         self.assertIn("- база: sprint/007-dnd", task_md)
-        self.assertIn("base — `sprint/007-dnd`", task_md)
+        self.assertIn("base: `sprint/007-dnd`", task_md)
 
     def test_card_base_branch_missing_on_origin_blocks_no_silent_main_fallback(self):
         # no self.worker.remote_head_shas entry -> remote_head_sha returns None (branch absent)

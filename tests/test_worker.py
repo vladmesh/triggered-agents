@@ -255,6 +255,8 @@ class ManifestLookupTest(unittest.TestCase):
         self._project_dir("bare-proj")
         self.assertEqual(worker.read_base_branch("bare-proj"), "main")
         self.assertFalse(worker.is_contrib("bare-proj"))
+        status = worker.manifest_status("bare-proj")
+        self.assertFalse(status["present"])
 
     def test_resolve_base_branch_card_override_wins_over_manifest(self):
         d = self._project_dir("sprint-proj")
@@ -271,6 +273,20 @@ class ManifestLookupTest(unittest.TestCase):
     def test_resolve_base_branch_falls_back_to_default_main_when_neither_set(self):
         self._project_dir("bare-proj2")
         self.assertEqual(worker.resolve_base_branch("bare-proj2", None), "main")
+
+    def test_manifest_status_local(self):
+        d = self._project_dir("status-local")
+        path = d / "workspace.toml"
+        path.write_text('[workspace]\nbase_branch = "main"\n')
+        self.assertEqual(worker.manifest_status("status-local"),
+                         {"present": True, "kind": "local", "path": str(path)})
+
+    def test_manifest_status_central(self):
+        self._project_dir("status-central")
+        path = self._central_manifest("status-central")
+        path.write_text('[workspace]\nbase_branch = "main"\n')
+        self.assertEqual(worker.manifest_status("status-central"),
+                         {"present": True, "kind": "central", "path": str(path)})
 
 
 class ContribBaseRefTest(unittest.TestCase):

@@ -137,6 +137,40 @@ def _load_manifest(project: str) -> dict:
     return {}
 
 
+def manifest_status(project: str, base_branch: str | None = None) -> dict:
+    """Where the dispatcher can see a workspace manifest for `project`.
+
+    The local/central lookup mirrors _load_manifest and control-panel's provision.py. The optional
+    origin check covers the post-PR case: the canonical checkout may not be fast-forwarded yet, but
+    a fresh Orca worktree cut from origin/<base_branch> will contain workspace.toml and provision
+    successfully. No absence path raises; a broken git fetch simply reads as not visible yet.
+    """
+    local = project_root(project) / "workspace.toml"
+    if local.is_file():
+        return {"present": True, "kind": "local", "path": str(local)}
+    central = CONTROL_PANEL / "pipeline" / "manifests" / f"{project}.toml"
+    if central.is_file():
+        return {"present": True, "kind": "central", "path": str(central)}
+    base = base_branch or "main"
+    root = project_root(project)
+    if root.is_dir():
+        try:
+            fetch = _git(root, ["fetch", "--quiet", "origin", base], timeout=GH_TIMEOUT_S)
+            if fetch.returncode == 0:
+                exists = _git(root, ["cat-file", "-e", f"origin/{base}:workspace.toml"],
+                              timeout=GH_TIMEOUT_S)
+                if exists.returncode == 0:
+                    return {"present": True, "kind": "origin",
+                            "path": f"origin/{base}:workspace.toml"}
+        except WorkspaceError:
+            pass
+    return {"present": False, "kind": "", "path": ""}
+
+
+def has_manifest(project: str, base_branch: str | None = None) -> bool:
+    return bool(manifest_status(project, base_branch).get("present"))
+
+
 def read_base_branch(project: str) -> str:
     """base_branch from the project's manifest (see _load_manifest), default 'main'."""
     return _load_manifest(project).get("workspace", {}).get("base_branch", "main")
@@ -403,6 +437,15 @@ def _launch_command(head: str | None, worker_id: str) -> str:
     return heads.render_command(head or heads.DEFAULT_PROFILE, role="worker", prompt=prompt)
 
 
+def _provisioner_command(head: str | None, worker_id: str) -> str:
+    prompt = (
+        "Ты провижн-агент task-пайплайна. Твоя задача целиком в TASK.md в корне воркспейса: "
+        "собери или почини workspace.toml/центральный манифест, проверь setup+smoke и отчитайся "
+        "через board-CLI с ролью worker. Исходную продуктовую задачу не реализуй."
+    )
+    return heads.render_command(head or heads.DEFAULT_PROFILE, role="worker", prompt=prompt)
+
+
 def ensure_trust(workspace: str) -> None:
     """Проставить folder trust Claude Code для свежего worktree. Без этого голова виснет на
     интерактивном вопросе «доверяешь ли папке» (та же логика — deploy/provision.py у агентов)."""
@@ -462,6 +505,19 @@ def launch_worker(workspace: str, head: str | None, worker_id: str, title: str) 
     data = _orca_json(["terminal", "create", "--worktree", f"path:{workspace}",
                        "--title", title,
                        "--command", _launch_command(head, worker_id)])
+    term = data.get("terminal", data)
+    handle = term.get("handle") or term.get("id") or ""
+    _close_orphan_terminals(workspace, handle)
+    return handle
+
+
+def launch_provisioner(workspace: str, head: str | None, worker_id: str, title: str) -> str:
+    """Spawn the manifest author/repair head in the workspace; return the terminal handle."""
+    ensure_trust(workspace)
+    ensure_theme()
+    data = _orca_json(["terminal", "create", "--worktree", f"path:{workspace}",
+                       "--title", title,
+                       "--command", _provisioner_command(head, worker_id)])
     term = data.get("terminal", data)
     handle = term.get("handle") or term.get("id") or ""
     _close_orphan_terminals(workspace, handle)

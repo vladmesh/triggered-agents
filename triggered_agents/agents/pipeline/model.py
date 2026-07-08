@@ -171,6 +171,11 @@ MARKER_VALIDATE_ERROR = "validate:error"
 # dispatcher._watchdog_retry. Never posted on the terminal Blocked (budget exhausted): that one
 # stays a plain [dispatcher] comment, same as before this marker existed.
 MARKER_WATCHDOG_RETRY = "watchdog:retry"
+# Provision-agent journal markers. A request means the next Ready claim should repair or author the
+# workspace manifest even if one already exists; done closes that request so later ordinary claims
+# go back to the worker path. Manual repair uses the same marker in a plain comment body.
+MARKER_PROVISION_REQUEST = "provision:request"
+MARKER_PROVISION_DONE = "provision:done"
 # The steward's justification for a Blocked->Done override (STEWARD_OVERRIDE), posted by
 # ops.move_card in the same call as the move itself — never a bare [steward] comment, so the
 # reason a card skipped review is always attached to the transition that needed it.

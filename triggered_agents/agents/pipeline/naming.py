@@ -61,6 +61,10 @@ def reviewer_workspace_base(card_id: str, slug: str) -> str:
     return f"review-{card_id}-{slug}"
 
 
+def provision_workspace_base(card_id: str, slug: str) -> str:
+    return f"provision-{card_id}-{slug}"
+
+
 def dedupe(base: str, exists) -> str:
     """`base`, or `base-2`/`base-3`/... — the first suffix for which `exists(candidate)` is
     False. `exists` is a predicate (str) -> bool, not a filesystem touch here."""
@@ -80,6 +84,10 @@ def reviewer_title(card_id: str, card_title: str) -> str:
     return f"review {card_id}: {card_title}"
 
 
+def provision_title(card_id: str, card_title: str) -> str:
+    return f"provision {card_id}: {card_title}"
+
+
 # --- git ref names (git hygiene: one ref per actor, see design-task-pipeline.md) ---------------
 # Single source of truth for every actor's branch name, keyed off the card `reference` (not the
 # workspace id above) so worker.py and dispatcher.py never hardcode the `pipeline/`/`review/`
@@ -92,6 +100,10 @@ def worker_branch(reference: str) -> str:
 
 def reviewer_branch(reference: str) -> str:
     return f"review/{reference}"
+
+
+def provision_branch(reference: str) -> str:
+    return f"provision/{reference}"
 
 
 def stand_branch(project: str) -> str:

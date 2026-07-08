@@ -44,7 +44,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 
 from ...runtime.state import PRECHECK_SKIP
-from . import health, heads, model, naming, ops, pause as pause_flag, validate, worker
+from . import health, heads, model, naming, ops, pause as pause_flag, provisioning, validate, worker
 from .state import STATE
 # Re-exported so dispatcher.<NAME> keeps resolving for existing callers/tests — validate.py owns
 # these now (its layer-3 rework/spawn/stall caps), dispatcher just orchestrates the tick.
@@ -151,6 +151,10 @@ def _worker_id(card: dict) -> str:
     return naming.dedupe(base, lambda n: worker.workspace_exists(project, n))
 
 
+def _provisioner_id(card: dict) -> str:
+    return provisioning.workspace_id(card)
+
+
 def _ff_agent_worktrees() -> None:
     """Fast-forward every triggered-agent's own worktree (curator/pipeline/retro/steward/...) to
     origin/main — the manual step this replaces ("push to triggered-agents, then go ff every
@@ -241,18 +245,23 @@ def precheck() -> int:
     return PRECHECK_SKIP
 
 
-def _report_verdict(reference: str, baseline: int) -> str | None:
-    """'done'/'blocked'/None from the worker's comments past `baseline` (the count at launch).
-    The last report wins if a worker somehow posted more than one."""
+def _latest_report(reference: str, baseline: int) -> dict | None:
+    """Latest worker report past `baseline`, or None."""
     comments = ops.show_card(reference)["comments"]
-    verdict = None
+    report = None
     for c in comments[baseline:]:
         text = c.get("text", "")
         if f"[{model.MARKER_REPORT_DONE}]" in text:
-            verdict = "done"
+            report = {"verdict": "done", "text": text}
         elif f"[{model.MARKER_REPORT_BLOCKED}]" in text:
-            verdict = "blocked"
-    return verdict
+            report = {"verdict": "blocked", "text": text}
+    return report
+
+
+def _report_verdict(reference: str, baseline: int) -> str | None:
+    """'done'/'blocked'/None from the worker's comments past `baseline`."""
+    report = _latest_report(reference, baseline)
+    return report["verdict"] if report else None
 
 
 def _restore_workspace(claim: str, project: str) -> str:
@@ -293,14 +302,19 @@ def _reconcile(records: dict) -> bool:
             if not c["claim"] or ref in records or c["steward_report"]:
                 continue
             now = time.time()
+            view = ops.show_card(ref)
+            is_provision = (c["claim"].startswith("provision-")
+                            or provisioning.requested(view.get("comments") or []))
             records[ref] = {
                 "workspace": _restore_workspace(c["claim"], c.get("project") or ""),
                 "worker": c["claim"],
                 "handle": "",
                 "claimed_at": now,
                 "last_activity": now,
-                "comment_baseline": len(ops.show_card(ref)["comments"]),
+                "comment_baseline": len(view["comments"]),
             }
+            if is_provision:
+                records[ref]["mode"] = provisioning.MODE
             STATE.log_run("reconcile", reference=ref, worker=c["claim"], column=column)
             changed = True
     return changed
@@ -351,8 +365,18 @@ def _advance(records: dict, statuses: dict[str, str]) -> bool:
             changed = True
             continue
         worker.rename_terminal(rec.get("handle", ""), rec.get("title", ""))
-        verdict = _report_verdict(ref, int(rec.get("comment_baseline", 0)))
-        if verdict == "done":
+        report = _latest_report(ref, int(rec.get("comment_baseline", 0)))
+        verdict = report["verdict"] if report else None
+        if rec.get("mode") == provisioning.MODE and verdict == "done":
+            _finish_provision(ref, card, rec, report.get("text", ""))
+            records.pop(ref)
+            changed = True
+        elif rec.get("mode") == provisioning.MODE and verdict == "blocked":
+            ops.move_card("dispatcher", ref, "Blocked")
+            STATE.log_run("advance", reference=ref, to="Blocked", reason="provision:blocked")
+            records.pop(ref)
+            changed = True
+        elif verdict == "done":
             ops.move_card("dispatcher", ref, "Validate")
             # Keep the record; advance the baseline past this report so a CI-red return to
             # In progress doesn't re-read the same done comment and bounce straight back. Reset the
@@ -366,8 +390,13 @@ def _advance(records: dict, statuses: dict[str, str]) -> bool:
             STATE.log_run("advance", reference=ref, to="Validate", reason="report:done")
             changed = True
         elif verdict == "blocked":
-            ops.move_card("dispatcher", ref, "Blocked")
-            STATE.log_run("advance", reference=ref, to="Blocked", reason="report:blocked")
+            if provisioning.is_environment_escalation(report.get("text", "")):
+                _request_reprovision(ref, rec, "worker reported environment: broken")
+                ops.move_card("dispatcher", ref, "Ready")
+                STATE.log_run("advance", reference=ref, to="Ready", reason="environment-escalation")
+            else:
+                ops.move_card("dispatcher", ref, "Blocked")
+                STATE.log_run("advance", reference=ref, to="Blocked", reason="report:blocked")
             records.pop(ref)
             changed = True
         else:
@@ -416,6 +445,39 @@ def _stop_terminal_best_effort(ref: str, ws: str | None) -> None:
     except Exception as e:  # noqa: BLE001 — best-effort, same rationale as _teardown_best_effort
         STATE.log_run("advance", reference=ref, result="stop-terminal-failed", level="warn",
                       error=worker.scrub_secrets(str(e)))
+
+
+def _request_reprovision(ref: str, rec: dict, reason: str) -> None:
+    _stop_terminal_best_effort(ref, rec.get("workspace"))
+    ops.add_comment(
+        "dispatcher", ref,
+        f"{reason}. Следующий claim запустит провижн-агента для ремонта манифеста/окружения.",
+        marker=model.MARKER_PROVISION_REQUEST)
+
+
+def _finish_provision(ref: str, card: dict, rec: dict, report_text: str) -> None:
+    project = card.get("project") or ""
+    base = worker.resolve_base_branch(project, card.get("base_branch") or "")
+    manifest = provisioning.visible_manifest(project, base)
+    _stop_terminal_best_effort(ref, rec.get("workspace"))
+    if not manifest.get("present"):
+        ops.add_comment(
+            "dispatcher", ref,
+            "Провижн-агент отчитался done, но dispatcher всё ещё не видит workspace.toml ни "
+            "в проекте/base branch, ни в центральных манифестах. Карточка в Blocked: смержи "
+            "манифест или добавь central manifest, затем верни в Ready.\n\n"
+            f"Отчёт provisioner:\n{worker.scrub_secrets(report_text)}")
+        ops.move_card("dispatcher", ref, "Blocked")
+        STATE.log_run("advance", reference=ref, to="Blocked", reason="provision:manifest-not-visible")
+        return
+    ops.add_comment(
+        "dispatcher", ref,
+        f"Провижн завершён, манифест виден: {manifest.get('path')}. Карточка возвращена в Ready "
+        "для обычного dispatch.",
+        marker=model.MARKER_PROVISION_DONE)
+    ops.move_card("dispatcher", ref, "Ready")
+    STATE.log_run("advance", reference=ref, to="Ready", reason="provision:done",
+                  manifest=manifest.get("path"))
 
 
 def _watchdog_retry(ref: str, card: dict, rec: dict, statuses: dict[str, str], silent: float) -> None:
@@ -589,25 +651,25 @@ def _task_md(card: dict, view: dict, base: str) -> str:
             f"и Co-Authored-By, стиль — как в git log репо."
         )
         report_clause = (
-            f"Отчёт по каждому acceptance criterion (сделано/нет и как проверял) — через board-CLI: "
-            f"`python3 -m triggered_agents pipeline --role worker report --ref {ref} --kind "
+            f"Отчёт по каждому acceptance criterion (сделано/нет и как проверял), через board-CLI: "
+            f"`pipeline --role worker report --ref {ref} --kind "
             f"done|blocked --body-file <файл>`. Вместо ссылки на PR отчёт done обязан нести ветку и "
             f"head sha пуша, ровно этими протокольными строками в теле:\n"
             f"```\nbranch: {branch}\nhead: <sha HEAD после пуша>\n```\n"
-            f"Несогласие со спекой — `--kind blocked` с обоснованием. Карточку сам не двигаешь. "
+            f"Несогласие со спекой: `--kind blocked` с обоснованием. Карточку сам не двигаешь. "
             f"TASK.md в репо не коммить."
         )
         history_tail = "origin: начни с `git fetch`, продолжай существующую ветку, не пересоздавай её."
     else:
         done_clause = (
             f"Done для тебя: код закоммичен туда, локальные тесты зелёные, ветка запушена, PR "
-            f"открыт через `gh` (base — `{base}`). В коммитах и PR никаких упоминаний "
-            f"AI и Co-Authored-By, стиль — как в git log репо."
+            f"открыт через `gh` (base: `{base}`). В коммитах и PR никаких упоминаний "
+            f"AI и Co-Authored-By, стиль как в git log репо."
         )
         report_clause = (
             f"Отчёт по каждому acceptance criterion (сделано/нет и как проверял, плюс ссылка на PR) "
-            f"— через board-CLI: `python3 -m triggered_agents pipeline --role worker report "
-            f"--ref {ref} --kind done|blocked --body-file <файл>`. Несогласие со спекой — "
+            f"через board-CLI: `pipeline --role worker report "
+            f"--ref {ref} --kind done|blocked --body-file <файл>`. Несогласие со спекой: "
             f"`--kind blocked` с обоснованием. Карточку сам не двигаешь. TASK.md в репо не коммить."
         )
         history_tail = ("origin, PR может быть уже открыт: начни с `git fetch`, продолжай "
@@ -720,6 +782,59 @@ def _bring_up(card: dict, worker_id: str, records: dict, head: str) -> None:
     STATE.log_run("bringup", reference=ref, to="In progress", workspace=ws, head=head)
 
 
+def _bring_up_provision(card: dict, worker_id: str, records: dict, head: str, reason: str,
+                        manifest: dict) -> None:
+    """Claim-time bring-up for the manifest author/repair head."""
+    ref = card["reference"]
+    project = card.get("project") or ""
+    card_base = card.get("base_branch") or ""
+    ws = None
+    try:
+        if card_base and worker.remote_head_sha(project, card_base) is None:
+            _block(ref, "base-branch",
+                   f"карточка задаёт base_branch `{card_base}`, которой нет на origin проекта "
+                   f"`{project}`. Провижн-агент не стартует, потому что worktree не от чего "
+                   f"создать.", base_branch=card_base)
+            return
+        base = worker.resolve_base_branch(project, card_base)
+        ws = worker.create_workspace(project, worker_id, base)
+        worker.set_branch(ws, naming.provision_branch(ref))
+        view = ops.show_card(ref)
+        if not provisioning.requested(view.get("comments") or []):
+            ops.add_comment(
+                "dispatcher", ref,
+                f"Манифест окружения не найден ({manifest.get('path') or 'workspace.toml/central'}). "
+                "Запускаю провижн-агента, который должен создать workspace.toml или central "
+                "manifest, проверить setup+smoke и отчитаться.",
+                marker=model.MARKER_PROVISION_REQUEST)
+            view = ops.show_card(ref)
+        worker.write_task(ws, provisioning.task_md(card, view, base, reason, manifest, ws))
+        title = naming.provision_title(naming.card_id(ref), card.get("title") or ref)
+        handle = worker.launch_provisioner(ws, head, worker_id, title)
+    except Exception as e:
+        stage = "workspace-create" if ws is None else "launch"
+        _block(ref, stage,
+               f"bring-up провижн-агента упал ({stage}): {e}"
+               + (f"\nВоркспейс {ws} оставлен." if ws else ""),
+               error=worker.scrub_secrets(str(e)))
+        return
+    now = time.time()
+    records[ref] = {
+        "mode": provisioning.MODE,
+        "workspace": ws,
+        "worker": worker_id,
+        "handle": handle,
+        "title": title,
+        "head": head,
+        "claimed_at": now,
+        "last_activity": now,
+        "comment_baseline": len(view["comments"]),
+    }
+    _save_cards(records)
+    STATE.log_run("bringup", reference=ref, to="In progress", mode=provisioning.MODE,
+                  workspace=ws, head=head, reason=reason)
+
+
 def _claim_next(records: dict, statuses: dict[str, str]) -> None:
     """Claim the top eligible Ready card and bring up its worker. One per tick. A per-card guard
     (blocked_by, one-code-per-project, or its whole head+fallback chain sitting on red resources)
@@ -736,17 +851,31 @@ def _claim_next(records: dict, statuses: dict[str, str]) -> None:
     for card in ready:
         ref = card["reference"]
         preferred = card.get("head") or heads.DEFAULT_PROFILE
-        try:
-            heads.load_registry().profile(preferred)
-        except heads.HeadRegistryError:
-            resolved = preferred
+        project = card.get("project") or ""
+        base = worker.resolve_base_branch(project, card.get("base_branch") or "")
+        manifest = provisioning.visible_manifest(project, base)
+        provision_reason = ""
+        if not manifest.get("present"):
+            provision_reason = "manifest missing"
         else:
-            resolved = health.resolve_head(preferred, statuses)
+            try:
+                view = ops.show_card(ref)
+            except Exception:  # noqa: BLE001, ordinary bring-up owns the post-claim failure path
+                view = None
+            if view and provisioning.requested(view.get("comments") or []):
+                provision_reason = "provision requested"
+        head_to_launch = provisioning.PROVISION_HEAD if provision_reason else preferred
+        try:
+            heads.load_registry().profile(head_to_launch)
+        except heads.HeadRegistryError:
+            resolved = head_to_launch
+        else:
+            resolved = health.resolve_head(head_to_launch, statuses)
             if resolved is None:
                 STATE.log_run("claim-skip", reference=ref,
-                              reason=f"head {preferred!r} and its whole fallback chain are on red resources")
+                              reason=f"head {head_to_launch!r} and its whole fallback chain are on red resources")
                 continue
-        worker_id = _worker_id(card)
+        worker_id = _provisioner_id(card) if provision_reason else _worker_id(card)
         try:
             ops.claim_card(ref, worker_id, cap=WORKER_CAP)
         except model.GuardError as e:
@@ -754,7 +883,10 @@ def _claim_next(records: dict, statuses: dict[str, str]) -> None:
             if "cap reached" in str(e):
                 return
             continue
-        _bring_up(card, worker_id, records, resolved)
+        if provision_reason:
+            _bring_up_provision(card, worker_id, records, resolved, provision_reason, manifest)
+        else:
+            _bring_up(card, worker_id, records, resolved)
         return
     STATE.log_run("tick", result="no-claimable-ready")
 
