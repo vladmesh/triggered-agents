@@ -220,16 +220,28 @@ def _ensure_claude_ready(ws: str) -> None:
         print(f"dispatch: claude config prep failed ({e})")
 
 
-def _agent_terminals(ws: str) -> list[dict]:
+def _agent_terminals(ws: str, state: AgentState | None = None) -> list[dict]:
     """Live terminals in the workspace running this singleton agent.
 
     New spawns get an explicit `triggered-agent:<name>` title. The legacy `Claude` match keeps
-    already-warm Claude terminals reusable until they are naturally restarted."""
+    already-warm Claude terminals reusable until they are naturally restarted. Codex may rename
+    its tab back to the shell cwd after startup, so the latest saved Orca handle is also accepted."""
     terms = _orca_json(["terminal", "list", "--worktree", f"path:{ws}", "--limit", "50"]).get("terminals", []) or []
+    saved_handle = state.load_terminal_handle() if state else None
     return [
         t for t in terms
-        if (t.get("title") or "").startswith("triggered-agent:") or "Claude" in (t.get("title") or "")
+        if (saved_handle and (t.get("handle") or t.get("id")) == saved_handle)
+        or (t.get("title") or "").startswith("triggered-agent:")
+        or "Claude" in (t.get("title") or "")
     ]
+
+
+def _create_terminal(agent: str, ws: str, launch: str, state: AgentState, profile: str | None) -> None:
+    data = _orca_json(["terminal", "create", "--worktree", f"path:{ws}",
+                       "--title", f"triggered-agent:{agent}", "--command", launch])
+    term = data.get("terminal", data)
+    state.save_terminal_handle(term.get("handle") or term.get("id"))
+    state.save_head_profile(profile)
 
 
 def _is_idle(handle: str) -> bool:
@@ -294,13 +306,11 @@ def run(agent: str, variant: str | None = None) -> int:
         reaped = _reap_ghosts(ws)  # prune dead-pty tabs so ghosts never accumulate
         if reaped:
             print(f"dispatch[{agent}]: reaped {reaped} ghost tab(s)")
-        terms = _agent_terminals(ws)
+        terms = _agent_terminals(ws, state)
         if not terms:
             skill, launch, profile = _dispatch_command(agent, variant)
             _ensure_claude_ready(ws)
-            _orca(["terminal", "create", "--worktree", f"path:{ws}",
-                   "--title", f"triggered-agent:{agent}", "--command", launch])
-            state.save_head_profile(profile)
+            _create_terminal(agent, ws, launch, state, profile)
             state.log_run(event, action="created")
             print(f"dispatch[{agent}]: no terminal — created fresh -> {skill}")
             return 0
@@ -317,9 +327,7 @@ def run(agent: str, variant: str | None = None) -> int:
             time.sleep(1.0)
             skill, launch, profile = _dispatch_command(agent, variant)
             _ensure_claude_ready(ws)
-            _orca(["terminal", "create", "--worktree", f"path:{ws}",
-                   "--title", f"triggered-agent:{agent}", "--command", launch])
-            state.save_head_profile(profile)
+            _create_terminal(agent, ws, launch, state, profile)
             state.log_run(event, action="watchdog-restart")
             print(f"dispatch[{agent}]: busy but stuck ({int(quiet)}s silent) — watchdog restart -> {skill}")
             return 0
@@ -335,14 +343,13 @@ def run(agent: str, variant: str | None = None) -> int:
             time.sleep(1.0)
             skill, launch, profile = _dispatch_command(agent, variant)
             _ensure_claude_ready(ws)
-            _orca(["terminal", "create", "--worktree", f"path:{ws}",
-                   "--title", f"triggered-agent:{agent}", "--command", launch])
-            state.save_head_profile(profile)
+            _create_terminal(agent, ws, launch, state, profile)
             state.log_run(event, action="reused-red-fallback")
             print(f"dispatch[{agent}]: idle terminal's head is red — stopped, fresh fallback terminal -> {skill}")
             return 0
 
         # idle: warm reuse, killing nothing -> no ghost. Close only legacy duplicates (one-time).
+        state.save_terminal_handle(survivor.get("handle") or survivor.get("id"))
         extras = [t for t in terms if t["handle"] != survivor["handle"]]
         for t in extras:
             _orca(["terminal", "close", "--terminal", t["handle"]])

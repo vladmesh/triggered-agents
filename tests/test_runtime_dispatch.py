@@ -55,6 +55,8 @@ class _DispatchBase(unittest.TestCase):
                 return {"terminals": self.terminals}
             if args[:2] == ["terminal", "wait"]:
                 return {"wait": {"satisfied": self.idle}}
+            if args[:2] == ["terminal", "create"]:
+                return {"terminal": {"handle": "new-terminal"}}
             return {}
 
         p = mock.patch.object(dispatch, "_orca_json", fake_orca_json)
@@ -90,7 +92,7 @@ class DispatchRunTest(_DispatchBase):
         self.terminals = []
         dispatch.run("agent")
         self.assertEqual(self.ready_calls, ["/ws/agent"])
-        create_calls = [c for c in self.orca_calls if c[:2] == ["terminal", "create"]]
+        create_calls = [c for c in self.orca_json_calls if c[:2] == ["terminal", "create"]]
         self.assertEqual(len(create_calls), 1)
         self.assertIn("--title", create_calls[0])
         self.assertIn("triggered-agent:agent", create_calls[0])
@@ -101,6 +103,7 @@ class DispatchRunTest(_DispatchBase):
         self.terminals = []
         dispatch.run("agent")
         self.assertEqual(dispatch.AgentState("agent").load_head_profile(), "fake-profile")
+        self.assertEqual(dispatch.AgentState("agent").load_terminal_handle(), "new-terminal")
 
     def test_variant_dispatch_logs_a_distinct_event_not_plain_dispatch(self):
         """triggered-agents-254: the deep-sweep timer's dispatch must be distinguishable in
@@ -133,6 +136,19 @@ class DispatchRunTest(_DispatchBase):
         sent = [c for c in self.orca_calls if c[:2] == ["terminal", "send"]]
         self.assertEqual(len(sent), 2)  # /clear, then the skill
 
+    def test_idle_reuse_finds_codex_terminal_by_saved_handle_after_title_changes(self):
+        dispatch.AgentState("agent").save_head_profile("fake-profile")
+        dispatch.AgentState("agent").save_terminal_handle("h1")
+        self.terminals = [{"handle": "h1", "title": "dev@host: ~/ws/agent", "lastOutputAt": 1000}]
+        self.idle = True
+        with mock.patch.object(dispatch, "_reuse_head_is_red", lambda agent, state: False):
+            dispatch.run("agent")
+        self.assertEqual(self.ready_calls, [])
+        create_calls = [c for c in self.orca_json_calls if c[:2] == ["terminal", "create"]]
+        self.assertEqual(create_calls, [])
+        sent = [c for c in self.orca_calls if c[:2] == ["terminal", "send"]]
+        self.assertEqual(len(sent), 2)
+
     def test_idle_reuse_diverts_to_fresh_terminal_when_head_is_red(self):
         """triggered-agents-274/275: a warm idle terminal keeps whatever profile it was spawned
         with, so a resource gone red since spawn must not receive the skill there. Dispatch must
@@ -145,7 +161,7 @@ class DispatchRunTest(_DispatchBase):
             dispatch.run("agent")
         self.assertEqual(self.ready_calls, ["/ws/agent"])
         stop_calls = [c for c in self.orca_calls if c[:2] == ["terminal", "stop"]]
-        create_calls = [c for c in self.orca_calls if c[:2] == ["terminal", "create"]]
+        create_calls = [c for c in self.orca_json_calls if c[:2] == ["terminal", "create"]]
         self.assertEqual(len(stop_calls), 1)
         self.assertEqual(len(create_calls), 1)
         sent = [c for c in self.orca_calls if c[:2] == ["terminal", "send"]]
@@ -162,7 +178,7 @@ class DispatchRunTest(_DispatchBase):
             dispatch.run("agent")
         self.assertEqual(self.ready_calls, [])
         stop_calls = [c for c in self.orca_calls if c[:2] == ["terminal", "stop"]]
-        create_calls = [c for c in self.orca_calls if c[:2] == ["terminal", "create"]]
+        create_calls = [c for c in self.orca_json_calls if c[:2] == ["terminal", "create"]]
         self.assertEqual(stop_calls, [])
         self.assertEqual(create_calls, [])
         sent = [c for c in self.orca_calls if c[:2] == ["terminal", "send"]]
@@ -195,7 +211,7 @@ class DispatchRunTest(_DispatchBase):
             dispatch.run("agent")
         self.assertEqual(self.ready_calls, ["/ws/agent"])
         stop_calls = [c for c in self.orca_calls if c[:2] == ["terminal", "stop"]]
-        create_calls = [c for c in self.orca_calls if c[:2] == ["terminal", "create"]]
+        create_calls = [c for c in self.orca_json_calls if c[:2] == ["terminal", "create"]]
         self.assertEqual(len(stop_calls), 1)
         self.assertEqual(len(create_calls), 1)
         self.assertEqual(dispatch.AgentState("agent").load_head_profile(), "fake-profile")
@@ -207,7 +223,7 @@ class DispatchRunTest(_DispatchBase):
         self.terminals = [{"handle": "stuck", "title": "dev@host: ~/ws", "lastOutputAt": 999}]
         dispatch.run("agent")
         self.assertEqual(self.ready_calls, ["/ws/agent"])
-        create_calls = [c for c in self.orca_calls if c[:2] == ["terminal", "create"]]
+        create_calls = [c for c in self.orca_json_calls if c[:2] == ["terminal", "create"]]
         self.assertEqual(len(create_calls), 1)
 
 
@@ -249,7 +265,7 @@ class PipelinePauseGateTest(_DispatchBase):
         self.terminals = []
         with mock.patch.object(dispatch, "_pipeline_paused", lambda: False):
             dispatch.run("agent")
-        create_calls = [c for c in self.orca_calls if c[:2] == ["terminal", "create"]]
+        create_calls = [c for c in self.orca_json_calls if c[:2] == ["terminal", "create"]]
         self.assertEqual(len(create_calls), 1)
 
 
@@ -462,6 +478,7 @@ class StewardReportCardDispatchTest(unittest.TestCase):
         self.terminals = []
         self.idle = True
         self.orca_calls = []
+        self.orca_json_calls = []
         self.created_cards = []
 
         def fake_create_report_card(project, title, slug, description=""):
@@ -484,10 +501,13 @@ class StewardReportCardDispatchTest(unittest.TestCase):
         self.addCleanup(p.stop)
 
         def fake_orca_json(args):
+            self.orca_json_calls.append(args)
             if args[:2] == ["terminal", "list"]:
                 return {"terminals": self.terminals}
             if args[:2] == ["terminal", "wait"]:
                 return {"wait": {"satisfied": self.idle}}
+            if args[:2] == ["terminal", "create"]:
+                return {"terminal": {"handle": "new-terminal"}}
             return {}
 
         p = mock.patch.object(dispatch, "_orca_json", fake_orca_json)
@@ -515,7 +535,7 @@ class StewardReportCardDispatchTest(unittest.TestCase):
         self.addCleanup(p.stop)
 
     def _launch_command_sent(self):
-        creates = [c for c in self.orca_calls if c[:2] == ["terminal", "create"]]
+        creates = [c for c in self.orca_json_calls if c[:2] == ["terminal", "create"]]
         self.assertEqual(len(creates), 1)
         return creates[0][creates[0].index("--command") + 1]
 
