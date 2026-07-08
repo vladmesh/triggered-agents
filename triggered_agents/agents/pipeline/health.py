@@ -29,10 +29,9 @@ import time
 import urllib.request
 from pathlib import Path
 
-from ...runtime.state import AgentState
 from . import heads as heads_mod
+from .state import STATE
 
-STATE = AgentState("pipeline")
 HEALTH_FILE = STATE.dir / "resource_health.json"
 
 # ~5 min between real probes of the same resource; a single slow/broken probe gets killed rather

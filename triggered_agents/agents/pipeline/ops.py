@@ -19,10 +19,9 @@ from __future__ import annotations
 import os
 
 from ...runtime.kanboard import KanboardError, call
-from ...runtime.state import AgentState
 from . import heads, model, naming, worker
+from .state import STATE
 
-STATE = AgentState("pipeline")
 
 
 def board_id() -> int:

@@ -24,6 +24,7 @@ if not os.environ.get("KANBOARD_URL"):
 os.environ["TA_PIPELINE_BOARD"] = "__e2e__"
 _STATE_DIR = tempfile.mkdtemp(prefix="ta-pipeline-e2e-")
 os.environ["TA_STATE"] = _STATE_DIR
+os.environ["TA_PIPELINE_STATE_DIR"] = tempfile.mkdtemp(prefix="ta-pipeline-live-state-e2e-")
 
 # Run as `python3 tests/e2e_pipeline.py`: sys.path[0] is tests/, so add the repo root.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))

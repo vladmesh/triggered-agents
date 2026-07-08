@@ -1,7 +1,7 @@
 """Unit tests for the pipeline agent — stdlib unittest, no network.
 
-TA_STATE is pointed at a tempdir BEFORE importing any triggered_agents module, because
-runtime/state.py reads it at import time and claim uses a real host lock. The Kanboard
+TA_STATE and TA_PIPELINE_STATE_DIR point at tempdirs BEFORE importing triggered_agents modules,
+because state paths are bound at import time and claim uses a real host lock. The Kanboard
 transport is replaced per test by FakeBoard.call, so nothing leaves the process.
 """
 from __future__ import annotations
@@ -12,7 +12,9 @@ import unittest
 from unittest import mock
 
 _STATE_DIR = tempfile.mkdtemp(prefix="ta-pipeline-test-")
+_PIPELINE_STATE_DIR = tempfile.mkdtemp(prefix="ta-pipeline-live-state-test-")
 os.environ["TA_STATE"] = _STATE_DIR
+os.environ["TA_PIPELINE_STATE_DIR"] = _PIPELINE_STATE_DIR
 os.environ.pop("KANBOARD_ADMIN_USER", None)
 
 from triggered_agents.runtime.kanboard import KanboardError  # noqa: E402

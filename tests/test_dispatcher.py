@@ -1,9 +1,9 @@
 """Unit tests for the pipeline dispatcher — stdlib unittest, no network, no Orca.
 
-TA_STATE points at a tempdir before any triggered_agents import (state.py reads it once at
-import). The board goes through FakeBoard (reused from test_pipeline); the host side (worker.py:
-worktree/head/activity) is stubbed by FakeWorker so the dispatcher's decisions run for real while
-nothing leaves the process.
+TA_STATE and TA_PIPELINE_STATE_DIR point at tempdirs before any triggered_agents import. The board
+goes through FakeBoard (reused from test_pipeline); the host side (worker.py: worktree/head/
+activity) is stubbed by FakeWorker so the dispatcher's decisions run for real while nothing leaves
+the process.
 """
 from __future__ import annotations
 
@@ -19,7 +19,9 @@ from pathlib import Path
 from unittest import mock
 
 _STATE_DIR = tempfile.mkdtemp(prefix="ta-dispatcher-test-")
+_PIPELINE_STATE_DIR = tempfile.mkdtemp(prefix="ta-dispatcher-live-state-test-")
 os.environ["TA_STATE"] = _STATE_DIR
+os.environ["TA_PIPELINE_STATE_DIR"] = _PIPELINE_STATE_DIR
 os.environ.pop("KANBOARD_ADMIN_USER", None)
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))          # tests/ for test_pipeline
@@ -30,6 +32,8 @@ from test_pipeline import FakeBoard  # noqa: E402
 from triggered_agents.agents.pipeline import (  # noqa: E402
     dispatcher, health, heads, model, ops, pause, validate, worker,
 )
+from triggered_agents.agents.pipeline import state as pipeline_state  # noqa: E402
+from triggered_agents.runtime import state as runtime_state  # noqa: E402
 from triggered_agents.runtime.state import PRECHECK_SKIP  # noqa: E402
 
 
@@ -2561,6 +2565,13 @@ class PipelinePauseTest(_DispatcherBase):
     def test_unknown_mode_is_a_guard_error(self):
         with self.assertRaises(model.GuardError):
             dispatcher.pause("nonsense")
+
+    def test_pause_and_dispatcher_state_use_live_pipeline_state_dir(self):
+        live = pipeline_state.STATE.dir
+        local = runtime_state.STATE_ROOT
+        self.assertEqual(pause.PAUSE_FILE, live / "pause.json")
+        self.assertEqual(dispatcher.CARDS_FILE, live / "cards.json")
+        self.assertFalse(str(pause.PAUSE_FILE).startswith(str(local)))
 
     def test_corrupt_pause_file_fails_open_but_logs_a_warn(self):
         pause.STATE.ensure_dir()

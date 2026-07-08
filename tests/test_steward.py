@@ -17,6 +17,7 @@ from unittest import mock
 
 _STATE_DIR = tempfile.mkdtemp(prefix="ta-steward-test-")
 os.environ["TA_STATE"] = _STATE_DIR
+os.environ.pop("TA_PIPELINE_STATE_DIR", None)
 os.environ.pop("KANBOARD_ADMIN_USER", None)
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))          # tests/ for test_pipeline
@@ -62,6 +63,7 @@ class StewardTestBase(unittest.TestCase):
         new_pipeline_state = AgentState("pipeline")
         self._patch(signals, "STATE", new_steward_state)
         self._patch(cli, "STATE", new_steward_state)
+        self._patch(signals.pipeline_ops, "STATE", new_pipeline_state)
         self._patch(signals, "PIPELINE_RUNS", new_pipeline_state.dir / "runs.jsonl")
         self._patch(signals, "PIPELINE_RESOURCE_HEALTH", new_pipeline_state.dir / "resource_health.json")
         self.pipeline_state = new_pipeline_state
@@ -477,14 +479,18 @@ class CrossWorkspaceStateTest(unittest.TestCase):
 
         patcher_state = mock.patch.object(runtime_state, "STATE_ROOT", state_root)
         patcher_ws = mock.patch.object(signals, "WORKSPACES_ROOT", workspaces_root)
+        patcher_pipeline_state_env = mock.patch.dict(os.environ, {"TA_PIPELINE_STATE_DIR": ""})
         patcher_state.start()
         patcher_ws.start()
+        patcher_pipeline_state_env.start()
         self.addCleanup(patcher_state.stop)
         self.addCleanup(patcher_ws.stop)
+        self.addCleanup(patcher_pipeline_state_env.stop)
 
         self.state_root = state_root
         self.workspaces_root = workspaces_root
         self._patch(signals, "STATE", AgentState("steward"))
+        self._patch(signals.pipeline_ops, "STATE", AgentState("pipeline"))
         self._patch(signals, "PIPELINE_RUNS", signals.resolve_pipeline_state_dir() / "runs.jsonl")
         self._patch(signals, "PIPELINE_RESOURCE_HEALTH",
                     signals.resolve_pipeline_state_dir() / "resource_health.json")

@@ -5,8 +5,9 @@ tests/e2e_dispatcher.py: drives the real dispatcher against a throwaway board `_
 heavy/nondeterministic host side (Orca worktree, claude head) stubbed the same way — a real
 tempdir git repo stands in for the workspace, a fake handle stands in for the terminal, and a
 worker's report is simulated by posting the board-CLI comment a real head would post. Every board
-transition and the pause flag itself (a real file under a real TA_STATE tempdir) are exercised for
-real; only the host process side is faked, exactly the boundary e2e_dispatcher.py already draws.
+transition and the pause flag itself (a real file under a throwaway pipeline state dir) are
+exercised for real; only the host process side is faked, exactly the boundary e2e_dispatcher.py
+already draws.
 
 Two scenarios, matching the card's acceptance criteria word for word:
   1. soft pause with a card in flight: it rides to Validate on its own report, a fresh Ready card
@@ -36,6 +37,7 @@ if not os.environ.get("KANBOARD_URL"):
 os.environ["TA_PIPELINE_BOARD"] = "__e2e__"
 _STATE_DIR = tempfile.mkdtemp(prefix="ta-pause-e2e-")
 os.environ["TA_STATE"] = _STATE_DIR
+os.environ["TA_PIPELINE_STATE_DIR"] = tempfile.mkdtemp(prefix="ta-pause-live-state-e2e-")
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
