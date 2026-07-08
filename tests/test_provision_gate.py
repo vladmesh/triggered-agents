@@ -29,6 +29,7 @@ def _run_gate(rc: int, *args: str) -> subprocess.CompletedProcess:
 
             agent, cmd, *rest = sys.argv[1:]
             if cmd == "precheck":
+                print("PATH=" + os.environ.get("PATH", ""))
                 print(f"PRECHECK {agent}")
                 raise SystemExit(int(os.environ["FAKE_PRECHECK_RC"]))
             if cmd == "dispatch":
@@ -72,6 +73,11 @@ class PrecheckGateTest(unittest.TestCase):
         self.assertEqual(p.returncode, 0)
         self.assertNotIn("PRECHECK", p.stdout)
         self.assertIn("DISPATCHED steward dispatch deep-sweep", p.stdout)
+
+    def test_gate_exports_user_cli_path_for_health_probes(self):
+        p = _run_gate(100)
+        self.assertEqual(p.returncode, 0)
+        self.assertTrue(p.stdout.startswith("PATH=/home/dev/.local/bin:/home/dev/bin:"), p.stdout)
 
 
 class ServiceUnitRenderTest(unittest.TestCase):

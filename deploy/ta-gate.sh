@@ -19,10 +19,13 @@
 # runs unconditionally (triggered-agents-254). The variant exists to wake the head even when the
 # deterministic signals stayed quiet, including the case where the signals themselves went blind).
 #
-# No login shell (-l): the unit invokes this script directly, not `bash -lc`. dispatch.py resolves
-# orca via ORCA_BIN / shutil.which / ~/.local/bin fallback and python3 is on systemd's default PATH,
-# so nothing here needs a profile sourced.
+# No login shell (-l): the unit invokes this script directly, not `bash -lc`. Export the per-user
+# binary dirs explicitly: systemd's default PATH does not include ~/.local/bin/~/bin, but pipeline
+# health probes call user-installed CLIs (`claude`, `codex`). Without this, probes falsely mark
+# resources red with FileNotFoundError even though the CLIs are available in the normal dev shell.
 set -u
+
+export PATH="/home/dev/.local/bin:/home/dev/bin:${PATH:-/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin}"
 
 agent="${1:?usage: ta-gate.sh <agent> [variant]}"
 variant="${2:-}"
