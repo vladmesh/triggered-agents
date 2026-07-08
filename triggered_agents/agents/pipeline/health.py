@@ -19,16 +19,24 @@ deploy/ta-gate.sh), so nothing survives in-process between them.
 A resource's red<->green flip is logged to runs.jsonl (`head-health`) exactly once per flip, not
 on every re-probe of an unchanged status — a resource pinned red for hours must not spam the log
 every tick, same principle as runtime/health.py's error-vs-freshness split.
+
+When a probe records red, the `head-health` line carries a `reason` object. Look there first when
+resource_health.json says a resource is red. stdout, stderr, and exception text are scrubbed and
+capped before logging so telemetry stays useful without storing secrets or whole CLI transcripts.
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
 import json
 import os
+import shlex
 import subprocess
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 
+from ...runtime.redact import redact
 from . import heads as heads_mod
 from .state import STATE
 
@@ -38,6 +46,7 @@ HEALTH_FILE = STATE.dir / "resource_health.json"
 # than hanging a tick. Both env-overridable so an e2e/live check can tighten them.
 PROBE_TTL_S = int(os.environ.get("TA_PROBE_TTL_S", "300"))
 PROBE_TIMEOUT_S = int(os.environ.get("TA_PROBE_TIMEOUT_S", "20"))
+PROBE_REASON_TEXT_LIMIT = int(os.environ.get("TA_PROBE_REASON_TEXT_LIMIT", "400"))
 # Comma-separated resource ids to report red without running their real probe at all — a live e2e
 # proving the fallback machinery behaves right under a red resource (steward chain lands on the
 # hermes head, product heads claim-skip) needs to redden claude-sub on demand, without actually
@@ -47,6 +56,20 @@ _FORCE_RED_ENV = "TA_HEALTH_FORCE_RED"
 
 GREEN = "green"
 RED = "red"
+
+
+@dataclass(frozen=True)
+class ProbeResult:
+    ok: bool
+    probe_class: str
+    command: str | None = None
+    status: str = "ok"
+    exit_code: int | None = None
+    timeout_s: float | None = None
+    http_status: int | None = None
+    stdout: str | bytes | None = None
+    stderr: str | bytes | None = None
+    exception: str | BaseException | None = None
 
 
 def _load() -> dict:
@@ -69,24 +92,126 @@ def _forced_red() -> set[str]:
     return {r for r in os.environ.get(_FORCE_RED_ENV, "").split(",") if r}
 
 
-def _run_probe_cmd(cmd: str) -> bool:
-    """True (green) iff `cmd` exits 0 within PROBE_TIMEOUT_S. A timeout, a missing binary, or any
-    other OSError all count as red — a probe that can't even run proves nothing about the
-    resource being up."""
+def _clean_summary(value) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, bytes):
+        text = value.decode("utf-8", errors="replace")
+    else:
+        text = str(value)
+    text = redact(text)
+    text = " ".join(text.strip().split())
+    if not text:
+        return None
+    if len(text) > PROBE_REASON_TEXT_LIMIT:
+        return text[:PROBE_REASON_TEXT_LIMIT] + "...[truncated]"
+    return text
+
+
+def _exception_text(exc: BaseException) -> str:
+    return f"{type(exc).__name__}: {exc}"
+
+
+def _display_command(command: str | list[str]) -> str:
+    return command if isinstance(command, str) else shlex.join(command)
+
+
+def _run_subprocess_probe(command: str | list[str], probe_class: str, *,
+                          shell: bool = False, env: dict | None = None,
+                          display_command: str | None = None) -> ProbeResult:
+    shown = display_command or _display_command(command)
     try:
-        p = subprocess.run(cmd, shell=True, capture_output=True, timeout=PROBE_TIMEOUT_S)
-    except (OSError, subprocess.TimeoutExpired):
-        return False
-    return p.returncode == 0
+        p = subprocess.run(
+            command, shell=shell, capture_output=True, text=True, timeout=PROBE_TIMEOUT_S, env=env)
+    except subprocess.TimeoutExpired as e:
+        return ProbeResult(
+            False, probe_class, command=shown, status="timeout",
+            timeout_s=float(e.timeout or PROBE_TIMEOUT_S), stdout=e.output, stderr=e.stderr,
+            exception=_exception_text(e))
+    except OSError as e:
+        return ProbeResult(False, probe_class, command=shown, status="exception",
+                           exception=_exception_text(e))
+    if p.returncode == 0:
+        return ProbeResult(True, probe_class, command=shown)
+    return ProbeResult(
+        False, probe_class, command=shown, status="non-zero-exit", exit_code=p.returncode,
+        stdout=p.stdout, stderr=p.stderr)
+
+
+def _run_probe_cmd(cmd: str) -> ProbeResult:
+    """Green iff `cmd` exits 0 within PROBE_TIMEOUT_S. A timeout, a missing binary, or any
+    other OSError all count as red because a probe that cannot run proves nothing about the
+    resource being up."""
+    return _run_subprocess_probe(cmd, "shell-command", shell=True)
+
+
+def _coerce_probe_result(value, *, command: str) -> ProbeResult:
+    if isinstance(value, ProbeResult):
+        return value
+    return ProbeResult(bool(value), "shell-command", command=command,
+                       status="ok" if value else "probe-failed")
+
+
+def _probe_failure_reason(resource_id: str, result: ProbeResult) -> dict:
+    reason = {
+        "resource": resource_id,
+        "probe_class": result.probe_class,
+        "status": result.status,
+    }
+    if result.command:
+        reason["command"] = result.command
+    if result.exit_code is not None:
+        reason["exit_code"] = result.exit_code
+    if result.timeout_s is not None:
+        reason["timeout_s"] = result.timeout_s
+    if result.http_status is not None:
+        reason["http_status"] = result.http_status
+    for key in ("stderr", "stdout", "exception"):
+        summary = _clean_summary(getattr(result, key))
+        if summary:
+            reason[key] = summary
+    return reason
+
+
+def _reason_key(reason: dict) -> str:
+    return json.dumps(reason, ensure_ascii=False, sort_keys=True)
+
+
+def format_probe_failure(resource_id: str, result: ProbeResult) -> str:
+    reason = _probe_failure_reason(resource_id, result)
+    parts = [f"resource {resource_id} probe failed",
+             f"class={reason['probe_class']}", f"status={reason['status']}"]
+    for key in ("command", "exit_code", "timeout_s", "http_status", "stderr", "stdout",
+                "exception"):
+        if key in reason:
+            parts.append(f"{key}={reason[key]}")
+    return "; ".join(parts)
+
+
+def _forced_red_result(resource_id: str) -> ProbeResult:
+    return ProbeResult(
+        False, "forced-red", status="forced-red",
+        exception=f"{_FORCE_RED_ENV} contains {resource_id!r}")
+
+
+def _log_health_event(resource_id: str, old_status: str | None, new_status: str,
+                      reason: dict | None, *, confirmed: bool = False) -> None:
+    fields = {"resource": resource_id, "from": old_status, "to": new_status}
+    if confirmed:
+        fields["confirmed"] = True
+    if reason:
+        fields["reason"] = reason
+    STATE.log_run("head-health", **fields)
 
 
 def refresh(registry: heads_mod.Registry | None = None) -> dict[str, str]:
     """Re-probe every resource whose cached entry is missing or older than PROBE_TTL_S; return
     {resource_id: GREEN/RED} for every resource in the registry (cached entries included). Logs
     one `head-health` runs.jsonl event per resource whose status actually flipped since its last
-    cached value — never on a fresh-cache reuse, never on a re-probe that confirms the same
-    status. A resource named in TA_HEALTH_FORCE_RED is always RED here, real probe skipped
-    entirely, TTL cache bypassed — see _FORCE_RED_ENV."""
+    cached value, plus a red confirmation when the failure reason is new or was never logged.
+    Fresh-cache reuse and identical red confirmations stay quiet. A resource named in
+    TA_HEALTH_FORCE_RED is always RED here, real probe skipped entirely, TTL cache bypassed;
+    see _FORCE_RED_ENV."""
     reg = registry or heads_mod.load_registry()
     cache = _load()
     now = time.time()
@@ -98,13 +223,29 @@ def refresh(registry: heads_mod.Registry | None = None) -> dict[str, str]:
         if rid not in forced and entry and now - entry.get("checked_at", 0) < PROBE_TTL_S:
             statuses[rid] = entry["status"]
             continue
-        new_status = RED if rid in forced else (GREEN if _run_probe_cmd(res.get("probe", "true")) else RED)
+        command = res.get("probe", "true")
+        result = _forced_red_result(rid) if rid in forced else _coerce_probe_result(
+            _run_probe_cmd(command), command=command)
+        new_status = GREEN if result.ok else RED
         old_status = entry["status"] if entry else None
-        cache[rid] = {"status": new_status, "checked_at": now}
+        reason = None if result.ok else _probe_failure_reason(rid, result)
+        reason_key = _reason_key(reason) if reason else None
+        cache_entry = {"status": new_status, "checked_at": now}
+        if reason:
+            cache_entry["reason"] = reason
+            cache_entry["reason_key"] = reason_key
+            logged_key = entry.get("logged_reason_key") if entry else None
+            if old_status != RED or logged_key != reason_key:
+                _log_health_event(rid, old_status, new_status, reason,
+                                  confirmed=(old_status == RED))
+                cache_entry["logged_reason_key"] = reason_key
+            elif logged_key:
+                cache_entry["logged_reason_key"] = logged_key
         dirty = True
         statuses[rid] = new_status
-        if old_status is not None and old_status != new_status:
-            STATE.log_run("head-health", resource=rid, **{"from": old_status, "to": new_status})
+        if reason is None and old_status is not None and old_status != new_status:
+            _log_health_event(rid, old_status, new_status, None)
+        cache[rid] = cache_entry
     if dirty:
         _save(cache)
     return statuses
@@ -185,10 +326,10 @@ def next_retry_head(current: str, tried: set[str], statuses: dict[str, str],
     return None, not found_untried
 
 
-# Real, cheap probes for the two resources this repo actually names in heads.toml. Deliberately
+# Real, cheap probes for the builtin resources this repo names in heads.toml. Deliberately
 # not resource-id-dispatched inside `refresh`/`_run_probe_cmd` above (those stay pure "run this
 # shell command" — heads.toml's `probe` field is the single source of what each resource runs);
-# these are just what that field's command, for these two ids, happens to invoke.
+# these are just what that field's command, for these ids, happens to invoke.
 _OPENROUTER_ENV_FILE = Path(os.environ.get("TA_OPENROUTER_ENV_FILE",
                                           str(Path.home() / "projects" / "project_inspect" / ".env")))
 _OPENROUTER_ENV_KEY = "open_router_key"
@@ -212,27 +353,43 @@ def _read_openrouter_key() -> str | None:
     return None
 
 
-def probe_claude_sub() -> bool:
+def probe_claude_sub_result() -> ProbeResult:
     """One haiku token through the shared OAuth-authenticated `claude` CLI (see heads.toml:
     claude-sub is one subscription, no per-profile credential) — red exactly when the
     subscription is rate-limited or the CLI can't reach the API, otherwise green. Costs one cheap
     call per PROBE_TTL_S, never per tick."""
+    return _run_subprocess_probe(
+        ["claude", "-p", "ping", "--model", "haiku", "--dangerously-skip-permissions"],
+        "builtin:claude-sub")
+
+
+def probe_claude_sub() -> bool:
+    return probe_claude_sub_result().ok
+
+
+def _http_failure_status(status: int | None) -> str:
+    if status in (401, 403):
+        return "auth"
+    if status == 429:
+        return "rate-limit"
+    return "http-error"
+
+
+def _read_http_error_body(err: urllib.error.HTTPError) -> bytes | None:
     try:
-        p = subprocess.run(
-            ["claude", "-p", "ping", "--model", "haiku", "--dangerously-skip-permissions"],
-            capture_output=True, text=True, timeout=PROBE_TIMEOUT_S,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return False
-    return p.returncode == 0
+        return err.read()
+    except Exception:
+        return None
 
 
-def probe_openrouter() -> bool:
+def probe_openrouter_result() -> ProbeResult:
     """One 1-token chat completion against OpenRouter's gemini-flash — red on a missing key, a
     non-2xx response, a timeout, or any transport error; never raises."""
+    command = "POST https://openrouter.ai/api/v1/chat/completions model=google/gemini-2.5-flash max_tokens=1"
     key = _read_openrouter_key()
     if not key:
-        return False
+        return ProbeResult(False, "builtin:openrouter", command=command, status="auth",
+                           exception="missing OpenRouter key")
     body = json.dumps({
         "model": "google/gemini-2.5-flash",
         "messages": [{"role": "user", "content": "ping"}],
@@ -244,12 +401,29 @@ def probe_openrouter() -> bool:
     )
     try:
         with urllib.request.urlopen(req, timeout=PROBE_TIMEOUT_S) as resp:  # noqa: S310 (fixed host)
-            return 200 <= resp.status < 300
-    except Exception:  # noqa: BLE001 — any transport/HTTP-error outcome is just "red"
-        return False
+            status = getattr(resp, "status", None)
+            if status is not None and 200 <= status < 300:
+                return ProbeResult(True, "builtin:openrouter", command=command)
+            return ProbeResult(False, "builtin:openrouter", command=command,
+                               status=_http_failure_status(status), http_status=status)
+    except urllib.error.HTTPError as e:
+        return ProbeResult(
+            False, "builtin:openrouter", command=command,
+            status=_http_failure_status(e.code), http_status=e.code,
+            stderr=_read_http_error_body(e), exception=_exception_text(e))
+    except TimeoutError as e:
+        return ProbeResult(False, "builtin:openrouter", command=command, status="timeout",
+                           timeout_s=float(PROBE_TIMEOUT_S), exception=_exception_text(e))
+    except Exception as e:  # noqa: BLE001 — any transport outcome is just "red"
+        return ProbeResult(False, "builtin:openrouter", command=command, status="transport-error",
+                           exception=_exception_text(e))
 
 
-def probe_openai_sub() -> bool:
+def probe_openrouter() -> bool:
+    return probe_openrouter_result().ok
+
+
+def probe_openai_sub_result() -> ProbeResult:
     """One `codex exec` turn through the ChatGPT-authed CODEX_HOME (see heads.CODEX_HOME:
     openai-sub is one subscription, no per-profile credential) — red exactly when the subscription
     is rate-limited or the `codex` CLI can't reach the API, otherwise green. `-s read-only` and a
@@ -257,14 +431,14 @@ def probe_openai_sub() -> bool:
     is needed. CODEX_HOME is set explicitly because this is a plain subprocess, not an orca-spawned
     terminal that would inherit it. Costs one cheap call per PROBE_TTL_S, never per tick."""
     env = {**os.environ, "CODEX_HOME": heads_mod.CODEX_HOME}
-    try:
-        p = subprocess.run(
-            ["codex", "exec", "--skip-git-repo-check", "-s", "read-only", "ping"],
-            capture_output=True, text=True, timeout=PROBE_TIMEOUT_S, env=env,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return False
-    return p.returncode == 0
+    cmd = ["codex", "exec", "--skip-git-repo-check", "-s", "read-only", "ping"]
+    return _run_subprocess_probe(
+        cmd, "builtin:openai-sub", env=env,
+        display_command=f"CODEX_HOME={heads_mod.CODEX_HOME} {_display_command(cmd)}")
+
+
+def probe_openai_sub() -> bool:
+    return probe_openai_sub_result().ok
 
 
 BUILTIN_PROBES = {
@@ -273,10 +447,20 @@ BUILTIN_PROBES = {
     "openai-sub": probe_openai_sub,
 }
 
+BUILTIN_PROBE_RESULTS = {
+    "claude-sub": probe_claude_sub_result,
+    "openrouter": probe_openrouter_result,
+    "openai-sub": probe_openai_sub_result,
+}
+
+
+def run_builtin_probe_result(resource_id: str) -> ProbeResult:
+    return BUILTIN_PROBE_RESULTS[resource_id]()
+
 
 def run_builtin_probe(resource_id: str) -> bool:
     """Dispatch to the real check for `resource_id` — the thing heads.toml's `probe = "python3 -m
     triggered_agents pipeline probe --resource <id>"` command actually runs. Raises KeyError for
     an id with no builtin (a resource that only ever needs "true"/"false" has no reason to go
     through this CLI at all)."""
-    return BUILTIN_PROBES[resource_id]()
+    return run_builtin_probe_result(resource_id).ok
