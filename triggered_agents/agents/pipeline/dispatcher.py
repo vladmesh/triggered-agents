@@ -43,15 +43,15 @@ import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
 
-from ...runtime.state import PRECHECK_SKIP, AgentState
+from ...runtime.state import PRECHECK_SKIP
 from . import health, heads, model, naming, ops, pause as pause_flag, validate, worker
+from .state import STATE
 # Re-exported so dispatcher.<NAME> keeps resolving for existing callers/tests — validate.py owns
 # these now (its layer-3 rework/spawn/stall caps), dispatcher just orchestrates the tick.
 from .validate import (  # noqa: F401
     CI_PENDING_STALL_SECONDS, REVIEW_RETURN_CAP, REVIEW_SPAWN_ATTEMPTS, VALIDATE_STALL_ATTEMPTS,
 )
 
-STATE = AgentState("pipeline")
 CARDS_FILE = STATE.dir / "cards.json"
 WATCHDOG_SECONDS = int(os.environ.get("TA_WATCHDOG_SECONDS", "1200"))
 WORKER_CAP = int(os.environ.get("TA_WORKER_CAP", "3"))

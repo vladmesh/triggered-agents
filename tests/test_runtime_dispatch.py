@@ -15,6 +15,7 @@ from pathlib import Path
 from unittest import mock
 
 os.environ["TA_STATE"] = tempfile.mkdtemp(prefix="ta-runtime-dispatch-test-")
+os.environ["TA_PIPELINE_STATE_DIR"] = tempfile.mkdtemp(prefix="ta-runtime-dispatch-live-state-test-")
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # repo root
 

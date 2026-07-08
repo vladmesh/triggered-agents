@@ -34,9 +34,9 @@ PRECHECK_SKIP = 100
 class AgentState:
     """Per-agent watermark + lock under STATE_ROOT/<agent>/."""
 
-    def __init__(self, agent: str):
+    def __init__(self, agent: str, state_dir: Path | None = None):
         self.agent = agent
-        self.dir = STATE_ROOT / agent
+        self.dir = Path(state_dir) if state_dir is not None else STATE_ROOT / agent
         self.watermark_file = self.dir / "watermark.json"
         self.pending_file = self.dir / "pending.json"
         self.lockfile = self.dir / "lock"

@@ -20,9 +20,8 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone
 
-from ...runtime.state import AgentState
+from .state import STATE
 
-STATE = AgentState("pipeline")
 PAUSE_FILE = STATE.dir / "pause.json"
 MODES = ("soft", "hard")
 

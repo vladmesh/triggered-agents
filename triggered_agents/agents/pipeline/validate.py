@@ -48,10 +48,9 @@ import os
 import re
 import time
 
-from ...runtime.state import AgentState
 from . import health, model, naming, ops, reviewer, worker
+from .state import STATE
 
-STATE = AgentState("pipeline")
 # Layer-3 rework cap: a card may be returned by red reviewer verdicts at most this many times over
 # its life. The next red after that goes to Blocked до vladmesh with the full verdict on the card.
 REVIEW_RETURN_CAP = int(os.environ.get("TA_REVIEW_RETURN_CAP", "3"))

@@ -27,6 +27,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+from ...runtime import shared_state
 from ...runtime.state import AgentState
 from ..pipeline import naming as pipeline_naming
 from ..pipeline import ops as pipeline_ops
@@ -39,10 +40,8 @@ STATE = AgentState("steward")
 STALE_COLUMNS = ("Ready", "In progress", "Validate", "Blocked")
 STALE_HOURS = float(os.environ.get("TA_STEWARD_STALE_HOURS", "24"))
 
-WORKSPACES_ROOT = Path(os.environ.get("TA_WORKSPACES_ROOT") or Path.home() / "orca" / "workspaces").resolve()
-# The runtime's own agent worktrees (curator/pipeline/retro/steward, one per agent, not one
-# per task) live under this reserved project name — never a workspace-orphan candidate.
-_AGENTS_PROJECT = "triggered-agents"
+WORKSPACES_ROOT = shared_state.WORKSPACES_ROOT
+_AGENTS_PROJECT = shared_state.AGENTS_PROJECT
 
 # The pipeline dispatcher's own runs.jsonl/resource_health.json used to be reached through
 # AgentState("pipeline") — but that resolves STATE_ROOT (runtime/state.py) from the checkout
@@ -61,10 +60,7 @@ _AGENTS_PROJECT = "triggered-agents"
 def resolve_pipeline_state_dir() -> Path:
     """Recomputed on every call (not baked into a constant at import time) so tests can patch
     WORKSPACES_ROOT and see this follow, the same way _orphan_signals already does."""
-    override = os.environ.get("TA_PIPELINE_STATE_DIR")
-    if override:
-        return Path(override)
-    return WORKSPACES_ROOT / _AGENTS_PROJECT / "pipeline" / "state" / "pipeline"
+    return shared_state.resolve_pipeline_state_dir(WORKSPACES_ROOT)
 
 
 PIPELINE_RUNS = resolve_pipeline_state_dir() / "runs.jsonl"

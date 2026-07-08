@@ -20,8 +20,8 @@ import tomllib
 from pathlib import Path
 
 from ...runtime import claude_env, redact
-from ...runtime.state import AgentState
 from . import heads, stand
+from .state import STATE
 
 ORCA = os.environ.get("ORCA_BIN") or shutil.which("orca") or str(Path.home() / ".local/bin/orca")
 GH = os.environ.get("GH_BIN") or shutil.which("gh") or "gh"
@@ -33,7 +33,6 @@ PROVISION = CONTROL_PANEL / "pipeline" / "provision.py"
 # and the same STATE (state/pipeline/) is where dispatcher.py logs, so a sudo-fallback trip shows
 # up in the one runs.jsonl the pipeline already watches.
 WORKSPACES_ROOT = Path(os.environ.get("TA_WORKSPACES_ROOT") or Path.home() / "orca" / "workspaces").resolve()
-STATE = AgentState("pipeline")
 ORCA_TIMEOUT_S = 120       # worktree create runs repo git; give it room, but never hang forever
 PROVISION_TIMEOUT_S = int(os.environ.get("TA_PROVISION_TIMEOUT_S", "900"))
 GH_TIMEOUT_S = 60          # a gh call may hit the network; bounded so a tick never hangs on it

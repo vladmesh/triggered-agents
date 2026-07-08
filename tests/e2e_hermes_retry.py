@@ -37,6 +37,7 @@ os.environ["TA_PIPELINE_BOARD"] = "__e2e__"
 os.environ["TA_HEALTH_FORCE_RED"] = "claude-sub"
 _STATE_DIR = tempfile.mkdtemp(prefix="ta-hermes-e2e-")
 os.environ["TA_STATE"] = _STATE_DIR
+os.environ["TA_PIPELINE_STATE_DIR"] = tempfile.mkdtemp(prefix="ta-hermes-live-state-e2e-")
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 

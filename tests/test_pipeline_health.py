@@ -17,7 +17,9 @@ from pathlib import Path
 from unittest import mock
 
 _STATE_DIR = tempfile.mkdtemp(prefix="ta-health-test-")
+_PIPELINE_STATE_DIR = tempfile.mkdtemp(prefix="ta-health-live-state-test-")
 os.environ["TA_STATE"] = _STATE_DIR
+os.environ["TA_PIPELINE_STATE_DIR"] = _PIPELINE_STATE_DIR
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
