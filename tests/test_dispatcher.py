@@ -290,13 +290,13 @@ class DispatcherTest(_DispatcherBase):
 
     # ff agent worktrees ------------------------------------------------------
     def test_precheck_ffs_clean_agent_worktrees(self):
-        self.worker.agent_worktrees = [("board", "/ws/agents/board")]
-        self.worker.ff_results = {"/ws/agents/board": {"ok": True, "reason": None,
-                                                        "before": "aaa", "after": "bbb"}}
+        self.worker.agent_worktrees = [("curator", "/ws/agents/curator")]
+        self.worker.ff_results = {"/ws/agents/curator": {"ok": True, "reason": None,
+                                                          "before": "aaa", "after": "bbb"}}
         dispatcher.precheck()
-        self.assertIn(("/ws/agents/board", "main"), self.worker.ff_calls)
+        self.assertIn(("/ws/agents/curator", "main"), self.worker.ff_calls)
         runs = [r for r in self._runs() if r["event"] == "ff-agents"]
-        self.assertTrue(any(r.get("agent") == "board" and r.get("result") == "ff"
+        self.assertTrue(any(r.get("agent") == "curator" and r.get("result") == "ff"
                              and r.get("before") == "aaa" and r.get("after") == "bbb" for r in runs))
 
     def test_precheck_ff_noop_when_already_up_to_date(self):
@@ -321,15 +321,15 @@ class DispatcherTest(_DispatcherBase):
                              for r in runs))
 
     def test_precheck_ff_one_bad_worktree_does_not_skip_the_rest(self):
-        self.worker.agent_worktrees = [("board", "/ws/agents/board"), ("retro", "/ws/agents/retro")]
-        self.worker.ff_results = {"/ws/agents/board": {"ok": False, "reason": "diverged"},
+        self.worker.agent_worktrees = [("curator", "/ws/agents/curator"), ("retro", "/ws/agents/retro")]
+        self.worker.ff_results = {"/ws/agents/curator": {"ok": False, "reason": "diverged"},
                                   "/ws/agents/retro": {"ok": True, "reason": None,
                                                         "before": "a", "after": "b"}}
         dispatcher.precheck()
         paths_called = [c[0] for c in self.worker.ff_calls]
-        self.assertEqual(paths_called, ["/ws/agents/board", "/ws/agents/retro"])
+        self.assertEqual(paths_called, ["/ws/agents/curator", "/ws/agents/retro"])
         runs = [r for r in self._runs() if r["event"] == "ff-agents"]
-        self.assertTrue(any(r.get("agent") == "board" and r.get("result") == "blocked" for r in runs))
+        self.assertTrue(any(r.get("agent") == "curator" and r.get("result") == "blocked" for r in runs))
         self.assertTrue(any(r.get("agent") == "retro" and r.get("result") == "ff" for r in runs))
 
     def test_precheck_ff_survives_read_base_branch_failure(self):
