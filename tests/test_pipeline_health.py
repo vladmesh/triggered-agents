@@ -348,6 +348,13 @@ class RunBuiltinProbeTest(unittest.TestCase):
         with self.assertRaises(KeyError):
             health.run_builtin_probe("no-such-resource")
 
+    def test_every_shipped_resource_has_a_builtin_probe(self):
+        # Every resource in the real heads.toml drives a `pipeline probe --resource <id>` command,
+        # which dispatches through BUILTIN_PROBES — a resource with no builtin (the codex/openai-sub
+        # class of bug) would KeyError at claim time instead of returning red/green.
+        for rid in heads.load_registry().resources:
+            self.assertIn(rid, health.BUILTIN_PROBES, f"resource {rid!r} has no builtin probe")
+
 
 if __name__ == "__main__":
     unittest.main()

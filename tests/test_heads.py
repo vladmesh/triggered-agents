@@ -30,7 +30,7 @@ class RealRegistryTest(unittest.TestCase):
 
     def test_starting_profiles_present(self):
         self.assertEqual(set(self.reg.known()),
-                         {"claude-sonnet", "claude-opus", "claude-fable", "hermes"})
+                         {"claude-sonnet", "claude-opus", "claude-fable", "hermes", "codex"})
 
     def test_claude_profiles_share_the_subscription_resource(self):
         for pid in ("claude-sonnet", "claude-opus", "claude-fable"):
@@ -109,6 +109,35 @@ class RenderHermesTest(unittest.TestCase):
         self.assertIn("--cli", cmd)
 
 
+class RenderCodexTest(unittest.TestCase):
+    """The codex adapter is the native OpenAI CLI's `exec` shape: no claude/hermes binary, a pinned
+    CODEX_HOME (so the head finds its ChatGPT login, memory MCP, and global AGENTS.md), and the
+    bypass-approvals flag standing in for claude's --dangerously-skip-permissions."""
+
+    def setUp(self):
+        self.reg = heads.load_registry()
+
+    def test_renders_codex_exec_not_claude_or_hermes(self):
+        cmd = heads.render_command("codex", role="worker", prompt="ping", registry=self.reg)
+        self.assertIn("BOARD_ROLE=worker ", cmd)
+        self.assertIn("codex exec", cmd)
+        self.assertNotIn("claude", cmd)
+        self.assertNotIn("hermes", cmd)
+
+    def test_pins_codex_home_and_bypass_flags(self):
+        cmd = heads.render_command("codex", role="worker", prompt="ping", registry=self.reg)
+        self.assertIn(f"CODEX_HOME={heads.CODEX_HOME} codex exec", cmd)
+        self.assertIn("--dangerously-bypass-approvals-and-sandbox", cmd)
+        self.assertIn("--skip-git-repo-check", cmd)
+        self.assertIn("-m gpt-5.5", cmd)
+        self.assertIn(repr("ping"), cmd)
+
+    def test_profile_codex_home_overrides_pin(self):
+        prof = dict(self.reg.profile("codex"), codex_home="/tmp/throwaway-home")
+        cmd = heads._render_codex(prof, prompt="ping")
+        self.assertIn("CODEX_HOME=/tmp/throwaway-home codex exec", cmd)
+
+
 class RegistryValidationTest(unittest.TestCase):
     """Malformed heads.toml variants — each must fail to load with a message naming the bad
     reference, not a raw KeyError/tomllib traceback."""
@@ -142,12 +171,12 @@ fallback = []
 probe = "true"
 [profiles.p1]
 resource = "claude-sub"
-adapter = "codex"
+adapter = "gemini"
 fallback = []
 """)
         with self.assertRaises(heads.HeadRegistryError) as ctx:
             heads.load_registry(path)
-        self.assertIn("codex", str(ctx.exception))
+        self.assertIn("gemini", str(ctx.exception))
 
     def test_profile_with_unknown_fallback_raises(self):
         path = self._write("""
