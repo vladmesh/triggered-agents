@@ -1,6 +1,6 @@
-"""Unit tests for triggered_agents.agents.steward.drift (triggered-agents-256): live ta-* systemd
-units vs. the render deploy/provision.py would produce right now from the current automation.toml
-specs. Fake AGENTS_DIR/SYSTEMD_DIR/AGENTS_ROOT throughout — no real host units are ever touched.
+"""Unit tests for triggered_agents.agents.steward.drift (triggered-agents-256/276): live ta-*
+systemd units and installed gate script vs. the render deploy/provision.py would produce right now
+from the current checkout. Fake paths throughout, no real host units are ever touched.
 """
 from __future__ import annotations
 
@@ -40,9 +40,17 @@ class DriftCheckTest(unittest.TestCase):
         self.systemd_dir = root / "systemd"
         self.systemd_dir.mkdir()
         self.workspaces_root = root / "workspaces"
+        self.gate_source = root / "repo" / "deploy" / "ta-gate.sh"
+        self.gate_source.parent.mkdir(parents=True)
+        self.gate_source.write_text("#!/bin/sh\necho gate\n", encoding="utf-8")
+        self.gate_install = root / "usr" / "local" / "bin" / "ta-gate.sh"
+        self.gate_install.parent.mkdir(parents=True)
+        self.gate_install.write_text(self.gate_source.read_text(encoding="utf-8"), encoding="utf-8")
 
         for p, target in ((provision, "AGENTS_DIR"), ):
             self._patch(p, target, self.agents_dir)
+        self._patch(provision, "GATE_SCRIPT_SRC", self.gate_source)
+        self._patch(provision, "GATE_INSTALL_PATH", self.gate_install)
         self._patch(drift, "SYSTEMD_DIR", self.systemd_dir)
         self._patch(pipeline_worker, "AGENTS_ROOT", self.workspaces_root)
 
@@ -95,7 +103,7 @@ class DriftCheckTest(unittest.TestCase):
         self.assertEqual(kinds["ta-curator.timer"], "missing")
 
     def test_extra_unit_when_agent_decommissioned_but_unit_left_on_host(self):
-        # No spec at all for "board" any more — a live unit with no matching spec is exactly the
+        # No spec at all for "board" any more; a live unit with no matching spec is exactly the
         # ta-board class this check exists to catch (2026-07-04).
         (self.systemd_dir / "ta-board.service").write_text("stale content", encoding="utf-8")
         (self.systemd_dir / "ta-board.timer").write_text("stale content", encoding="utf-8")
@@ -127,6 +135,25 @@ randomized_delay_sec = 600
         units = {h["unit"] for h in result["drift"]}
         self.assertIn("ta-steward-deep-sweep.service", units)
         self.assertIn("ta-steward-deep-sweep.timer", units)
+
+    def test_gate_script_content_drift_when_live_script_is_stale(self):
+        self.gate_install.write_text("#!/bin/sh\necho stale\n", encoding="utf-8")
+
+        result = drift.check()
+
+        self.assertFalse(result["in_sync"])
+        kinds = {h["unit"]: h["kind"] for h in result["drift"]}
+        self.assertEqual(kinds[str(self.gate_install)], "content")
+        self.assertIn("stale", result["drift"][0]["diff"])
+
+    def test_missing_gate_script_when_source_exists_but_host_has_none(self):
+        self.gate_install.unlink()
+
+        result = drift.check()
+
+        self.assertFalse(result["in_sync"])
+        kinds = {h["unit"]: h["kind"] for h in result["drift"]}
+        self.assertEqual(kinds[str(self.gate_install)], "missing")
 
     def test_render_markdown_reports_clean_when_in_sync(self):
         result = {"in_sync": True, "drift": []}

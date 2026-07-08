@@ -1511,10 +1511,11 @@ class ValidateTest(_DispatcherBase):
 
 
 class PostMergeProvisionApplyTest(_DispatcherBase):
-    """triggered-agents-256: a merged PR that touches deploy/provision.py or an agent's own
-    automation.toml gets its live systemd units re-provisioned right away, one-shot, without
-    touching the (already Done) card on failure. Only the triggered-agents project itself has
-    these paths, so every non-triggered-agents merge must never even call gh for the file list."""
+    """triggered-agents-256/276: a merged PR that touches deploy/provision.py, deploy/ta-gate.sh or
+    an agent's own automation.toml gets its live systemd artifacts re-provisioned right away,
+    one-shot, without touching the (already Done) card on failure. Only the triggered-agents
+    project itself has these paths, so every non-triggered-agents merge must never even call gh for
+    the file list."""
 
     PR = "https://github.com/vladmesh/triggered-agents/pull/99"
 
@@ -1548,6 +1549,12 @@ class PostMergeProvisionApplyTest(_DispatcherBase):
     def test_provision_py_change_applies_to_every_agent(self):
         ref = self._to_validate()
         self.worker.pr_files_result = ["deploy/provision.py", "deploy/README.md"]
+        self._merge(ref)
+        self.assertEqual(self.worker.apply_provision_calls, [[]])   # [] -> every agent
+
+    def test_gate_script_change_applies_to_every_agent(self):
+        ref = self._to_validate()
+        self.worker.pr_files_result = ["deploy/ta-gate.sh"]
         self._merge(ref)
         self.assertEqual(self.worker.apply_provision_calls, [[]])   # [] -> every agent
 

@@ -88,9 +88,10 @@ _CONTRIB_BRANCH_RE = re.compile(r"(?im)^\s*branch\s*:\s*(\S+)\s*$")
 _CONTRIB_HEAD_RE = re.compile(r"(?im)^\s*head\s*:\s*([0-9a-fA-F]{7,40})\s*$")
 
 # Post-merge provision apply (triggered-agents-256): only the triggered-agents repo itself has
-# these paths, so a squash diff touching either one means the live ta-* systemd units are now
+# these paths, so a squash diff touching any of them means the live systemd artifacts are now
 # stale against what's on the board's own main. See _apply_provision_after_merge below.
 _PROVISION_PY_PATH = "deploy/provision.py"
+_GATE_SCRIPT_PATH = "deploy/ta-gate.sh"
 _AUTOMATION_TOML_RE = re.compile(r"^triggered_agents/agents/([^/]+)/automation\.toml$")
 
 
@@ -349,12 +350,12 @@ def _validate_card(card: dict, records: dict, watchdog_seconds: int, save_cards,
 
 def _provision_apply_plan(files: list[str]) -> list[str] | None:
     """Which agents (if any) a merged PR's changed files call for re-provisioning. None -> nothing
-    relevant changed, skip entirely. [] -> deploy/provision.py itself changed, so EVERY agent with
-    automation needs re-provisioning — deliberately not "no agents": it mirrors deploy/
-    provision.py's own convention that an empty argv means every agent. A non-empty list names
-    only the agents whose own automation.toml was touched (deduped, sorted for a deterministic
-    runs.jsonl log and a deterministic `provision.py <agents>` argv)."""
-    if _PROVISION_PY_PATH in files:
+    relevant changed, skip entirely. [] -> a global provision artifact changed, so EVERY agent with
+    automation needs re-provisioning. Deliberately not "no agents": it mirrors deploy/provision.py's
+    own convention that an empty argv means every agent. A non-empty list names only the agents
+    whose own automation.toml was touched (deduped, sorted for a deterministic runs.jsonl log and a
+    deterministic `provision.py <agents>` argv)."""
+    if _PROVISION_PY_PATH in files or _GATE_SCRIPT_PATH in files:
         return []
     agents = sorted({m.group(1) for f in files if (m := _AUTOMATION_TOML_RE.match(f))})
     return agents or None
@@ -362,9 +363,10 @@ def _provision_apply_plan(files: list[str]) -> list[str] | None:
 
 def _apply_provision_after_merge(ref: str, project: str, pr: str) -> None:
     """Post-merge provision apply (triggered-agents-256): once a card lands on Done because gh
-    reports its PR merged, check whether the squash diff touched deploy/provision.py or an agent's
-    automation.toml and, if so, re-run deploy/provision.py for the affected agent(s) right away —
-    without this the live ta-* systemd units stay on the pre-merge spec until a human notices or
+    reports its PR merged, check whether the squash diff touched deploy/provision.py,
+    deploy/ta-gate.sh or an agent's automation.toml and, if so, re-run deploy/provision.py for the
+    affected agent(s) right away. Without this the live ta-* systemd artifacts stay on the pre-merge
+    version until a human notices or
     the steward's own deep-sweep drift check (triggered_agents/agents/steward/drift.py) catches up
     on its own daily schedule, exactly the "code merged, host not caught up, no signal" gap that
     motivated this card (the env_file/deep-sweep-timer fixes of 2026-07-04 both had to be applied
