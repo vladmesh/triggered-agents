@@ -26,13 +26,16 @@ anomaly the daily sweep hasn't looked at yet, and vice versa.
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 from datetime import datetime, timezone
+from pathlib import Path
 
 from . import drift, signals
 from ..pipeline import worker as pipeline_worker
 
 STATE = signals.STATE
+ROLE_SKILLS = Path("/home/dev/control-panel/scripts/role_skills.py")
 
 
 def _deep_sweep_file():
@@ -133,6 +136,50 @@ def cmd_drift(as_json: bool) -> int:
     return 0
 
 
+def _render_role_skills_markdown(result: dict) -> str:
+    if "error" in result:
+        return f"role skills: error\n\n{result['error']}"
+    lines = [f"role skills: {'ok' if result.get('ok') else 'drift'}", ""]
+    for target, stats in sorted(result.get("targets", {}).items()):
+        lines.append(
+            f"- {target} ({stats['shell']}): expected={stats['expected']}, "
+            f"missing={stats['missing']}, drift={stats['drift']}, source_missing={stats['source_missing']}"
+        )
+    for title, key in (("Missing", "missing"), ("Drift", "drift"), ("Source missing", "source_missing")):
+        if result.get(key):
+            lines.extend(["", f"{title}:"])
+            for item in result[key]:
+                lines.append(f"- {item['target']} {item['role']}/{item['skill']} -> {item['dest']}")
+    return "\n".join(lines)
+
+
+def cmd_role_skills(as_json: bool) -> int:
+    """Deep-sweep-only helper: role-owned skills from control-panel vs. shell-owned copies.
+    Always exits 0 like drift(): `ok: false` is a signal for the skill, not a crashed steward."""
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(ROLE_SKILLS), "audit", "--json"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        if proc.returncode not in (0, 1):
+            result = {
+                "ok": False,
+                "error": proc.stderr.strip() or proc.stdout.strip() or f"role_skills exited {proc.returncode}",
+            }
+        else:
+            result = json.loads(proc.stdout)
+    except Exception as e:  # noqa: BLE001 - report helper failure as steward data, not a crash
+        result = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    if as_json:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    else:
+        print(_render_role_skills_markdown(result))
+    return 0
+
+
 def cmd_deep_sweep_advance() -> int:
     """Stamp now() as the last unconditional sweep. Independent of `advance` above (signals.py's
     per-kind watermark) on purpose — see module docstring."""
@@ -162,6 +209,8 @@ def main(argv=None) -> int:
         return cmd_deep_sweep_advance()
     if cmd == "drift":
         return cmd_drift("--json" in argv)
+    if cmd == "role-skills":
+        return cmd_role_skills("--json" in argv)
     print(__doc__)
     return 0 if cmd in ("help", "-h", "--help") else 2
 
