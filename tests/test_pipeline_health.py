@@ -148,6 +148,27 @@ class RefreshTtlTest(unittest.TestCase):
         self.assertNotIn(secret, json.dumps(reason, ensure_ascii=False))
         self.assertIn("REDACTED", reason["stderr"])
 
+    def test_probe_command_is_scrubbed_and_limited_in_reason_and_cli_text(self):
+        secret = "sk-proj-" + "B" * 40
+        command = f"fake probe --token {secret} --payload {'x' * 80}"
+        proc = subprocess.CompletedProcess(command, 7, stdout="useful stdout", stderr="failed")
+        reg = _registry({"r1": {"probe": command}})
+        with mock.patch.object(health, "PROBE_REASON_TEXT_LIMIT", 70), \
+             mock.patch.object(health.subprocess, "run", return_value=proc):
+            statuses = health.refresh(reg)
+            cli_text = health.format_probe_failure(
+                "r1", health.ProbeResult(False, "shell-command", command=command,
+                                         status="non-zero-exit", exit_code=7))
+        self.assertEqual(statuses, {"r1": "red"})
+        reason = self._head_events()[0]["reason"]
+        self.assertNotIn(secret, json.dumps(reason, ensure_ascii=False))
+        self.assertIn("REDACTED", reason["command"])
+        self.assertIn("...[truncated]", reason["command"])
+        self.assertNotIn("x" * 80, reason["command"])
+        self.assertNotIn(secret, cli_text)
+        self.assertIn("REDACTED", cli_text)
+        self.assertIn("...[truncated]", cli_text)
+
     def test_timeout_logs_reason(self):
         timeout = subprocess.TimeoutExpired(
             "fake probe", 0.01, output="partial stdout", stderr="partial stderr")

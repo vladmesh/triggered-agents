@@ -158,8 +158,9 @@ def _probe_failure_reason(resource_id: str, result: ProbeResult) -> dict:
         "probe_class": result.probe_class,
         "status": result.status,
     }
-    if result.command:
-        reason["command"] = result.command
+    command = _clean_summary(result.command)
+    if command:
+        reason["command"] = command
     if result.exit_code is not None:
         reason["exit_code"] = result.exit_code
     if result.timeout_s is not None:
