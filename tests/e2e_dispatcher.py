@@ -36,6 +36,8 @@ if not os.environ.get("KANBOARD_URL"):
 os.environ["TA_PIPELINE_BOARD"] = "__e2e__"
 _STATE_DIR = tempfile.mkdtemp(prefix="ta-dispatcher-e2e-")
 os.environ["TA_STATE"] = _STATE_DIR
+_PIPELINE_STATE_DIR = tempfile.mkdtemp(prefix="ta-dispatcher-live-state-e2e-")
+os.environ["TA_PIPELINE_STATE_DIR"] = _PIPELINE_STATE_DIR
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -135,6 +137,8 @@ def install_stubs(provision=_stub_provision_ok, activity=lambda ws: None):
 def main() -> int:
     try:
         install_stubs()
+        check("dispatcher state isolated",
+              dispatcher.CARDS_FILE == Path(_PIPELINE_STATE_DIR) / "cards.json")
 
         # 1. setup board
         rc = _run_cli(None, ["setup"])
@@ -236,6 +240,8 @@ def main() -> int:
                     break
         except Exception as e:
             print(f"cleanup: failed to remove __e2e__: {e}", file=sys.stderr)
+        shutil.rmtree(_STATE_DIR, ignore_errors=True)
+        shutil.rmtree(_PIPELINE_STATE_DIR, ignore_errors=True)
 
 
 if __name__ == "__main__":
