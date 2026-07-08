@@ -28,6 +28,25 @@ probe = "python3 -m triggered_agents pipeline probe --resource claude-sub"
 account = "openrouter-pooled-key"
 probe = "python3 -m triggered_agents pipeline probe --resource openrouter"
 
+[resources.openai-sub]
+# The ChatGPT/OpenAI subscription codex draws from via its native `codex` CLI — one account, no
+# per-profile credential, mirroring resources.claude-sub. Authed once with `codex login` (ChatGPT
+# OAuth) into the pinned CODEX_HOME (heads.CODEX_HOME), which also holds the memory MCP server and
+# the global AGENTS.md. Probe: one real `codex exec` token through that home (health.probe_openai_sub)
+# — red exactly when the subscription is rate-limited or the CLI can't reach the API.
+account = "openai-subscription"
+probe = "python3 -m triggered_agents pipeline probe --resource openai-sub"
+
+[profiles.codex]
+# Native OpenAI Codex head (gpt-5.5), verified end to end 2026-07-08 (memory MCP + global AGENTS.md
+# reach the head). Standalone (fallback = []): a card names head=codex explicitly to run on it; a
+# red openai-sub then means claim-skip, same shape as claude-sonnet. Deliberately absent from the
+# claude/steward fallback chains — product policy stays Claude-only.
+resource = "openai-sub"
+adapter = "codex"
+model = "gpt-5.5"
+fallback = []
+
 [profiles.claude-sonnet]
 # No fallback (2026-07-04, vladmesh): product tasks run on Claude only. Overnight 04.07 the
 # gemini-flash fallback burned three worker attempts without ever reaching the report step, so a

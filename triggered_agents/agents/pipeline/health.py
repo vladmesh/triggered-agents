@@ -250,9 +250,28 @@ def probe_openrouter() -> bool:
         return False
 
 
+def probe_openai_sub() -> bool:
+    """One `codex exec` turn through the ChatGPT-authed CODEX_HOME (see heads.CODEX_HOME:
+    openai-sub is one subscription, no per-profile credential) — red exactly when the subscription
+    is rate-limited or the `codex` CLI can't reach the API, otherwise green. `-s read-only` and a
+    bare "ping" keep it side-effect-free and tool-free (no approval-hook cancel), so no bypass flag
+    is needed. CODEX_HOME is set explicitly because this is a plain subprocess, not an orca-spawned
+    terminal that would inherit it. Costs one cheap call per PROBE_TTL_S, never per tick."""
+    env = {**os.environ, "CODEX_HOME": heads_mod.CODEX_HOME}
+    try:
+        p = subprocess.run(
+            ["codex", "exec", "--skip-git-repo-check", "-s", "read-only", "ping"],
+            capture_output=True, text=True, timeout=PROBE_TIMEOUT_S, env=env,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return p.returncode == 0
+
+
 BUILTIN_PROBES = {
     "claude-sub": probe_claude_sub,
     "openrouter": probe_openrouter,
+    "openai-sub": probe_openai_sub,
 }
 
 

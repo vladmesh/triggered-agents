@@ -12,11 +12,22 @@ Kanboard, no orca, no subprocess.
 """
 from __future__ import annotations
 
+import os
 import tomllib
 from functools import lru_cache
 from pathlib import Path
 
 HEADS_TOML = Path(__file__).with_name("heads.toml")
+
+# The CODEX_HOME a codex head runs under: a dedicated, pipeline-owned home holding codex' ChatGPT
+# login (auth.json), the memory MCP server, and the global AGENTS.md (style/git rules + the
+# memory_search mandate). Deliberately NOT Orca's codex-runtime home — that one regenerates
+# config.toml on every session start and silently drops the [mcp_servers.*] entry, so the memory
+# tool would vanish; this dedicated home is stable across sessions (verified: mcp_servers survives
+# codex' own trust-write). Pinned explicitly (not left to terminal-env inheritance) so the probe
+# process — a plain `pipeline probe` subprocess, not an orca-spawned terminal — hits the same home.
+# Env-overridable so an e2e can point at a throwaway home. health.probe_openai_sub imports this.
+CODEX_HOME = os.environ.get("TA_CODEX_HOME", "/home/dev/.codex-pipeline")
 
 # The profile a card/reviewer gets when it names no head at all — same role the bare `claude`
 # call with no --model played before this registry existed.
@@ -47,9 +58,25 @@ def _render_hermes(profile: dict, *, prompt: str) -> str:
     return " ".join(parts)
 
 
+def _render_codex(profile: dict, *, prompt: str) -> str:
+    """Codex' non-interactive equivalent of `claude --dangerously-skip-permissions <prompt>`:
+    `exec` runs one-shot (prints the agent turn, no TUI), `--dangerously-bypass-approvals-and-sandbox`
+    is codex' skip-permissions (the Orca worktree is the external sandbox; it also lets the memory
+    MCP tool run without an interactive approval prompt), `--skip-git-repo-check` keeps a
+    not-yet-a-repo workspace from aborting. `CODEX_HOME` is pinned to the ChatGPT-authed home
+    (see CODEX_HOME above) so the head finds its login, memory MCP, and global AGENTS.md regardless
+    of the launching terminal's env. `codex_home` on the profile overrides it (e.g. for an e2e)."""
+    home = profile.get("codex_home") or CODEX_HOME
+    model = profile.get("model")
+    model_flag = f" -m {model}" if model else ""
+    return (f"CODEX_HOME={home} codex exec --dangerously-bypass-approvals-and-sandbox "
+            f"--skip-git-repo-check{model_flag} {prompt!r}")
+
+
 ADAPTERS = {
     "claude": _render_claude,
     "hermes": _render_hermes,
+    "codex": _render_codex,
 }
 
 
