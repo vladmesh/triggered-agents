@@ -136,9 +136,17 @@ def parse_hermes_rows(rows) -> list[dict]:
     return turns
 
 
-def _harvest_claude_sessions(mark: dict) -> tuple[list[dict], dict]:
+def _completed_jsonl_lines(text: str) -> tuple[list[str], int]:
+    """Return only newline-terminated JSONL records."""
+    lines = text.splitlines()
+    if text and not text.endswith("\n"):
+        return lines[:-1], max(len(lines) - 1, 0)
+    return lines, len(lines)
+
+
+def _harvest_jsonl_sessions(mark: dict, sessions: list[dict], parse_lines) -> tuple[list[dict], dict]:
     sessions_out, pending = [], {}
-    for sess in discover.claude_sessions():
+    for sess in sessions:
         path = Path(sess["path"])
         try:
             stat = path.stat()
@@ -146,44 +154,28 @@ def _harvest_claude_sessions(mark: dict) -> tuple[list[dict], dict]:
             continue
         prev = mark.get(sess["path"], {})
         prev_lines = prev.get("lines", 0)
-        if prev.get("mtime") == stat.st_mtime and prev_lines:
+        if prev.get("mtime") == stat.st_mtime and prev.get("size") == stat.st_size and prev_lines:
             continue  # unchanged since last run
-        all_lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-        new_lines = all_lines[prev_lines:]
-        pending[sess["path"]] = {"lines": len(all_lines), "mtime": stat.st_mtime}
+        text = path.read_text(encoding="utf-8", errors="replace")
+        complete_lines, complete_count = _completed_jsonl_lines(text)
+        new_lines = complete_lines[prev_lines:]
+        pending[sess["path"]] = {"lines": complete_count, "mtime": stat.st_mtime, "size": stat.st_size}
         if not new_lines:
             continue
-        turns = parse_claude_lines(new_lines)
+        turns = parse_lines(new_lines)
         for t in turns:
             t["text"] = redact(t["text"])
         if turns:
             sessions_out.append({**sess, "turns": turns})
     return sessions_out, pending
+
+
+def _harvest_claude_sessions(mark: dict) -> tuple[list[dict], dict]:
+    return _harvest_jsonl_sessions(mark, discover.claude_sessions(), parse_claude_lines)
 
 
 def _harvest_codex_sessions(mark: dict) -> tuple[list[dict], dict]:
-    sessions_out, pending = [], {}
-    for sess in discover.codex_sessions():
-        path = Path(sess["path"])
-        try:
-            stat = path.stat()
-        except FileNotFoundError:
-            continue
-        prev = mark.get(sess["path"], {})
-        prev_lines = prev.get("lines", 0)
-        if prev.get("mtime") == stat.st_mtime and prev_lines:
-            continue
-        all_lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-        new_lines = all_lines[prev_lines:]
-        pending[sess["path"]] = {"lines": len(all_lines), "mtime": stat.st_mtime}
-        if not new_lines:
-            continue
-        turns = parse_codex_lines(new_lines)
-        for t in turns:
-            t["text"] = redact(t["text"])
-        if turns:
-            sessions_out.append({**sess, "turns": turns})
-    return sessions_out, pending
+    return _harvest_jsonl_sessions(mark, discover.codex_sessions(), parse_codex_lines)
 
 
 def _harvest_hermes_sessions(mark: dict) -> tuple[list[dict], dict]:

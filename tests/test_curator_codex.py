@@ -186,6 +186,33 @@ class HarvestCodexSessionsTest(_CodexFixtureCase):
 
         self.assertEqual([t["text"] for t in next_batch["sessions"][0]["turns"]], ["second codex turn"])
 
+    def test_after_advance_incomplete_tail_is_returned_when_completed(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        prefix = "\n".join(
+            json.dumps(r, ensure_ascii=False)
+            for r in [
+                _session_meta("codex-session-1", "/home/dev/project"),
+                _message("user", "first complete codex turn"),
+            ]
+        ) + "\n"
+        tail = json.dumps(_message("assistant", "tail completed later"), ensure_ascii=False)
+        self.path.write_text(prefix + tail[:len(tail) // 2], encoding="utf-8")
+        state = self._state()
+
+        batch = harvest.harvest(state)
+        harvest.advance(state, batch["pending"])
+
+        self.assertEqual([t["text"] for t in batch["sessions"][0]["turns"]], ["first complete codex turn"])
+        self.assertEqual(batch["pending"][str(self.path)]["lines"], 2)
+
+        time.sleep(0.01)
+        self.path.write_text(prefix + tail + "\n", encoding="utf-8")
+        os.utime(self.path, None)
+
+        next_batch = harvest.harvest(state)
+
+        self.assertEqual([t["text"] for t in next_batch["sessions"][0]["turns"]], ["tail completed later"])
+
     def test_codex_turns_are_redacted_before_markdown_render(self):
         secret = "sk-ant-" + "c" * 30
         self._write_session(_message("user", f"secret is {secret}"))
