@@ -7,9 +7,9 @@ JSONL file approach"). The schema below is a real subset of that live schema (co
 types, NOT NULL flags, session-id shape and role values all match a real inspected DB),
 not an invented format.
 
-No network, no real ~/.hermes -- every test builds its own tiny state.db / memories dir
-and patches discover.HERMES_STATE_DB / discover.HERMES_MEMORY_DIR / discover.EXCLUDE_CWDS,
-the same way test_curator.py patches discover.CLAUDE_PROJECTS.
+No network, no real ~/.hermes or Codex runtime home: every test builds its own tiny
+state.db / memories dir and patches discover.HERMES_STATE_DB / discover.HERMES_MEMORY_DIR /
+discover.EXCLUDE_CWDS, the same way test_curator.py patches discover.CLAUDE_PROJECTS.
 """
 from __future__ import annotations
 
@@ -22,7 +22,9 @@ from pathlib import Path
 from unittest import mock
 
 _STATE_DIR = tempfile.mkdtemp(prefix="ta-curator-hermes-state-")
+_CODEX_SESSIONS_DIR = tempfile.mkdtemp(prefix="ta-curator-hermes-codex-sessions-")
 os.environ.setdefault("TA_STATE", _STATE_DIR)
+os.environ.setdefault("TA_CODEX_SESSIONS_DIR", _CODEX_SESSIONS_DIR)
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -86,6 +88,7 @@ class _HermesFixtureCase(unittest.TestCase):
         self.mem_dir = self.hermes_home / "memories"
         self._patch(discover, "HERMES_STATE_DB", self.db_path)
         self._patch(discover, "HERMES_MEMORY_DIR", self.mem_dir)
+        self._patch(discover, "CODEX_SESSIONS", Path(tempfile.mkdtemp(prefix="ta-curator-hermes-nocodex-")))
         exclude = ["/home/dev/triggered-agents", "/home/dev/orca/workspaces/triggered-agents"]
         self._patch(discover, "EXCLUDE_CWDS", exclude)
         # harvest.harvest()/harvest_memory_files() also walk the Claude side

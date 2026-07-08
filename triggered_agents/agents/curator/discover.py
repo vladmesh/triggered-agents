@@ -2,7 +2,7 @@
 
 Paths mirror Orca's ai-vault session-scanner (src/main/ai-vault/session-scanner-*),
 which we reuse as reference rather than runtime (it only keeps 5-message previews and is
-reachable only in-process). We read the raw files ourselves. Only heads with live
+reachable only in-process). We read the raw files ourselves. Claude, Hermes and Codex
 sessions on this host are wired; add a parser + path as new heads produce sessions.
 
 Self-exclusion: the curator must not harvest its own runs, sessions or memory. Sessions
@@ -30,6 +30,14 @@ CLAUDE_PROJECTS = Path(os.environ.get("TA_CLAUDE_PROJECTS_DIR", str(Path.home() 
 HERMES_HOME = Path(os.environ.get("TA_HERMES_HOME_DIR", str(Path.home() / ".hermes")))
 HERMES_STATE_DB = HERMES_HOME / "state.db"
 HERMES_MEMORY_DIR = HERMES_HOME / "memories"
+
+# Orca-managed Codex home. Pipeline-Codex uses /home/dev/.codex-pipeline, but
+# interactive Orca-Codex heads write transcripts under this managed runtime home.
+# Overridable in tests for the same reason as CLAUDE_PROJECTS/HERMES_HOME.
+CODEX_SESSIONS = Path(os.environ.get(
+    "TA_CODEX_SESSIONS_DIR",
+    str(Path.home() / ".config" / "orca" / "codex-runtime-home" / "home" / "sessions"),
+))
 
 # cwd prefixes whose sessions we never harvest — the triggered-agents' own runs, so no
 # triggered-agent (curator included) harvests itself or its siblings:
@@ -144,6 +152,44 @@ def hermes_sessions() -> list[dict]:
     return out
 
 
+def _codex_meta_from_file(path: Path) -> dict:
+    """Read Codex's session_meta line. Returns session_id/cwd fallbacks on bad files."""
+    meta = {"session_id": path.stem, "cwd": ""}
+    try:
+        with path.open(encoding="utf-8", errors="replace") as fh:
+            for _ in range(20):
+                line = fh.readline()
+                if not line:
+                    break
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if rec.get("type") != "session_meta":
+                    continue
+                payload = rec.get("payload") or {}
+                meta["session_id"] = payload.get("session_id") or payload.get("id") or path.stem
+                meta["cwd"] = payload.get("cwd") or ""
+                break
+    except OSError:
+        pass
+    return meta
+
+
+def codex_sessions() -> list[dict]:
+    """List Codex session JSONL files as {head, path, session_id, cwd}, self-excluded."""
+    out = []
+    if not CODEX_SESSIONS.is_dir():
+        return out
+    for f in sorted(CODEX_SESSIONS.glob("**/*.jsonl")):
+        meta = _codex_meta_from_file(f)
+        cwd = meta["cwd"]
+        if cwd and _excluded(cwd):
+            continue
+        out.append({"head": "codex", "path": str(f), "session_id": meta["session_id"], "cwd": cwd})
+    return out
+
+
 def hermes_messages(session_id: str, since_id: int = 0) -> list[dict]:
     """Return {id, role, content, timestamp} rows for one Hermes session, id > since_id.
 
@@ -165,7 +211,7 @@ def hermes_messages(session_id: str, since_id: int = 0) -> list[dict]:
 
 def all_sessions() -> list[dict]:
     """All discoverable sessions across heads."""
-    return claude_sessions() + hermes_sessions()
+    return claude_sessions() + hermes_sessions() + codex_sessions()
 
 
 def claude_memory_files() -> list[dict]:
