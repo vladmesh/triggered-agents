@@ -43,6 +43,7 @@ from triggered_agents.agents.pipeline import model  # noqa: E402
 from triggered_agents.agents.pipeline import ops as pipeline_ops  # noqa: E402
 from triggered_agents.agents.steward import cli as steward_cli  # noqa: E402
 from triggered_agents.agents.steward import signals  # noqa: E402
+from triggered_agents.runtime.state import PRECHECK_SKIP  # noqa: E402
 
 _fail = False
 
@@ -97,7 +98,7 @@ def main() -> int:
 
         # 0. quiet board/disk -> precheck skips, zero LLM cost.
         rc, _ = run_steward(["precheck"])
-        check("precheck rc!=0 on a quiet board", rc != 0)
+        check("precheck rc=100 on a quiet board", rc == PRECHECK_SKIP)
 
         # 1. anomaly: a card lands in Blocked (via the steward escalation move — exercises the
         #    same real transition a live incident would use, see model.TRANSITIONS["steward"]).
@@ -207,7 +208,7 @@ def main() -> int:
         rc, _ = run_steward(["advance"])
         check("advance rc=0", rc == 0)
         rc, _ = run_steward(["precheck"])
-        check("precheck rc!=0 again after advance + cleanup", rc != 0)
+        check("precheck rc=100 again after advance + cleanup", rc == PRECHECK_SKIP)
 
         print("\nALL PASS")
         return 0

@@ -13,8 +13,8 @@ precheck, which runs unconditionally every timer fire, and again from tick() for
 resource's TTL lapsed between the two) — probes cost real tokens/quota, so the TTL cache
 (`PROBE_TTL_S`, ~5 min) is what keeps that cost to "once per window", not "once per 3-min tick".
 Cache lives in a JSON file (state/pipeline/resource_health.json), not in memory: precheck and
-tick are two separate `python3 -m triggered_agents` processes per timer fire (deploy/provision.py's
-`_precheck_gate`), so nothing survives in-process between them.
+tick are two separate `python3 -m triggered_agents` processes per timer fire (via
+deploy/ta-gate.sh), so nothing survives in-process between them.
 
 A resource's red<->green flip is logged to runs.jsonl (`head-health`) exactly once per flip, not
 on every re-probe of an unchanged status — a resource pinned red for hours must not spam the log

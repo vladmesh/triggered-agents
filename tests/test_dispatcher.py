@@ -30,6 +30,7 @@ from test_pipeline import FakeBoard  # noqa: E402
 from triggered_agents.agents.pipeline import (  # noqa: E402
     dispatcher, health, heads, model, ops, pause, validate, worker,
 )
+from triggered_agents.runtime.state import PRECHECK_SKIP  # noqa: E402
 
 
 class FakeWorker:
@@ -255,7 +256,7 @@ class DispatcherTest(_DispatcherBase):
     # precheck --------------------------------------------------------------
     def test_precheck_skip_when_empty(self):
         rc = dispatcher.precheck()
-        self.assertEqual(rc, 1)
+        self.assertEqual(rc, PRECHECK_SKIP)   # deliberate skip, distinct from a crash (1)
         self.assertTrue(any(r["event"] == "precheck" and r.get("result") == "nothing-to-do"
                              for r in self._runs()))
 
@@ -277,12 +278,12 @@ class DispatcherTest(_DispatcherBase):
                             meta={model.META_TASK_TYPE: "code", model.META_PROJECT: "personal_site"})
         self.assertEqual(dispatcher.precheck(), 0)
 
-    # Kanboard недоступен/битый env: исход error, ненулевой выход отличимый от nothing-to-do (1)
+    # Kanboard недоступен/битый env: исход error, ненулевой выход отличимый от PRECHECK_SKIP.
     def test_precheck_error_when_board_unreachable(self):
         with mock.patch.object(ops, "list_cards", side_effect=RuntimeError("connection refused")):
             rc = dispatcher.precheck()
         self.assertEqual(rc, 2)
-        self.assertNotEqual(rc, 1)  # must differ from the plain-skip exit code
+        self.assertNotEqual(rc, PRECHECK_SKIP)
         runs = [r for r in self._runs() if r["event"] == "precheck"]
         self.assertTrue(any(r.get("result") == "error" and r.get("error_class") == "RuntimeError"
                              for r in runs))
@@ -334,7 +335,7 @@ class DispatcherTest(_DispatcherBase):
     def test_precheck_ff_survives_read_base_branch_failure(self):
         with mock.patch.object(worker, "read_base_branch", side_effect=RuntimeError("no manifest")):
             rc = dispatcher.precheck()
-        self.assertEqual(rc, 1)  # board still empty -> nothing-to-do, unaffected
+        self.assertEqual(rc, PRECHECK_SKIP)  # board still empty -> nothing-to-do, unaffected
         runs = [r for r in self._runs() if r["event"] == "ff-agents"]
         self.assertTrue(any(r.get("result") == "error" and r.get("level") == "warn" for r in runs))
 
@@ -2635,7 +2636,7 @@ class PipelinePauseTest(_DispatcherBase):
     def test_precheck_hard_paused_skips_before_listing_the_board(self):
         dispatcher.pause("hard")
         rc = dispatcher.precheck()
-        self.assertEqual(rc, 1)
+        self.assertEqual(rc, PRECHECK_SKIP)
         runs = [r for r in self._runs() if r["event"] == "precheck"]
         self.assertEqual(runs[-1]["result"], "paused")
         self.assertEqual(runs[-1]["mode"], "hard")
@@ -2651,7 +2652,7 @@ class PipelinePauseTest(_DispatcherBase):
     def test_precheck_soft_paused_with_nothing_inflight_skips_as_paused(self):
         dispatcher.pause("soft")
         rc = dispatcher.precheck()
-        self.assertEqual(rc, 1)
+        self.assertEqual(rc, PRECHECK_SKIP)
         runs = [r for r in self._runs() if r["event"] == "precheck"]
         self.assertEqual(runs[-1]["result"], "paused")
 
@@ -2659,7 +2660,7 @@ class PipelinePauseTest(_DispatcherBase):
         self._ready_card("A")   # a Ready card alone must not count as work while soft-paused
         dispatcher.pause("soft")
         rc = dispatcher.precheck()
-        self.assertEqual(rc, 1)
+        self.assertEqual(rc, PRECHECK_SKIP)
 
     # --- hard resume: relaunch + fresh watchdog clock ----------------------------------------
     def test_hard_resume_relaunches_the_worker_in_the_same_workspace(self):

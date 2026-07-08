@@ -74,7 +74,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("setup")
     sub.add_parser("tick")       # dispatcher: one deterministic tick (claim/advance)
-    sub.add_parser("precheck")   # dispatcher: exit 0 if there is work, non-zero to skip
+    sub.add_parser("precheck")   # dispatcher: exit 0 if there is work, PRECHECK_SKIP (100) to skip
 
     p_pause = sub.add_parser("pause")     # po/steward: soft (claims off) or hard (heads stopped)
     p_pause.add_argument("--mode", required=True, choices=("soft", "hard"))

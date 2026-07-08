@@ -17,8 +17,8 @@ Flow the agent follows each run:
 
 Two-phase like the curator: a crash before the proposals are filed re-harvests instead of
 dropping turns. `harvest --json` emits the structured batch; `sessions` lists discovered sources;
-`status` shows the watermark; `precheck` exits non-zero when nothing is new (so the systemd gate
-can skip the run without spinning up a head).
+`status` shows the watermark; `precheck` exits PRECHECK_SKIP (100) when nothing is new, so the
+systemd gate can skip the run without spinning up a head.
 
 Retro's watermark/lock/runs.jsonl live under state/retro, independent of the curator's cursor,
 so the two harvest the same sources on separate schedules without clobbering each other.
@@ -29,7 +29,7 @@ import json
 import sys
 from pathlib import Path
 
-from ...runtime.state import AgentState
+from ...runtime.state import PRECHECK_SKIP, AgentState
 from ..curator import discover, harvest
 from . import search_log
 
@@ -72,14 +72,16 @@ def cmd_advance() -> int:
 
 
 def cmd_precheck() -> int:
-    """Exit 0 if there are new turns to review, non-zero if nothing new (skip the run)."""
+    """Exit 0 if there are new turns to review, PRECHECK_SKIP (100) to skip a clean run when nothing
+    is new. Any other code means precheck crashed. An uncaught exception exits 1, which the systemd
+    gate treats as an error, not a skip. See runtime/state.py PRECHECK_SKIP and deploy/ta-gate.sh."""
     batch = harvest.harvest(STATE)
     if batch["sessions"]:
         STATE.log_run("precheck", result="change")
         return 0
     STATE.log_run("precheck", result="no-change")
     print("retro: no new turns since watermark", file=sys.stderr)
-    return 1
+    return PRECHECK_SKIP
 
 
 def cmd_log_proposal(refs: list[str]) -> int:
