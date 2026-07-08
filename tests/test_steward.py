@@ -367,18 +367,18 @@ class NoSignalTest(StewardTestBase):
 
 class CliTest(StewardTestBase):
     def test_precheck_exits_nonzero_on_quiet_board(self):
-        self.assertEqual(cli.cmd_precheck(), 1)
+        self.assertEqual(cli.cmd_precheck(), runtime_state.PRECHECK_SKIP)
 
     def test_precheck_exits_zero_on_a_signal(self):
         self.board.add_task("A", "Blocked", meta={"project": "personal_site"})
         self.assertEqual(cli.cmd_precheck(), 0)
 
-    # Kanboard недоступен/битый env: исход error, rc=2 отличимый и от dispatch(0), и от skip(1)
+    # Kanboard недоступен/битый env: исход error, rc=2 отличимый от dispatch(0) и skip(100).
     def test_precheck_error_when_scan_raises(self):
         with mock.patch.object(signals, "scan", side_effect=RuntimeError("connection refused")):
             rc = cli.cmd_precheck()
         self.assertEqual(rc, 2)
-        self.assertNotIn(rc, (0, 1))
+        self.assertNotIn(rc, (0, runtime_state.PRECHECK_SKIP))
         runs = [json.loads(l) for l in (cli.STATE.dir / "runs.jsonl").read_text().splitlines()]
         precheck_runs = [r for r in runs if r["event"] == "precheck"]
         self.assertTrue(any(r.get("result") == "error" and r.get("error_class") == "RuntimeError"
@@ -396,7 +396,7 @@ class CliTest(StewardTestBase):
         mark = signals.load_watermark()
         self.assertIn(ref, mark["notified_blocked"])
         # the same still-Blocked card no longer trips precheck after advance
-        self.assertEqual(cli.cmd_precheck(), 1)
+        self.assertEqual(cli.cmd_precheck(), runtime_state.PRECHECK_SKIP)
 
     def test_status_reports_the_persisted_watermark(self):
         self.board.add_task("A", "Blocked", meta={"project": "personal_site"})
@@ -414,7 +414,7 @@ class CliTest(StewardTestBase):
         self.assertEqual(cli.cmd_advance(), 0)
         mark = signals.load_watermark()
         self.assertIn(ref, mark["notified_blocked"])
-        self.assertEqual(cli.cmd_precheck(), 1)  # no fresh wake-up for the same card next hour
+        self.assertEqual(cli.cmd_precheck(), runtime_state.PRECHECK_SKIP)  # no fresh wake-up next hour
 
 
 class DeepSweepWatermarkTest(StewardTestBase):

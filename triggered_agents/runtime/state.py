@@ -22,6 +22,14 @@ from pathlib import Path
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 STATE_ROOT = Path(os.environ.get("TA_STATE", str(_REPO_ROOT / "state")))
 
+# Precheck exit-code protocol, shared by every agent's `precheck` command and the systemd gate
+# (deploy/ta-gate.sh): 0 = there is work (dispatch the head), PRECHECK_SKIP = a deliberate skip
+# (nothing changed / paused: a clean run, not a failure), any OTHER code = precheck itself broke.
+# 100 is deliberately NOT 1: Python's default uncaught-crash exit code is 1 (ImportError, an
+# exception before the return, a raise inside the except handler), so a crashed precheck must land
+# in the gate's error branch and fail the unit, never masquerade as a quiet skip (triggered-agents-276).
+PRECHECK_SKIP = 100
+
 
 class AgentState:
     """Per-agent watermark + lock under STATE_ROOT/<agent>/."""

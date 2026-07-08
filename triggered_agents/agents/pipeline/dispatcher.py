@@ -43,7 +43,7 @@ import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
 
-from ...runtime.state import AgentState
+from ...runtime.state import PRECHECK_SKIP, AgentState
 from . import health, heads, model, naming, ops, pause as pause_flag, validate, worker
 # Re-exported so dispatcher.<NAME> keeps resolving for existing callers/tests — validate.py owns
 # these now (its layer-3 rework/spawn/stall caps), dispatcher just orchestrates the tick.
@@ -189,9 +189,10 @@ def _ff_agent_worktrees() -> None:
 
 def precheck() -> int:
     """Exit 0 when there is work: a Ready card to claim, an In-progress card to advance, or a
-    Validate card whose PR needs polling. Exit 1 when precheck ran fine and found nothing to do.
-    Exit 2 when precheck itself failed (Kanboard unreachable, broken env) — a distinct outcome
-    from a plain skip, so a dead board doesn't read as "nothing to do" in journalctl/runs.jsonl.
+    Validate card whose PR needs polling. Exit PRECHECK_SKIP (100) when precheck ran fine and found
+    nothing to do (or the pipeline is paused). Exit 2 when precheck itself failed (Kanboard
+    unreachable, broken env); both that and any uncaught crash (Python exits 1) land in the gate's
+    error branch, so a dead board doesn't read as "nothing to do" in journalctl/runs.jsonl.
     Every run logs exactly one event to runs.jsonl regardless of outcome, so health-check can
     tell a live-but-idle dispatcher from one that stopped ticking. Cheap: one board list, before
     any task workspace/head is touched — _ff_agent_worktrees is the one exception, a best-effort
@@ -217,7 +218,7 @@ def precheck() -> int:
     if paused and paused.get("mode") == "hard":
         STATE.log_run("precheck", result="paused", mode="hard")
         print("pipeline: hard-paused — SKIP", file=sys.stderr)
-        return 1
+        return PRECHECK_SKIP
     try:
         cards = ops.list_cards()
     except Exception as e:  # noqa: BLE001 — any precheck failure must be logged, not just KanboardError
@@ -237,7 +238,7 @@ def precheck() -> int:
                   **({"mode": "soft"} if soft else {}))
     print("pipeline: " + ("soft-paused, nothing in flight — SKIP" if soft else
                           "nothing Ready, in flight or validating — SKIP"), file=sys.stderr)
-    return 1
+    return PRECHECK_SKIP
 
 
 def _report_verdict(reference: str, baseline: int) -> str | None:

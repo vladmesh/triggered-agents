@@ -9,6 +9,7 @@ UUIDs) are resolved here, not stored in the spec. This applies the spec idempote
   * mark the workspace folder trusted for Claude Code (else headless hangs on the dialog),
   * upsert the Orca automation matched BY NAME — edit in place so its id (and thus the
     systemd ExecStart) stays stable across re-provisions; create only if missing,
+  * install the precheck gate script (deploy/ta-gate.sh) that the units' ExecStart references,
   * generate the ta-<agent> systemd service+timer from the spec (the real clock on this
     headless box), and remove a one-time legacy unit if the spec names one.
 
@@ -34,6 +35,11 @@ CANONICAL_ROOT = Path.home() / "triggered-agents"
 AGENTS_DIR = REPO_ROOT / "triggered_agents" / "agents"
 CLAUDE_JSON = Path.home() / ".claude.json"
 SYSTEMD_DIR = Path("/etc/systemd/system")
+# The precheck gate lives as a versioned script (deploy/ta-gate.sh), installed to a fixed host path
+# so every unit's ExecStart can reference it by absolute path instead of an inline shell string.
+# install_gate_script() sudo-writes it alongside the units.
+GATE_SCRIPT_SRC = REPO_ROOT / "deploy" / "ta-gate.sh"
+GATE_INSTALL_PATH = Path("/usr/local/bin/ta-gate.sh")
 ORCA = os.environ.get("ORCA_BIN") or subprocess.run(
     ["bash", "-lc", "command -v orca"], capture_output=True, text=True
 ).stdout.strip() or "/home/dev/.local/bin/orca"
@@ -173,27 +179,15 @@ def ensure_automation(spec: dict, workspace: Path) -> str | None:
     return aid
 
 
-def _precheck_gate(agent: str, precheck: str, dispatch: str) -> str:
-    """Bash snippet three-way on precheck's own exit code, not just true/false: 0 -> dispatch,
-    1 -> nothing to do (still a clean unit run, not a failure), anything else -> precheck itself
-    broke (Kanboard down, bad env) — propagate that exit code so the unit is recorded as failed
-    in journalctl, distinguishable there from a plain skip. Also NOT Orca's automation --precheck
-    field: `automations run` is trigger=manual and Orca only honors precheck for trigger=scheduled
-    (service.ts), which never ticks headless. So the gate lives here instead."""
-    return (f"{precheck}; rc=$?; "
-            f"if [ $rc -eq 0 ]; then exec {dispatch}; "
-            f'elif [ $rc -eq 1 ]; then echo "[ta-{agent}] precheck: no change, run skipped"; '
-            f'else echo "[ta-{agent}] precheck: ERROR (rc=$rc) — see runs.jsonl" >&2; exit $rc; fi')
-
-
-def _service_unit(agent: str, calendar: str, workspace: Path, precheck: str,
+def _service_unit(agent: str, calendar: str, workspace: Path, _precheck: str,
                   env_file: str = "") -> str:
-    # Dispatch is our singleton terminal driver, NOT `orca automations run`: the latter dispatches
-    # with trigger=manual and spawns a new head every tick (Orca's reuse only kicks in for
-    # scheduled runs, which don't tick headless), so heads pile up. The driver converges the
-    # workspace to one warm claude terminal and reuses it. See runtime/dispatch.py.
-    dispatch = f"python3 -m triggered_agents {agent} dispatch"
-    gate = _precheck_gate(agent, precheck, dispatch) if precheck else f"exec {dispatch}"
+    # ExecStart is the versioned gate script (deploy/ta-gate.sh, installed at GATE_INSTALL_PATH),
+    # run as `ta-gate.sh <agent>`. It calls `<agent> precheck` and branches on the exit-code
+    # protocol (0 dispatch / 100 skip / other = fail the unit), then execs `<agent> dispatch`.
+    # Dispatch is our singleton terminal driver, not `orca automations run`: the latter dispatches
+    # trigger=manual and spawns a fresh head every tick, so heads pile up. The driver converges the
+    # workspace to one warm claude terminal and reuses it. See runtime/dispatch.py and ta-gate.sh.
+    exec_start = f"{GATE_INSTALL_PATH} {agent}"
     env_line = f"EnvironmentFile={env_file}\n" if env_file else ""
     return f"""[Unit]
 Description=triggered-agents: {agent} {calendar} tick (precheck gate + singleton terminal dispatch)
@@ -207,7 +201,7 @@ User=dev
 Group=dev
 WorkingDirectory={workspace}
 Environment=HOME=/home/dev
-{env_line}ExecStart=/bin/bash -lc '{gate}'
+{env_line}ExecStart={exec_start}
 """
 
 
@@ -232,10 +226,10 @@ WantedBy=timers.target
 def _variant_service_unit(agent: str, variant: str, calendar: str, workspace: Path, env_file: str = "") -> str:
     """Unconditional dispatch — no precheck gate at all (triggered-agents-254: the whole point of
     a second, differently-scheduled mode is to wake the head even when the deterministic signals
-    stayed quiet, including the case where the signals themselves are blind). ExecStart runs
-    `dispatch <variant>` directly; dispatch.py's own busy/idle check still protects it from
-    colliding with a live hourly-tick session in the same workspace."""
-    dispatch = f"python3 -m triggered_agents {agent} dispatch {variant}"
+    stayed quiet, including the case where the signals themselves are blind). ExecStart is the
+    script called with a variant arg (`ta-gate.sh <agent> <variant>`), whose two-arg form skips
+    precheck entirely and execs `dispatch <variant>` directly; dispatch.py's own busy/idle check
+    still protects it from colliding with a live hourly-tick session in the same workspace."""
     env_line = f"EnvironmentFile={env_file}\n" if env_file else ""
     return f"""[Unit]
 Description=triggered-agents: {agent} {variant} {calendar} unconditional sweep (no precheck gate)
@@ -249,12 +243,23 @@ User=dev
 Group=dev
 WorkingDirectory={workspace}
 Environment=HOME=/home/dev
-{env_line}ExecStart=/bin/bash -lc 'exec {dispatch}'
+{env_line}ExecStart={GATE_INSTALL_PATH} {agent} {variant}
 """
 
 
 def _sudo_write(path: Path, content: str) -> None:
     run(["sudo", "tee", str(path)], input_bytes=content.encode())
+
+
+def install_gate_script() -> None:
+    """Install deploy/ta-gate.sh to GATE_INSTALL_PATH so unit ExecStarts can reference it by
+    absolute path. Idempotent: sudo-writes the current repo copy on every provision, same delivery
+    channel as the unit files, so the script and the units that reference it cannot drift inside one
+    provision run. The gate is a versioned script, not an inline `bash -lc` string in ExecStart, so
+    this logic is reviewable and unit-tested (triggered-agents-276)."""
+    _sudo_write(GATE_INSTALL_PATH, GATE_SCRIPT_SRC.read_text(encoding="utf-8"))
+    run(["sudo", "chmod", "755", str(GATE_INSTALL_PATH)])
+    log(f"gate script installed: {GATE_INSTALL_PATH}")
 
 
 def remove_legacy_unit(legacy: str) -> None:
@@ -298,6 +303,7 @@ def render_units(agent: str, spec: dict, workspace: Path) -> dict[str, str]:
 
 def ensure_systemd(agent: str, spec: dict, workspace: Path) -> None:
     units = render_units(agent, spec, workspace)
+    install_gate_script()   # the units below reference it by absolute path; write it first
     sysd = spec.get("systemd", {})
     unit = f"ta-{agent}"
     _sudo_write(SYSTEMD_DIR / f"{unit}.service", units[f"{unit}.service"])

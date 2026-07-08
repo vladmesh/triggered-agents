@@ -11,6 +11,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 _PROJECTS_DIR = tempfile.mkdtemp(prefix="ta-curator-projects-")
 _STATE_DIR = tempfile.mkdtemp(prefix="ta-curator-state-")
@@ -25,8 +26,9 @@ os.environ["TA_STATE"] = _STATE_DIR
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from triggered_agents.agents.curator import discover, harvest  # noqa: E402
-from triggered_agents.runtime.state import AgentState  # noqa: E402
+from triggered_agents.agents.curator import cli as curator_cli, discover, harvest  # noqa: E402
+from triggered_agents.agents.retro import cli as retro_cli  # noqa: E402
+from triggered_agents.runtime.state import PRECHECK_SKIP, AgentState  # noqa: E402
 
 
 def _write(path: Path, text: str) -> None:
@@ -175,6 +177,22 @@ class HarvestCombinesSessionsAndMemoryTest(unittest.TestCase):
         rendered = harvest.render_markdown(batch)
         self.assertIn("Личная память", rendered)
         self.assertIn("fact.md", rendered)
+
+
+class PrecheckProtocolTest(unittest.TestCase):
+    def setUp(self):
+        self.projects = Path(tempfile.mkdtemp(prefix="ta-curator-precheck-case-"))
+        p = mock.patch.object(discover, "CLAUDE_PROJECTS", self.projects)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_curator_precheck_skip_uses_sentinel(self):
+        with mock.patch.object(curator_cli, "STATE", AgentState("curator-precheck-test")):
+            self.assertEqual(curator_cli.cmd_precheck(), PRECHECK_SKIP)
+
+    def test_retro_precheck_skip_uses_sentinel(self):
+        with mock.patch.object(retro_cli, "STATE", AgentState("retro-precheck-test")):
+            self.assertEqual(retro_cli.cmd_precheck(), PRECHECK_SKIP)
 
 
 if __name__ == "__main__":

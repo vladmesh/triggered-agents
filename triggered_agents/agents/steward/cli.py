@@ -14,8 +14,8 @@ Flow the agent follows each run:
      watermark, so a condition that hasn't changed does not re-spawn the head next hour.
 
 Two-phase like curator/retro: a crash before advance re-scans instead of dropping a signal.
-`scan --json` emits the structured batch; `precheck` exits non-zero when there is no signal (so
-the systemd gate can skip the run, zero LLM cost); `status` shows the watermark.
+`scan --json` emits the structured batch; `precheck` exits PRECHECK_SKIP (100) when there is no
+signal, so the systemd gate can skip the run at zero LLM cost; `status` shows the watermark.
 
 Second, unconditional mode (triggered-agents-254): `deep-sweep-since`/`deep-sweep-advance` keep
 a separate watermark — just a timestamp, not a per-kind dedup like signals.py's — for the daily
@@ -33,6 +33,7 @@ from pathlib import Path
 
 from . import drift, signals
 from ..pipeline import worker as pipeline_worker
+from ...runtime.state import PRECHECK_SKIP
 
 STATE = signals.STATE
 ROLE_SKILLS = Path("/home/dev/control-panel/scripts/role_skills.py")
@@ -78,10 +79,11 @@ def cmd_advance() -> int:
 
 
 def cmd_precheck() -> int:
-    """Exit 0 if any anomaly signal is present, 1 to skip a clean run, 2 when precheck itself
-    broke (Kanboard unreachable, bad env, any other exception) — a distinct outcome from a plain
-    skip, so the systemd gate's rc>=2 branch (see deploy/provision.py) can tell a dead precheck
-    from a quiet hour in journalctl/runs.jsonl instead of both looking like rc=1."""
+    """Exit 0 if any anomaly signal is present, PRECHECK_SKIP (100) to skip a clean run, 2 when
+    precheck itself broke (Kanboard unreachable, bad env, any other exception). Both the caught error
+    (2) and any uncaught crash (Python exits 1) fall in the gate's "anything but 0/100" error branch,
+    so a dead precheck fails the unit instead of reading as a quiet hour. This removes the old
+    1-means-skip masking. See runtime/state.py PRECHECK_SKIP and deploy/ta-gate.sh."""
     try:
         batch = signals.scan()
     except Exception as e:  # noqa: BLE001 — any precheck failure must be logged, not just KanboardError
@@ -96,7 +98,7 @@ def cmd_precheck() -> int:
         return 0
     STATE.log_run("precheck", result="no-change")
     print("steward: no anomaly signal since watermark", file=sys.stderr)
-    return 1
+    return PRECHECK_SKIP
 
 
 def cmd_status() -> int:

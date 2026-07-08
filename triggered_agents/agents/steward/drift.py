@@ -1,17 +1,19 @@
-"""Deep-sweep drift check (triggered-agents-256): live ta-* systemd units vs. what
-deploy/provision.py would render right now from the current triggered_agents/agents/*/
-automation.toml specs. Detection only, called from the deep-sweep section of `.claude/skills/
-steward/SKILL.md` — filing an Идеи card with the diff is the skill's job, not this module's;
-auto-healing the drift is explicitly out of scope for this card (a live systemd rewrite belongs to
-a human-reviewed provision run, not an unconditional daily sweep).
+"""Deep-sweep drift check (triggered-agents-256): live ta-* systemd units plus the installed
+precheck gate script vs. what deploy/provision.py would install right now from the current
+triggered_agents/agents/*/automation.toml specs and repo copy of deploy/ta-gate.sh. Detection only,
+called from the deep-sweep section of `.claude/skills/steward/SKILL.md`; filing an Идеи card with
+the diff is the skill's job, not this module's. Auto-healing the drift is explicitly out of scope
+for this card (a live systemd rewrite belongs to a human-reviewed provision run, not an
+unconditional daily sweep).
 
 Reuses deploy/provision.py's own unit-string builders (_service_unit/_timer_unit/
 _variant_service_unit) instead of reimplementing the rendering: two independently maintained
 renderers of the same unit text would drift from EACH OTHER as much as from the host, defeating
 the whole point of this check. Reads specs from THIS process's own checkout (the steward's named
-worktree, kept current by the pipeline dispatcher's every-tick fast-forward — worker._ff_agent_
-worktrees) rather than the canonical ~/triggered-agents checkout, which nothing keeps up to date
-between provision runs and would otherwise make every comparison stale by definition.
+worktree, kept current by the pipeline dispatcher's every-tick fast-forward,
+worker._ff_agent_worktrees) rather than the canonical ~/triggered-agents checkout, which nothing
+keeps up to date between provision runs and would otherwise make every comparison stale by
+definition.
 """
 from __future__ import annotations
 
@@ -30,14 +32,14 @@ from ..pipeline import worker as pipeline_worker  # noqa: E402
 SYSTEMD_DIR = Path("/etc/systemd/system")
 
 
-def _expected_units() -> dict[str, str]:
-    """unit filename ('ta-<agent>.service', ...) -> expected content, for every agent spec found
-    under provision.AGENTS_DIR — the same set deploy/provision.py's own `main()` provisions with
-    no argv (every agent with a spec). Delegates the actual rendering to provision.render_units,
-    the exact function ensure_systemd itself calls before writing units to disk, so this can never
-    drift from what a real provision run would produce (see render_units' own docstring — the
-    same anti-duplication reasoning that already applies to the unit-text builders themselves)."""
-    expected: dict[str, str] = {}
+def _expected_artifacts() -> dict[str, str]:
+    """Artifact name/path -> expected content for every file provision.py owns: ta-* unit files for
+    every agent spec plus the installed gate script. Unit rendering delegates to provision.
+    render_units, the exact function ensure_systemd itself calls before writing units to disk, so
+    this can never drift from what a real provision run would produce."""
+    expected: dict[str, str] = {
+        str(provision.GATE_INSTALL_PATH): provision.GATE_SCRIPT_SRC.read_text(encoding="utf-8"),
+    }
     for agent_dir in sorted(provision.AGENTS_DIR.iterdir()):
         spec_path = agent_dir / "automation.toml"
         if not spec_path.is_file():
@@ -49,35 +51,37 @@ def _expected_units() -> dict[str, str]:
     return expected
 
 
-def _live_units() -> dict[str, str]:
-    """Every ta-*.service/ta-*.timer currently on disk under SYSTEMD_DIR -> its content. Unit
-    files are world-readable (confirmed live), so this never needs sudo."""
-    if not SYSTEMD_DIR.is_dir():
-        return {}
+def _live_artifacts() -> dict[str, str]:
+    """Every live artifact provision.py owns and the drift check can read without sudo."""
     live = {}
-    for path in sorted(SYSTEMD_DIR.glob("ta-*.service")) + sorted(SYSTEMD_DIR.glob("ta-*.timer")):
-        live[path.name] = path.read_text(encoding="utf-8")
+    if SYSTEMD_DIR.is_dir():
+        for path in sorted(SYSTEMD_DIR.glob("ta-*.service")) + sorted(SYSTEMD_DIR.glob("ta-*.timer")):
+            live[path.name] = path.read_text(encoding="utf-8")
+    gate = provision.GATE_INSTALL_PATH
+    if gate.is_file():
+        live[str(gate)] = gate.read_text(encoding="utf-8")
     return live
 
 
-def _diff(live: str, expected: str, unit: str) -> str:
+def _diff(live: str, expected: str, artifact: str) -> str:
     return "".join(difflib.unified_diff(
         live.splitlines(keepends=True), expected.splitlines(keepends=True),
-        fromfile=f"{unit} (live)", tofile=f"{unit} (expected from current specs)"))
+        fromfile=f"{artifact} (live)", tofile=f"{artifact} (expected from current checkout)"))
 
 
 def check() -> dict:
-    """{"in_sync": bool, "drift": [{"unit", "kind", "diff"}, ...]}. `kind`:
-      "content" -> unit exists on both sides but differs (a merged spec change never applied to
-                   the host — the class this card's post-merge apply now catches earlier; this
-                   check is the safety net for whatever still slips past it).
-      "missing" -> the spec calls for this unit, the host has none (never provisioned, or removed
-                   by hand without touching the spec).
+    """{"in_sync": bool, "drift": [{"unit", "kind", "diff"}, ...]}. The "unit" field may hold a
+    unit filename or an installed script path. `kind`:
+      "content" -> artifact exists on both sides but differs (a merged spec/script change never
+                   applied to the host; post-merge apply catches this earlier, and this check is
+                   the safety net for whatever still slips past it).
+      "missing" -> the checkout calls for this artifact, the host has none (never provisioned, or
+                   removed by hand without touching the source).
       "extra"   -> the unit lives on the host, no spec calls for it any more (a decommissioned
-                   agent/variant whose unit was never torn down — the ta-board class, 2026-07-04).
-    Sorted by unit name for a deterministic report."""
-    expected = _expected_units()
-    live = _live_units()
+                   agent/variant whose unit was never torn down, the ta-board class, 2026-07-04).
+    Sorted by artifact name for a deterministic report."""
+    expected = _expected_artifacts()
+    live = _live_artifacts()
     drift = []
     for unit in sorted(set(expected) | set(live)):
         exp = expected.get(unit)
@@ -93,8 +97,8 @@ def check() -> dict:
 
 def render_markdown(result: dict) -> str:
     if result["in_sync"]:
-        return "steward: дрейфа юнитов нет — живой набор совпадает с рендером текущих specs.\n"
-    lines = [f"# steward: дрейф systemd-юнитов ({len(result['drift'])})", ""]
+        return "steward: дрейфа systemd-артефактов нет, живой набор совпадает с текущим рендером.\n"
+    lines = [f"# steward: дрейф systemd-артефактов ({len(result['drift'])})", ""]
     for hit in result["drift"]:
         lines.append(f"## {hit['unit']} ({hit['kind']})")
         lines.append("```diff")

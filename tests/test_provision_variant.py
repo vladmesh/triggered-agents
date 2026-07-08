@@ -12,7 +12,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # repo root
 
-from deploy.provision import _variant_service_unit, _timer_unit  # noqa: E402
+from deploy.provision import GATE_INSTALL_PATH, _timer_unit, _variant_service_unit  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -21,7 +21,8 @@ class VariantServiceUnitTest(unittest.TestCase):
     def test_no_precheck_gate_dispatch_is_unconditional(self):
         unit = _variant_service_unit("steward", "deep-sweep", "03:47:00", Path("/ws/steward"))
         self.assertNotIn("rc=$?", unit)
-        self.assertIn("ExecStart=/bin/bash -lc 'exec python3 -m triggered_agents steward dispatch deep-sweep'", unit)
+        self.assertIn(f"ExecStart={GATE_INSTALL_PATH} steward deep-sweep", unit)
+        self.assertNotIn("bash -lc", unit)
 
     def test_env_file_included_when_given(self):
         unit = _variant_service_unit("steward", "deep-sweep", "03:47:00", Path("/ws/steward"),
