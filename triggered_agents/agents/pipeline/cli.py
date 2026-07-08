@@ -14,11 +14,12 @@ in the same call) — see model.STEWARD_OVERRIDE and ops.move_card. idea is revi
 setup/list/show/probe need no role. Guards live in model/ops; this layer only wires argv to them
 and maps failures to exit codes.
 
-pause/resume (triggered-agents-281) are po-/steward-only — toggle the persistent flag in
-`state/pipeline/pause.json` (see dispatcher.pause/resume, pause.py) that dispatcher.tick checks
-before claiming or (in hard mode) before touching any head at all, and runtime/dispatch.py checks
-before dispatching steward/curator/retro. pause-status needs no role, same as list/show — it only
-reads the flag.
+pause/resume (triggered-agents-281) are po-/steward-only. `pause drain|freeze --reason ...`
+toggles the persistent flag in `state/pipeline/pause.json` (see dispatcher.pause/resume, pause.py)
+that dispatcher.tick checks before claiming or (in freeze's internal hard mode) before touching
+any head at all, and runtime/dispatch.py checks before dispatching steward/curator/retro. Legacy
+`soft`/`hard` aliases still parse for compatibility. pause-status needs no role, same as
+list/show, it only reads the flag.
 
 `probe --resource <id>` exits 0/1 for green/red (see health.run_builtin_probe), not the generic
 KanboardError/GuardError table below — it is heads.toml's own probe command, run by
@@ -34,6 +35,7 @@ import json
 import os
 import sys
 
+from . import pause as pause_flag
 from .model import GuardError, ROLES
 
 
@@ -67,6 +69,19 @@ def _need_role(role: str | None, allowed: tuple[str, ...]) -> bool:
     return True
 
 
+def _pause_mode(args) -> str | None:
+    mode_arg = getattr(args, "mode", None)
+    mode_flag = getattr(args, "mode_flag", None)
+    if mode_arg and mode_flag:
+        _err("pause mode specified twice; use positional drain/freeze or legacy --mode, not both")
+        return None
+    mode = mode_arg or mode_flag
+    if not mode:
+        _err("pause needs a mode: drain or freeze (legacy aliases: soft, hard)")
+        return None
+    return mode
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="triggered_agents pipeline", add_help=True)
     parser.add_argument("--role", choices=ROLES, help="acting role (or env BOARD_ROLE)")
@@ -76,8 +91,16 @@ def _build_parser() -> argparse.ArgumentParser:
     sub.add_parser("tick")       # dispatcher: one deterministic tick (claim/advance)
     sub.add_parser("precheck")   # dispatcher: exit 0 if there is work, PRECHECK_SKIP (100) to skip
 
-    p_pause = sub.add_parser("pause")     # po/steward: soft (claims off) or hard (heads stopped)
-    p_pause.add_argument("--mode", required=True, choices=("soft", "hard"))
+    p_pause = sub.add_parser("pause")     # po/steward: drain (claims off) or freeze (heads stopped)
+    p_pause.add_argument(
+        "mode", nargs="?", choices=(*pause_flag.PUBLIC_MODES, *pause_flag.MODES),
+        help="drain stops new claims; freeze also stops live heads; soft/hard are legacy internal aliases")
+    p_pause.add_argument(
+        "--mode", dest="mode_flag", choices=(*pause_flag.PUBLIC_MODES, *pause_flag.MODES),
+        help="legacy form; use positional drain/freeze for user-facing calls")
+    p_pause.add_argument("--reason")
+    p_pause.add_argument("--reason-file")
+    p_pause.add_argument("--actor", help="who requested the pause; defaults to the acting role")
     sub.add_parser("resume")              # po/steward: undo pause, idempotent if not paused
     sub.add_parser("pause-status")        # any role: current pause state, read-only
 
@@ -184,8 +207,16 @@ def main(argv=None) -> int:
         if args.cmd == "pause":
             if not _need_role(role, ("po", "steward")):
                 return 2
+            mode = _pause_mode(args)
+            if mode is None:
+                return 2
+            reason = _text_arg(args.reason, args.reason_file).strip()
+            if not reason:
+                _err("pause needs a non-empty --reason or --reason-file")
+                return 2
+            actor = (args.actor or role or "").strip()
             from . import dispatcher
-            return _emit(dispatcher.pause(args.mode))
+            return _emit(dispatcher.pause(mode, reason=reason, actor=actor))
         if args.cmd == "resume":
             if not _need_role(role, ("po", "steward")):
                 return 2

@@ -633,6 +633,10 @@ def _task_md(card: dict, view: dict, base: str) -> str:
         f"Всегда (независимо от истории): force-push запрещён; пушь только в репозиторий своего "
         f"проекта и только в свою ветку `{branch}`.",
         "",
+        "Пауза пайплайна (`drain` или `freeze`) это админ-состояние всей очереди, не поломка "
+        "твоей карточки. Не репорти `blocked` только из-за паузы; после `resume` продолжай ту же "
+        "карточку в этом же воркспейсе.",
+        "",
     ]
     if is_contrib:
         lines += [
@@ -792,7 +796,8 @@ def tick() -> int:
     return 0
 
 
-def pause(requested_mode: str) -> dict:
+def pause(requested_mode: str, *, reason: str = pause_flag.DEFAULT_REASON,
+          actor: str = pause_flag.DEFAULT_ACTOR) -> dict:
     """Pause the pipeline (triggered-agents-281) — the built-in replacement for the 2026-07-04
     workaround: hand-moving Ready cards to Blocked, disabling ta-pipeline.timer, killing terminals
     by hand. `soft` stops new worker claims and steward/curator/retro dispatch (runtime/dispatch.py
@@ -810,20 +815,29 @@ def pause(requested_mode: str) -> dict:
     first, then pause in the new mode, so a mode switch is never a silent partial transition (a
     soft pause quietly upgraded to hard mid-call could stop a head whose card the caller still
     expects to be riding its cycle unattended)."""
-    if requested_mode not in pause_flag.MODES:
-        raise model.GuardError(f"unknown pause mode {requested_mode!r} (one of {pause_flag.MODES})")
+    mode = pause_flag.normalize_mode(requested_mode)
+    if mode not in pause_flag.MODES:
+        known = tuple(pause_flag.PUBLIC_MODES + pause_flag.MODES)
+        raise model.GuardError(f"unknown pause mode {requested_mode!r} (one of {known})")
+    reason = (reason or "").strip()
+    actor = (actor or "").strip()
+    if not reason:
+        raise model.GuardError("pause requires a non-empty reason")
+    if not actor:
+        raise model.GuardError("pause requires a non-empty actor")
     with _admin_lock():
         state = pause_flag.load()
         if state:
-            if state.get("mode") == requested_mode:
-                STATE.log_run("pause", mode=requested_mode, action="noop")
+            if state.get("mode") == mode:
+                STATE.log_run("pause", mode=mode, display_mode=pause_flag.display_mode(mode),
+                              action="noop", actor=actor, reason=worker.scrub_secrets(reason))
                 return pause_flag.status()
             raise model.GuardError(
-                f"pipeline already paused ({state.get('mode')}) — resume before pausing "
+                f"pipeline already paused ({state.get('mode')}), resume before pausing "
                 f"{requested_mode!r}")
         stopped_worker: list[str] = []
         stopped_reviewer: list[str] = []
-        if requested_mode == "hard":
+        if mode == "hard":
             records = _load_cards()
             by_ref = {c["reference"]: c for c in ops.list_cards()}
             for ref, rec in records.items():
@@ -836,9 +850,10 @@ def pause(requested_mode: str) -> dict:
                 if card["column"] == "Validate" and rec.get("review_ws"):
                     worker.stop_terminals(rec["review_ws"])
                     stopped_reviewer.append(ref)
-        pause_flag.save(requested_mode, stopped_worker=stopped_worker,
-                        stopped_reviewer=stopped_reviewer)
-        STATE.log_run("pause", mode=requested_mode, action="paused",
+        pause_flag.save(mode, stopped_worker=stopped_worker,
+                        stopped_reviewer=stopped_reviewer, reason=reason, actor=actor)
+        STATE.log_run("pause", mode=mode, display_mode=pause_flag.display_mode(mode),
+                      action="paused", actor=actor, reason=worker.scrub_secrets(reason),
                       stopped_worker=len(stopped_worker), stopped_reviewer=len(stopped_reviewer))
         return pause_flag.status()
 
