@@ -9,12 +9,11 @@ name = "steward"          # Orca automation name; the match key across re-provis
 skill = "/steward"        # automation prompt = skill invocation (skill lives in .claude/skills/steward)
 provider = "claude"
 reuse_session = true
-# heads.toml profile (triggered_agents/agents/pipeline/heads.toml): claude-fable, falling back to
-# claude-opus, then hermes-flash off-subscription (PR #38) — the 2026-07-04 design grill's pick for the
-# steward's own head (memory: "стюард присмотр пайплайн дизайн"). runtime/dispatch.py resolves
-# this through pipeline.health/heads the same way a worker/reviewer head is resolved at claim
-# time, so a red claude-sub still lands the steward on a live profile instead of a doomed launch.
-head = "claude-fable"
+# heads.toml profile (triggered_agents/agents/pipeline/heads.toml): codex-steward uses Codex
+# gpt-5.5 extra first, then falls back to the previous steward chain (claude-fable -> claude-opus
+# -> hermes). runtime/dispatch.py resolves this through pipeline.health/heads the same way a
+# worker/reviewer head is resolved at claim time.
+head = "codex-steward"
 # Skip the run unless the deterministic scan finds a real anomaly signal (new Blocked card,
 # warn/error/head-health-flip line in the pipeline's own runs.jsonl, a card stuck past the
 # staleness threshold, a resource health flip, a worker/reviewer workspace on disk with no

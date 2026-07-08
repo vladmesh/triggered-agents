@@ -13,6 +13,7 @@ Kanboard, no orca, no subprocess.
 from __future__ import annotations
 
 import os
+import shlex
 import tomllib
 from functools import lru_cache
 from pathlib import Path
@@ -29,9 +30,18 @@ HEADS_TOML = Path(__file__).with_name("heads.toml")
 # Env-overridable so an e2e can point at a throwaway home. health.probe_openai_sub imports this.
 CODEX_HOME = os.environ.get("TA_CODEX_HOME", "/home/dev/.codex-pipeline")
 
-# The profile a card/reviewer gets when it names no head at all — same role the bare `claude`
-# call with no --model played before this registry existed.
-DEFAULT_PROFILE = "claude-sonnet"
+# The profile a card gets when it names no head at all. New work defaults to Codex; legacy cards
+# with explicit claude-* metadata keep using that exact profile until a PO updates them.
+DEFAULT_PROFILE = "codex"
+
+CODEX_EFFORTS = {
+    "default": None,
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "extra": "xhigh",
+    "xhigh": "xhigh",
+}
 
 
 class HeadRegistryError(RuntimeError):
@@ -69,8 +79,12 @@ def _render_codex(profile: dict, *, prompt: str) -> str:
     home = profile.get("codex_home") or CODEX_HOME
     model = profile.get("model")
     model_flag = f" -m {model}" if model else ""
+    effort = CODEX_EFFORTS.get(profile.get("effort", "default"))
+    effort_flag = ""
+    if effort:
+        effort_flag = " -c " + shlex.quote(f'model_reasoning_effort="{effort}"')
     return (f"CODEX_HOME={home} codex exec --dangerously-bypass-approvals-and-sandbox "
-            f"--skip-git-repo-check{model_flag} {prompt!r}")
+            f"--skip-git-repo-check{model_flag}{effort_flag} {prompt!r}")
 
 
 ADAPTERS = {
@@ -107,6 +121,12 @@ def _validate(resources: dict, profiles: dict) -> None:
         if adapter not in ADAPTERS:
             raise HeadRegistryError(f"profile {pid!r} has unknown adapter {adapter!r} "
                                     f"(known: {', '.join(sorted(ADAPTERS))})")
+        if adapter == "codex":
+            effort = prof.get("effort", "default")
+            if effort not in CODEX_EFFORTS:
+                known = ", ".join(sorted(CODEX_EFFORTS))
+                raise HeadRegistryError(f"profile {pid!r} has unknown codex effort {effort!r} "
+                                        f"(known: {known})")
         for fb in prof.get("fallback") or []:
             if fb not in profiles:
                 raise HeadRegistryError(f"profile {pid!r} fallback references unknown profile {fb!r}")

@@ -39,12 +39,70 @@ probe = "python3 -m triggered_agents pipeline probe --resource openai-sub"
 
 [profiles.codex]
 # Native OpenAI Codex head (gpt-5.5), verified end to end 2026-07-08 (memory MCP + global AGENTS.md
-# reach the head). Standalone (fallback = []): a card names head=codex explicitly to run on it; a
-# red openai-sub then means claim-skip, same shape as claude-sonnet. Deliberately absent from the
-# claude/steward fallback chains — product policy stays Claude-only.
+# reach the head). This is the default-effort profile: no model_reasoning_effort override is passed,
+# so Codex uses its model default. Standalone fallback: a red openai-sub means claim-skip.
 resource = "openai-sub"
 adapter = "codex"
 model = "gpt-5.5"
+effort = "default"
+fallback = []
+
+[profiles.codex-high]
+# Same model, explicit high reasoning for harder implementation/debug cards.
+resource = "openai-sub"
+adapter = "codex"
+model = "gpt-5.5"
+effort = "high"
+fallback = []
+
+[profiles.codex-extra]
+# Same model, extra reasoning (Codex CLI value: xhigh) for pipeline/core/system changes.
+resource = "openai-sub"
+adapter = "codex"
+model = "gpt-5.5"
+effort = "extra"
+fallback = []
+
+[profiles.codex-reviewer]
+# Layer-3 reviewer: prefer Codex extra, keep the previous claude-opus reviewer as second priority.
+resource = "openai-sub"
+adapter = "codex"
+model = "gpt-5.5"
+effort = "extra"
+fallback = ["claude-opus"]
+
+[profiles.codex-curator]
+# Curator is critical memory infrastructure. Prefer Codex extra, then fall back to the same bare
+# Claude invocation it used before it had a head profile.
+resource = "openai-sub"
+adapter = "codex"
+model = "gpt-5.5"
+effort = "extra"
+fallback = ["claude-default"]
+
+[profiles.codex-steward]
+# Steward is the safety watcher. Prefer Codex extra, then keep the exact previous steward chain:
+# claude-fable -> claude-opus -> hermes.
+resource = "openai-sub"
+adapter = "codex"
+model = "gpt-5.5"
+effort = "extra"
+fallback = ["claude-fable"]
+
+[profiles.codex-retro]
+# Retro is reflective and less urgent than steward/curator: high effort is enough, with the old
+# bare Claude runtime as backup if the OpenAI subscription is red.
+resource = "openai-sub"
+adapter = "codex"
+model = "gpt-5.5"
+effort = "high"
+fallback = ["claude-default"]
+
+[profiles.claude-default]
+# The historical curator/retro launch shape before role agents got explicit head profiles:
+# bare `claude --dangerously-skip-permissions <skill>`, no --model flag.
+resource = "claude-sub"
+adapter = "claude"
 fallback = []
 
 [profiles.claude-sonnet]

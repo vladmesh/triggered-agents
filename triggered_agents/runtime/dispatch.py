@@ -1,9 +1,9 @@
 """Singleton terminal driver, shared by every triggered-agent.
 
-Replaces `orca automations run` in the systemd trigger. One agent = one warm claude terminal in
+Replaces `orca automations run` in the systemd trigger. One agent = one warm terminal in
 its worktree, reused across ticks. On a trigger (after precheck passes, under the run lock):
 
-  * no agent terminal          -> create one running `claude ... <skill>`
+  * no agent terminal          -> create one running the agent's resolved head profile
   * one idle agent terminal    -> `/clear` it and re-send <skill> (warm reuse, kills nothing)
   * ...unless its head is red  -> stop it, start a fresh one on the resolved fallback instead
   * it's busy and fresh        -> leave it working, dispatch nothing
@@ -221,9 +221,15 @@ def _ensure_claude_ready(ws: str) -> None:
 
 
 def _agent_terminals(ws: str) -> list[dict]:
-    """Live terminals in the workspace running a claude agent (title carries 'Claude')."""
+    """Live terminals in the workspace running this singleton agent.
+
+    New spawns get an explicit `triggered-agent:<name>` title. The legacy `Claude` match keeps
+    already-warm Claude terminals reusable until they are naturally restarted."""
     terms = _orca_json(["terminal", "list", "--worktree", f"path:{ws}", "--limit", "50"]).get("terminals", []) or []
-    return [t for t in terms if "Claude" in (t.get("title") or "")]
+    return [
+        t for t in terms
+        if (t.get("title") or "").startswith("triggered-agent:") or "Claude" in (t.get("title") or "")
+    ]
 
 
 def _is_idle(handle: str) -> bool:
@@ -292,7 +298,8 @@ def run(agent: str, variant: str | None = None) -> int:
         if not terms:
             skill, launch, profile = _dispatch_command(agent, variant)
             _ensure_claude_ready(ws)
-            _orca(["terminal", "create", "--worktree", f"path:{ws}", "--command", launch])
+            _orca(["terminal", "create", "--worktree", f"path:{ws}",
+                   "--title", f"triggered-agent:{agent}", "--command", launch])
             state.save_head_profile(profile)
             state.log_run(event, action="created")
             print(f"dispatch[{agent}]: no terminal — created fresh -> {skill}")
@@ -310,7 +317,8 @@ def run(agent: str, variant: str | None = None) -> int:
             time.sleep(1.0)
             skill, launch, profile = _dispatch_command(agent, variant)
             _ensure_claude_ready(ws)
-            _orca(["terminal", "create", "--worktree", f"path:{ws}", "--command", launch])
+            _orca(["terminal", "create", "--worktree", f"path:{ws}",
+                   "--title", f"triggered-agent:{agent}", "--command", launch])
             state.save_head_profile(profile)
             state.log_run(event, action="watchdog-restart")
             print(f"dispatch[{agent}]: busy but stuck ({int(quiet)}s silent) — watchdog restart -> {skill}")
@@ -327,7 +335,8 @@ def run(agent: str, variant: str | None = None) -> int:
             time.sleep(1.0)
             skill, launch, profile = _dispatch_command(agent, variant)
             _ensure_claude_ready(ws)
-            _orca(["terminal", "create", "--worktree", f"path:{ws}", "--command", launch])
+            _orca(["terminal", "create", "--worktree", f"path:{ws}",
+                   "--title", f"triggered-agent:{agent}", "--command", launch])
             state.save_head_profile(profile)
             state.log_run(event, action="reused-red-fallback")
             print(f"dispatch[{agent}]: idle terminal's head is red — stopped, fresh fallback terminal -> {skill}")
