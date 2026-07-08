@@ -136,9 +136,9 @@ def main() -> int:
         dispatcher.tick()
         check("card A claimed -> In progress", _column(ref_a) == model.IN_PROGRESS)
 
-        status = dispatcher.pause("soft")
-        check("pause(soft) reports paused/soft", status["paused"] and status["mode"] == "soft")
-        check("pause-status agrees", dispatcher.pause_status()["mode"] == "soft")
+        status = dispatcher.pause("drain", reason="e2e drain", actor="e2e")
+        check("pause(drain) reports paused/drain", status["paused"] and status["mode"] == "drain")
+        check("pause-status agrees", dispatcher.pause_status()["mode"] == "drain")
 
         ref_b = _create_ready_card("e2e-pause: soft new claim blocked")
         dispatcher.tick()
@@ -154,7 +154,7 @@ def main() -> int:
               _column(ref_a) == "Validate")
 
         dispatcher.resume()
-        check("resume clears the flag", dispatcher.pause_status() == {"paused": False})
+        check("resume clears the flag", dispatcher.pause_status()["paused"] is False)
         dispatcher.tick()
         check("after resume: previously-blocked card B now claimed",
               _column(ref_b) == model.IN_PROGRESS)
@@ -177,8 +177,9 @@ def main() -> int:
         check("card C's stub workspace exists on disk", Path(ws_c).is_dir())
         stopped_before = len(_stopped)
 
-        status = dispatcher.pause("hard")
-        check("pause(hard) reports paused/hard", status["paused"] and status["mode"] == "hard")
+        status = dispatcher.pause("freeze", reason="e2e freeze", actor="e2e")
+        check("pause(freeze) reports paused/freeze",
+              status["paused"] and status["mode"] == "freeze")
         check("hard pause stopped card C's terminal", _stopped[stopped_before:] == [ws_c])
         check("hard pause did NOT tear the workspace down", ws_c not in _torn_down)
         check("card C's workspace is still on disk, untouched", Path(ws_c).is_dir())
@@ -191,7 +192,7 @@ def main() -> int:
         check("hard pause: tick did nothing at all (frozen, no new launch)",
               _column(ref_c) == model.IN_PROGRESS and _launched[launched_before:] == [])
         dispatcher.resume()
-        check("resume clears the flag", dispatcher.pause_status() == {"paused": False})
+        check("resume clears the flag", dispatcher.pause_status()["paused"] is False)
         new_launches = _launched[launched_before:]
         check("resume relaunched exactly card C's worker",
               len(new_launches) == 1 and new_launches[0]["ws"] == ws_c
