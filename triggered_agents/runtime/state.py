@@ -33,6 +33,7 @@ class AgentState:
         self.pending_file = self.dir / "pending.json"
         self.lockfile = self.dir / "lock"
         self.head_profile_file = self.dir / "head_profile.json"
+        self.terminal_handle_file = self.dir / "terminal_handle.json"
 
     def ensure_dir(self) -> None:
         self.dir.mkdir(parents=True, exist_ok=True)
@@ -72,6 +73,31 @@ class AgentState:
         tmp = self.head_profile_file.with_suffix(".json.tmp")
         tmp.write_text(json.dumps({"profile": profile}, ensure_ascii=False), encoding="utf-8")
         tmp.replace(self.head_profile_file)
+
+    def load_terminal_handle(self) -> str | None:
+        """The Orca terminal handle last created for this singleton agent."""
+        if not self.terminal_handle_file.is_file():
+            return None
+        try:
+            return json.loads(self.terminal_handle_file.read_text(encoding="utf-8")).get("handle")
+        except json.JSONDecodeError:
+            return None
+
+    def save_terminal_handle(self, handle: str | None) -> None:
+        """Record the terminal handle from the latest fresh spawn.
+
+        Codex can rename its tab away from the explicit `triggered-agent:<name>` title after
+        startup, so title matching alone is not stable enough for singleton reuse."""
+        self.ensure_dir()
+        if not handle:
+            try:
+                self.terminal_handle_file.unlink()
+            except FileNotFoundError:
+                pass
+            return
+        tmp = self.terminal_handle_file.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps({"handle": handle}, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(self.terminal_handle_file)
 
     def log_run(self, event: str, **fields) -> None:
         """Append a run-telemetry line to runs.jsonl. Best-effort: a logging failure
