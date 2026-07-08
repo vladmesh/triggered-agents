@@ -1,5 +1,5 @@
 """Unit tests for triggered_agents.agents.pipeline.health — TTL-cached resource probes, claim-time
-fallback selection, and the two real (mocked-at-the-boundary) probes for claude-sub/openrouter.
+fallback selection, and the real (mocked-at-the-boundary) resource probes.
 
 Not to be confused with tests/test_health.py (runtime/health.py's unrelated per-agent liveness
 check). No network, no orca, no real `claude`/OpenRouter calls: subprocess.run and
@@ -43,16 +43,27 @@ class RefreshTtlTest(unittest.TestCase):
             return []
         return [json.loads(line) for line in path.read_text().splitlines()]
 
+    def _head_events(self):
+        return [r for r in self._runs() if r["event"] == "head-health"]
+
     def test_first_probe_sets_status_without_logging_a_transition(self):
         reg = _registry({"r1": {"probe": "true"}})
         statuses = health.refresh(reg)
         self.assertEqual(statuses, {"r1": "green"})
-        self.assertFalse(any(r["event"] == "head-health" for r in self._runs()))
+        self.assertFalse(self._head_events())
 
     def test_red_probe_sets_red_status(self):
         reg = _registry({"r1": {"probe": "false"}})
         statuses = health.refresh(reg)
         self.assertEqual(statuses, {"r1": "red"})
+        events = self._head_events()
+        self.assertEqual(len(events), 1)
+        self.assertIsNone(events[0]["from"])
+        self.assertEqual(events[0]["to"], "red")
+        self.assertEqual(events[0]["reason"]["resource"], "r1")
+        self.assertEqual(events[0]["reason"]["probe_class"], "shell-command")
+        self.assertEqual(events[0]["reason"]["command"], "false")
+        self.assertEqual(events[0]["reason"]["exit_code"], 1)
 
     def test_cache_reused_within_ttl_no_reprobe(self):
         calls = []
@@ -88,11 +99,12 @@ class RefreshTtlTest(unittest.TestCase):
                 health.refresh(reg)
             with mock.patch.object(health, "_run_probe_cmd", return_value=False):
                 health.refresh(reg)
-        events = [r for r in self._runs() if r["event"] == "head-health"]
+        events = self._head_events()
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0]["resource"], "r1")
         self.assertEqual(events[0]["from"], "green")
         self.assertEqual(events[0]["to"], "red")
+        self.assertEqual(events[0]["reason"]["status"], "probe-failed")
 
     def test_same_status_reprobe_does_not_log_again(self):
         reg = _registry({"r1": {"probe": "true"}})
@@ -101,8 +113,7 @@ class RefreshTtlTest(unittest.TestCase):
             health.refresh(reg)
             health.refresh(reg)
             health.refresh(reg)
-        events = [r for r in self._runs() if r["event"] == "head-health"]
-        self.assertFalse(events)
+        self.assertFalse(self._head_events())
 
     def test_independent_redness_across_two_resources(self):
         # The health mechanic must not be implicitly keyed to a single resource id — claude red,
@@ -121,6 +132,82 @@ class RefreshTtlTest(unittest.TestCase):
         with mock.patch.object(health, "PROBE_TIMEOUT_S", 0.01):
             statuses = health.refresh(reg)
         self.assertEqual(statuses, {"r1": "red"})
+
+    def test_nonzero_exit_logs_scrubbed_limited_reason(self):
+        secret = "sk-proj-" + "A" * 40
+        proc = subprocess.CompletedProcess(
+            "fake probe", 7, stdout="useful stdout", stderr=f"failed with {secret}")
+        reg = _registry({"r1": {"probe": "fake probe"}})
+        with mock.patch.object(health.subprocess, "run", return_value=proc):
+            statuses = health.refresh(reg)
+        self.assertEqual(statuses, {"r1": "red"})
+        reason = self._head_events()[0]["reason"]
+        self.assertEqual(reason["status"], "non-zero-exit")
+        self.assertEqual(reason["exit_code"], 7)
+        self.assertEqual(reason["stdout"], "useful stdout")
+        self.assertNotIn(secret, json.dumps(reason, ensure_ascii=False))
+        self.assertIn("REDACTED", reason["stderr"])
+
+    def test_probe_command_is_scrubbed_and_limited_in_reason_and_cli_text(self):
+        secret = "sk-proj-" + "B" * 40
+        command = f"fake probe --token {secret} --payload {'x' * 80}"
+        proc = subprocess.CompletedProcess(command, 7, stdout="useful stdout", stderr="failed")
+        reg = _registry({"r1": {"probe": command}})
+        with mock.patch.object(health, "PROBE_REASON_TEXT_LIMIT", 70), \
+             mock.patch.object(health.subprocess, "run", return_value=proc):
+            statuses = health.refresh(reg)
+            cli_text = health.format_probe_failure(
+                "r1", health.ProbeResult(False, "shell-command", command=command,
+                                         status="non-zero-exit", exit_code=7))
+        self.assertEqual(statuses, {"r1": "red"})
+        reason = self._head_events()[0]["reason"]
+        self.assertNotIn(secret, json.dumps(reason, ensure_ascii=False))
+        self.assertIn("REDACTED", reason["command"])
+        self.assertIn("...[truncated]", reason["command"])
+        self.assertNotIn("x" * 80, reason["command"])
+        self.assertNotIn(secret, cli_text)
+        self.assertIn("REDACTED", cli_text)
+        self.assertIn("...[truncated]", cli_text)
+
+    def test_timeout_logs_reason(self):
+        timeout = subprocess.TimeoutExpired(
+            "fake probe", 0.01, output="partial stdout", stderr="partial stderr")
+        reg = _registry({"r1": {"probe": "fake probe"}})
+        with mock.patch.object(health.subprocess, "run", side_effect=timeout):
+            statuses = health.refresh(reg)
+        self.assertEqual(statuses, {"r1": "red"})
+        reason = self._head_events()[0]["reason"]
+        self.assertEqual(reason["status"], "timeout")
+        self.assertEqual(reason["timeout_s"], 0.01)
+        self.assertEqual(reason["stdout"], "partial stdout")
+        self.assertEqual(reason["stderr"], "partial stderr")
+
+    def test_exception_logs_reason(self):
+        reg = _registry({"r1": {"probe": "fake probe"}})
+        with mock.patch.object(health.subprocess, "run", side_effect=OSError("no route")):
+            statuses = health.refresh(reg)
+        self.assertEqual(statuses, {"r1": "red"})
+        reason = self._head_events()[0]["reason"]
+        self.assertEqual(reason["status"], "exception")
+        self.assertIn("OSError: no route", reason["exception"])
+
+    def test_red_confirmation_logs_only_new_reason_after_ttl(self):
+        reg = _registry({"r1": {"probe": "fake probe"}})
+        first = subprocess.CompletedProcess("fake probe", 1, stderr="same reason")
+        second = subprocess.CompletedProcess("fake probe", 1, stderr="same reason")
+        changed = subprocess.CompletedProcess("fake probe", 1, stderr="new reason")
+        with mock.patch.object(health, "PROBE_TTL_S", 0), \
+             mock.patch.object(health.subprocess, "run", side_effect=[first, second, changed]):
+            health.refresh(reg)
+            health.refresh(reg)
+            health.refresh(reg)
+        events = self._head_events()
+        self.assertEqual(len(events), 2)
+        self.assertNotIn("confirmed", events[0])
+        self.assertTrue(events[1]["confirmed"])
+        self.assertEqual(events[1]["from"], "red")
+        self.assertEqual(events[1]["to"], "red")
+        self.assertEqual(events[1]["reason"]["stderr"], "new reason")
 
 
 class ResolveHeadTest(unittest.TestCase):
@@ -297,6 +384,16 @@ class ProbeClaudeSubTest(unittest.TestCase):
                                return_value=subprocess.CompletedProcess([], 1)):
             self.assertFalse(health.probe_claude_sub())
 
+    def test_nonzero_exit_result_has_diagnostics(self):
+        with mock.patch.object(health.subprocess, "run",
+                               return_value=subprocess.CompletedProcess([], 17, stderr="rate limit")):
+            result = health.probe_claude_sub_result()
+        self.assertFalse(result.ok)
+        self.assertEqual(result.probe_class, "builtin:claude-sub")
+        self.assertEqual(result.status, "non-zero-exit")
+        self.assertEqual(result.exit_code, 17)
+        self.assertEqual(result.stderr, "rate limit")
+
     def test_timeout_is_red(self):
         with mock.patch.object(health.subprocess, "run",
                                side_effect=subprocess.TimeoutExpired("claude", 20)):
@@ -340,10 +437,45 @@ class ProbeOpenrouterTest(unittest.TestCase):
         with mock.patch.object(health.urllib.request, "urlopen", side_effect=OSError("no route")):
             self.assertFalse(health.probe_openrouter())
 
+    def test_transport_error_result_has_diagnostics(self):
+        with mock.patch.object(health.urllib.request, "urlopen", side_effect=OSError("no route")):
+            result = health.probe_openrouter_result()
+        self.assertFalse(result.ok)
+        self.assertEqual(result.probe_class, "builtin:openrouter")
+        self.assertEqual(result.status, "transport-error")
+        self.assertIn("OSError: no route", result.exception)
+
+
+class ProbeOpenaiSubTest(unittest.TestCase):
+    """The real openai-sub probe: one `codex exec` through the pipeline CODEX_HOME, mocked at
+    subprocess.run so this never spends a real token or needs live credentials."""
+
+    def test_exit_zero_is_green(self):
+        with mock.patch.object(health.subprocess, "run",
+                               return_value=subprocess.CompletedProcess([], 0)):
+            self.assertTrue(health.probe_openai_sub())
+
+    def test_nonzero_exit_is_red(self):
+        with mock.patch.object(health.subprocess, "run",
+                               return_value=subprocess.CompletedProcess([], 2)):
+            self.assertFalse(health.probe_openai_sub())
+
+    def test_timeout_result_has_diagnostics(self):
+        timeout = subprocess.TimeoutExpired("codex", 20, output="partial", stderr="slow")
+        with mock.patch.object(health.subprocess, "run", side_effect=timeout):
+            result = health.probe_openai_sub_result()
+        self.assertFalse(result.ok)
+        self.assertEqual(result.probe_class, "builtin:openai-sub")
+        self.assertEqual(result.status, "timeout")
+        self.assertEqual(result.timeout_s, 20.0)
+        self.assertIn("CODEX_HOME=", result.command)
+        self.assertIn("codex exec", result.command)
+
 
 class RunBuiltinProbeTest(unittest.TestCase):
     def test_known_resource_dispatches(self):
-        with mock.patch.object(health, "BUILTIN_PROBES", {"r1": lambda: True}):
+        result = health.ProbeResult(True, "builtin:r1")
+        with mock.patch.object(health, "BUILTIN_PROBE_RESULTS", {"r1": lambda: result}):
             self.assertTrue(health.run_builtin_probe("r1"))
 
     def test_unknown_resource_raises_key_error(self):
@@ -356,6 +488,8 @@ class RunBuiltinProbeTest(unittest.TestCase):
         # class of bug) would KeyError at claim time instead of returning red/green.
         for rid in heads.load_registry().resources:
             self.assertIn(rid, health.BUILTIN_PROBES, f"resource {rid!r} has no builtin probe")
+            self.assertIn(rid, health.BUILTIN_PROBE_RESULTS,
+                          f"resource {rid!r} has no diagnostic builtin probe")
 
 
 if __name__ == "__main__":

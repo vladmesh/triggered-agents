@@ -197,12 +197,14 @@ def main(argv=None) -> int:
         if args.cmd == "probe":
             from . import health
             try:
-                ok = health.run_builtin_probe(args.resource)
+                result = health.run_builtin_probe_result(args.resource)
             except KeyError:
                 _err(f"no builtin probe for resource {args.resource!r} "
                     f"(known: {', '.join(sorted(health.BUILTIN_PROBES))})")
                 return 2
-            return 0 if ok else 1
+            if not result.ok:
+                _err(health.format_probe_failure(args.resource, result))
+            return 0 if result.ok else 1
         if args.cmd == "list":
             return _emit(ops.list_cards(column=args.column, project=args.project))
         if args.cmd == "show":
