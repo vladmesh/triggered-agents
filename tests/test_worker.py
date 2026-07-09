@@ -642,6 +642,52 @@ class TerminalLiveTest(unittest.TestCase):
             self.assertTrue(worker.terminal_live("term-tui", "/ws/fresh", "codex-tui"))
         self.assertTrue(any(c[:2] == ["terminal", "read"] for c in calls))
 
+    def test_codex_tui_expected_kind_rejects_codex_help_shell_output(self):
+        calls = []
+
+        def fake_orca_json(args):
+            calls.append(args)
+            if args[:2] == ["terminal", "list"]:
+                return {"terminals": [{
+                    "handle": "term-shell",
+                    "connected": True,
+                    "writable": True,
+                    "preview": "watch 'codex --help'\nOpenAI Codex",
+                }]}
+            if args[:2] == ["terminal", "read"]:
+                return {"terminal": {"tail": [
+                    "watch 'codex --help'",
+                    "OpenAI Codex",
+                    "Usage: codex [OPTIONS]",
+                ]}}
+            return {}
+
+        with mock.patch.object(worker, "_orca_json", fake_orca_json):
+            self.assertEqual(worker.terminal_status("term-shell", "/ws/fresh", "codex-tui"),
+                             {"known": True, "live": False, "reason": "not-codex-tui"})
+        self.assertTrue(any(c[:2] == ["terminal", "read"] for c in calls))
+
+    def test_codex_tui_expected_kind_rejects_shell_text_with_tui_words_without_frame(self):
+        def fake_orca_json(args):
+            if args[:2] == ["terminal", "list"]:
+                return {"terminals": [{
+                    "handle": "term-shell",
+                    "connected": True,
+                    "writable": True,
+                    "preview": "OpenAI Codex\nmodel: gpt-5.5 xhigh\npermissions: YOLO mode",
+                }]}
+            if args[:2] == ["terminal", "read"]:
+                return {"terminal": {"tail": [
+                    "OpenAI Codex",
+                    "model: gpt-5.5 xhigh",
+                    "permissions: YOLO mode",
+                ]}}
+            return {}
+
+        with mock.patch.object(worker, "_orca_json", fake_orca_json):
+            self.assertEqual(worker.terminal_status("term-shell", "/ws/fresh", "codex-tui"),
+                             {"known": True, "live": False, "reason": "not-codex-tui"})
+
     def test_codex_tui_expected_kind_rejects_long_running_shell(self):
         def fake_orca_json(args):
             if args[:2] == ["terminal", "list"]:

@@ -20,7 +20,7 @@ import tomllib
 from pathlib import Path
 
 from ...runtime import claude_env, redact
-from . import heads, stand
+from . import heads, stand, terminal_session
 from .state import STATE
 
 ORCA = os.environ.get("ORCA_BIN") or shutil.which("orca") or str(Path.home() / ".local/bin/orca")
@@ -55,15 +55,6 @@ class WorkspaceError(RuntimeError):
 _ASSIGN_RE = re.compile(r"(?i)\b([A-Z0-9_]*(?:TOKEN|KEY|SECRET|PASSWORD|PASSWD)[A-Z0-9_]*)\s*=\s*\S+")
 _BLOB_RE = re.compile(r"\b[A-Za-z0-9+=_-]{40,}\b")
 _HEX_RE = re.compile(r"^[0-9a-fA-F]{7,40}$")
-_ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
-_SHELL_PROMPT_RE = re.compile(
-    r"(?:^|\n)\s*(?:\([^)\n]+\)\s*)?(?:[\w.-]+@[\w.-]+:\s*)?"
-    r"(?:~|/|[A-Za-z]:\\)[^\n]{0,240}[$#%]\s*$"
-)
-_CODEX_TUI_MODEL_RE = re.compile(
-    r"(?:gpt|o\d|codex)[A-Za-z0-9_.-]*(?:\s+(?:default|low|medium|high|xhigh))?"
-    r"\s+\u00b7\s+(?:~|/|[A-Za-z]:\\)"
-)
 
 
 def _is_git_sha(blob: str) -> bool:
@@ -390,58 +381,26 @@ def workspace_exists(project: str, name: str) -> bool:
 
 
 def _terminal_entry_dead_reason(term: dict) -> str | None:
-    if term.get("connected") is False:
-        return "disconnected"
-    if term.get("writable") is False:
-        return "unwritable"
-    preview = _ANSI_RE.sub("", str(term.get("preview") or "")).strip()
-    if preview and _SHELL_PROMPT_RE.search(preview):
-        return "shell-prompt"
-    return None
+    return terminal_session.entry_dead_reason(term)
 
 
 def _terminal_entry_live(term: dict) -> bool:
-    return _terminal_entry_dead_reason(term) is None
-
-
-def _terminal_entry_text(term: dict) -> str:
-    parts = []
-    for key in ("title", "preview"):
-        value = term.get(key)
-        if value:
-            parts.append(str(value))
-    return _ANSI_RE.sub("", "\n".join(parts))
-
-
-def _looks_like_codex_tui(text: str) -> bool:
-    text = _ANSI_RE.sub("", text or "")
-    if "OpenAI Codex" in text:
-        return True
-    if "permissions: YOLO mode" in text and "model:" in text:
-        return True
-    return bool("\u203a" in text and _CODEX_TUI_MODEL_RE.search(text))
+    return terminal_session.entry_live(term)
 
 
 def _read_terminal_text(handle: str) -> str:
-    data = _orca_json(["terminal", "read", "--terminal", handle, "--limit", "120"])
-    term = data.get("terminal", data)
-    return _ANSI_RE.sub("", "\n".join(str(line) for line in (term.get("tail") or [])))
+    return terminal_session.read_terminal_text(handle, _orca_json)
 
 
 def _terminal_expected_kind_dead_reason(term: dict, expected_kind: str | None, handle: str,
-                                        read_terminal_text=_read_terminal_text) -> str | None:
-    if not expected_kind:
-        return None
-    if expected_kind != "codex-tui":
-        return "unknown-terminal-kind"
-    if _looks_like_codex_tui(_terminal_entry_text(term)):
-        return None
-    try:
-        if handle and _looks_like_codex_tui(read_terminal_text(handle)):
-            return None
-    except (WorkspaceError, subprocess.TimeoutExpired):
-        pass
-    return "not-codex-tui"
+                                        read_terminal_text=None) -> str | None:
+    return terminal_session.expected_kind_dead_reason(
+        term,
+        expected_kind,
+        handle,
+        read_terminal_text=read_terminal_text or _read_terminal_text,
+        unavailable_errors=(WorkspaceError, subprocess.TimeoutExpired),
+    )
 
 
 def terminal_status(handle: str, workspace: str | None = None,
@@ -462,86 +421,29 @@ def terminal_status(handle: str, workspace: str | None = None,
     `known=false` means Orca itself could not be queried. Callers should keep their ordinary
     watchdog path for that case instead of treating a transport failure as proof that the tracked
     terminal died."""
-    if not handle:
-        return {"known": True, "live": False, "reason": "missing-handle"}
-    args = ["terminal", "list", "--limit", "50"]
-    if workspace:
-        args.extend(["--worktree", f"path:{workspace}"])
-    try:
-        data = _orca_json(args)
-    except (WorkspaceError, subprocess.TimeoutExpired):
-        return {"known": False, "live": False, "reason": "terminal-list-unavailable"}
-    for t in data.get("terminals") or []:
-        if (t.get("handle") or t.get("id")) != handle:
-            continue
-        if workspace and not _terminal_belongs_to_workspace(t, workspace):
-            return {"known": True, "live": False, "reason": "wrong-workspace"}
-        reason = _terminal_entry_dead_reason(t)
-        if reason:
-            return {"known": True, "live": False, "reason": reason}
-        reason = _terminal_expected_kind_dead_reason(t, expected_kind, handle)
-        if reason:
-            return {"known": True, "live": False, "reason": reason}
-        last = t.get("lastOutputAt")
-        last_activity = None
-        if last:
-            try:
-                last_activity = float(last) / 1000.0
-            except (TypeError, ValueError):
-                last_activity = None
-        return {"known": True, "live": True, "reason": "live", "last_activity": last_activity}
-    return {"known": True, "live": False, "reason": "missing-terminal"}
+    return terminal_session.terminal_status(
+        handle,
+        workspace,
+        expected_kind,
+        orca_json=_orca_json,
+        unavailable_errors=(WorkspaceError, subprocess.TimeoutExpired),
+    )
 
 
 def terminal_live(handle: str, workspace: str | None = None,
                   expected_kind: str | None = None) -> bool:
     """Whether `handle` is a live Orca terminal, optionally scoped to `workspace`."""
-    return bool(terminal_status(handle, workspace, expected_kind).get("live"))
+    return terminal_session.terminal_live(
+        handle,
+        workspace,
+        expected_kind,
+        orca_json=_orca_json,
+        unavailable_errors=(WorkspaceError, subprocess.TimeoutExpired),
+    )
 
 
 def _terminal_belongs_to_workspace(term: dict, workspace: str) -> bool:
-    """Best-effort guard for terminal entries that carry an explicit worktree path.
-
-    `terminal list --worktree path:<workspace>` is the primary scoping. Some Orca responses also
-    include the worktree in the entry; when they do, require it to match the workspace the
-    dispatcher is tracking. Older responses without that field are accepted because the list call
-    already scoped them."""
-    candidates = []
-
-    def add_candidate(value, explicit_path: bool = False) -> None:
-        if isinstance(value, dict):
-            candidates.extend(value.get(k) for k in ("path", "root", "worktreePath", "workspacePath"))
-            return
-        if not value:
-            return
-        text = str(value)
-        path_like = (
-            explicit_path
-            or text.startswith(("path:", "~", "/"))
-            or "::" in text
-            or bool(re.match(r"^[A-Za-z]:\\", text))
-        )
-        if path_like:
-            candidates.append(value)
-
-    for key in ("worktreePath", "workspacePath"):
-        add_candidate(term.get(key), explicit_path=True)
-    for key in ("worktree", "workspace"):
-        add_candidate(term.get(key))
-    candidates = [c for c in candidates if c]
-    if not candidates:
-        return True
-
-    def norm(value) -> str:
-        text = str(value)
-        if "::" in text:
-            text = text.split("::", 1)[-1]
-        if text.startswith("path:"):
-            text = text[len("path:"):]
-        return os.path.abspath(os.path.expanduser(text))
-
-    want = norm(workspace)
-    return any(norm(c) == want for c in candidates)
+    return terminal_session.belongs_to_workspace(term, workspace)
 
 
 def terminal_activity(handle: str, workspace: str) -> float | None:

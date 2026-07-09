@@ -1568,6 +1568,31 @@ class ValidateTest(_DispatcherBase):
         self.assertEqual(self.worker.notified[-1][0], rec_after["handle"])
         self.assertNotIn(old_handle, [handle for handle, _ in self.worker.notified])
 
+    def test_red_ci_relaunches_codex_tui_codex_help_shell_handle(self):
+        self.worker.unique_launch_handles = True
+        ref = self._to_validate(head="codex-tui")
+        rec_before = dispatcher._load_cards()[ref]
+        old_handle = rec_before["handle"]
+        self.assertEqual(rec_before["terminal_kind"], "codex-tui")
+        self.worker.terminal_entries[old_handle] = {
+            "handle": old_handle,
+            "connected": True,
+            "writable": True,
+            "preview": "watch 'codex --help'\nOpenAI Codex",
+        }
+        self.worker.pr_status = {
+            "merged": False, "state": "OPEN", "rollup": "FAILURE",
+            "failed_job": "CI", "failed_log": "boom",
+        }
+
+        dispatcher.tick()
+
+        rec_after = dispatcher._load_cards()[ref]
+        self.assertEqual(rec_after["terminal_kind"], "codex-tui")
+        self.assertNotEqual(rec_after["handle"], old_handle)
+        self.assertEqual(self.worker.notified[-1][0], rec_after["handle"])
+        self.assertNotIn(old_handle, [handle for handle, _ in self.worker.notified])
+
     def test_red_ci_move_failure_does_not_nudge_live_worker(self):
         ref = self._to_validate()
         rec_before = dispatcher._load_cards()[ref]
