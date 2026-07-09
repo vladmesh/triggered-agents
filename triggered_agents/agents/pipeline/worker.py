@@ -379,6 +379,29 @@ def workspace_exists(project: str, name: str) -> bool:
     return Path(workspace_path(project, name)).is_dir()
 
 
+def terminal_live(handle: str, workspace: str | None = None) -> bool:
+    """Whether `handle` is a live Orca terminal, optionally scoped to `workspace`.
+
+    `terminal send` has a dangerous degraded mode for this pipeline: an old handle that no longer
+    names a live head can leave the nudge landing somewhere else in the worktree, commonly a
+    plain shell. Listing live terminals first makes an exited/ghost/missing handle a clean false,
+    so the caller can relaunch instead of probing by sending the rework prompt."""
+    if not handle:
+        return False
+    args = ["terminal", "list", "--limit", "50"]
+    if workspace:
+        args.extend(["--worktree", f"path:{workspace}"])
+    try:
+        data = _orca_json(args)
+    except (WorkspaceError, subprocess.TimeoutExpired):
+        return False
+    for t in data.get("terminals") or []:
+        if (t.get("handle") or t.get("id")) != handle:
+            continue
+        return t.get("connected") is not False and t.get("writable") is not False
+    return False
+
+
 def rename_terminal(handle: str, title: str) -> bool:
     """Best-effort: (re)apply a human-readable title to `handle`'s tab. Claude Code's own
     session dynamically rewrites its tab title once it starts working (spinner + an inferred

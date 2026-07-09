@@ -47,9 +47,12 @@ from __future__ import annotations
 import os
 import re
 import time
+from collections.abc import Callable
 
 from . import health, model, naming, ops, reviewer, worker
 from .state import STATE
+
+RefreshWorkerTask = Callable[[dict, dict], None]
 
 # Layer-3 rework cap: a card may be returned by red reviewer verdicts at most this many times over
 # its life. The next red after that goes to Blocked до vladmesh with the full verdict on the card.
@@ -137,20 +140,80 @@ def _count_marker(view: dict, marker: str) -> int:
     return sum(1 for c in view["comments"] if f"[{marker}]" in c.get("text", ""))
 
 
-def _ensure_worker_alive(rec: dict) -> None:
-    """Relaunch the worker head in its own (never-torn-down) workspace if it was left parked with
-    no live terminal — `rec["handle"]` cleared, the mark dispatcher.resume() leaves on a hard-pause
-    Validate card instead of eagerly relaunching it (triggered-agents-281 review, blocker B1: an
-    eager relaunch there could start a fresh worker turn, pushing commits under a reviewer that may
-    still be reviewing this exact branch). A CI-red or review-red return to In progress is the one
-    moment that parked worker is actually needed again, so this is called right there, lazily —
-    never on resume itself. A no-op when the handle is already live (the ordinary case, no pause
-    ever involved) or there is no workspace to relaunch into at all."""
-    if rec.get("handle") or not rec.get("workspace"):
-        return
-    rec["handle"] = worker.launch_worker(rec["workspace"], rec.get("head"),
-                                         rec.get("worker", ""), rec.get("title") or "")
+def _worker_title(card: dict, rec: dict) -> str:
+    return rec.get("title") or naming.worker_title(naming.card_id(card["reference"]),
+                                                   card.get("title") or card["reference"])
+
+
+def _worker_head(card: dict, rec: dict) -> str | None:
+    return rec.get("head") or card.get("head")
+
+
+def _relaunch_worker_for_rework(ref: str, card: dict, rec: dict, records: dict, save_cards,
+                                refresh_worker_task: RefreshWorkerTask | None,
+                                reason: str) -> str | None:
+    """Start a fresh worker terminal in the existing workspace for a rework return.
+
+    The workspace and branch stay exactly where the original worker left them. Before the new head
+    starts, TASK.md is rewritten from the card's current journal so a red CI/review verdict posted
+    milliseconds earlier is part of the prompt the relaunched worker reads."""
+    workspace = rec.get("workspace")
+    if not workspace:
+        raise RuntimeError("worker workspace is missing")
+    old_handle = rec.get("handle") or ""
+    if refresh_worker_task is not None:
+        refresh_worker_task(card, rec)
+    rec["title"] = _worker_title(card, rec)
+    rec["head"] = _worker_head(card, rec)
+    handle = worker.launch_worker(workspace, rec.get("head"), rec.get("worker", ""),
+                                  rec["title"])
+    if not handle:
+        raise RuntimeError("worker launch returned no handle")
+    rec["handle"] = handle
     rec["last_activity"] = time.time()
+    save_cards(records)
+    STATE.log_run("rework-worker", reference=ref, result="relaunched", reason=reason,
+                  old_handle=old_handle, new_handle=rec["handle"])
+    return rec["handle"]
+
+
+def _notify_worker_for_rework(ref: str, card: dict, rec: dict, records: dict, save_cards,
+                              refresh_worker_task: RefreshWorkerTask | None,
+                              message: str, reason: str) -> None:
+    """Nudge the tracked worker, relaunching first when the saved terminal is not usable."""
+    handle = rec.get("handle") or ""
+    workspace = rec.get("workspace")
+    if handle and worker.terminal_live(handle, workspace) and worker.notify(handle, message):
+        return
+    handle = _relaunch_worker_for_rework(ref, card, rec, records, save_cards, refresh_worker_task,
+                                         reason)
+    if handle:
+        worker.notify(handle, message)
+
+
+def _block_rework_worker_failure(ref: str, rec: dict, records: dict,
+                                 reason: str, exc: Exception) -> None:
+    """After a Validate -> In progress return, failure to refresh/relaunch is terminal.
+
+    At this point the board move already succeeded, so leaving the old dead handle in cards.json
+    would make the pipeline treat the card as working. Escalate instead and stop any terminal that
+    might have been created before the failure surfaced."""
+    scrubbed = worker.scrub_secrets(str(exc))
+    workspace = rec.get("workspace")
+    if workspace:
+        try:
+            worker.stop_terminals(workspace)
+        except Exception as stop_exc:  # noqa: BLE001, escalation must not be masked by cleanup
+            STATE.log_run("rework-worker", reference=ref, result="stop-failed", level="warn",
+                          reason=reason, error=worker.scrub_secrets(str(stop_exc)))
+    ws_note = f"Воркспейс {workspace} оставлен для разбора." if workspace else "Воркспейс неизвестен."
+    ops.add_comment("dispatcher", ref,
+                    f"Не удалось вернуть карточку в работу после {reason}: worker head не поднят "
+                    f"или TASK.md не обновлён: {scrubbed}. Карточка в Blocked до vladmesh. "
+                    f"{ws_note}")
+    ops.move_card("dispatcher", ref, "Blocked")
+    records.pop(ref, None)
+    STATE.log_run("rework-worker", reference=ref, to="Blocked", reason=reason, error=scrubbed)
 
 
 def _stand_gate(ref: str, pr: str, card: dict, cfg: dict, records: dict, view: dict) -> bool:
@@ -206,7 +269,8 @@ def _stand_gate(ref: str, pr: str, card: dict, cfg: dict, records: dict, view: d
     return rec is not None
 
 
-def run(records: dict, watchdog_seconds: int, save_cards, statuses: dict[str, str]) -> bool:
+def run(records: dict, watchdog_seconds: int, save_cards, statuses: dict[str, str],
+        refresh_worker_task: RefreshWorkerTask | None = None) -> bool:
     """Drive each Validate card (zero LLM below layer 3). `statuses` is this tick's resource health
     from health.refresh, threaded through to _review_watchdog to freeze the layer-3 reviewer's
     clock the same way dispatcher._advance freezes the worker's (see _review_watchdog). The
@@ -237,14 +301,16 @@ def run(records: dict, watchdog_seconds: int, save_cards, statuses: dict[str, st
     changed = False
     for card in ops.list_cards(column="Validate"):
         try:
-            changed = _validate_card(card, records, watchdog_seconds, save_cards, statuses) or changed
+            changed = _validate_card(card, records, watchdog_seconds, save_cards, statuses,
+                                     refresh_worker_task) or changed
         except Exception as e:  # noqa: BLE001 — one bad card must not abort the whole tick
             _validate_error(card["reference"], e)
     return changed
 
 
 def _validate_card(card: dict, records: dict, watchdog_seconds: int, save_cards,
-                   statuses: dict[str, str]) -> bool:
+                   statuses: dict[str, str],
+                   refresh_worker_task: RefreshWorkerTask | None = None) -> bool:
     """Drive one Validate card by its PR (and, for stand projects, the stand). Returns whether
     `records` changed. Raises only on an unexpected failure, which run() localizes.
 
@@ -255,7 +321,7 @@ def _validate_card(card: dict, records: dict, watchdog_seconds: int, save_cards,
     view = ops.show_card(ref)
     if worker.is_contrib(card.get("project") or ""):
         return _validate_contrib_card(ref, card, rec, records, view, watchdog_seconds, save_cards,
-                                      statuses)
+                                      statuses, refresh_worker_task)
     pr = _pr_url(view)
     if not pr:
         return _validate_stall(ref, "no-pr-ref", rec, records)
@@ -302,17 +368,23 @@ def _validate_card(card: dict, records: dict, watchdog_seconds: int, save_cards,
         ops.move_card("dispatcher", ref, model.IN_PROGRESS)
         if rec is not None:
             # Baseline past the red comment so the stale done report isn't re-read as a new one,
-            # and restart the watchdog clock — the worker is only now handed work again. The stand
-            # fail-count and any in-flight review reset too: rework is a fresh code state.
+            # and restart the watchdog clock. The stand fail-count and any in-flight review reset
+            # too: rework is a fresh code state. Keep this after move_card so a failed board move
+            # cannot leave a worker running against a card that still sits in Validate.
             clear_review(rec)
             rec["comment_baseline"] = len(ops.show_card(ref)["comments"])
             rec["last_activity"] = time.time()
             rec["stand_fails"] = 0
             rec.pop("ci_pending_since", None)
-            _ensure_worker_alive(rec)
-            worker.notify(rec.get("handle", ""),
-                          f"CI по {pr} красный — джоба «{job}» упала, карточка вернулась в "
-                          f"In progress. Разбор в комментарии карточки, почини и снова report done.")
+            try:
+                _notify_worker_for_rework(
+                    ref, card, rec, records, save_cards, refresh_worker_task,
+                    f"CI по {pr} красный: джоба «{job}» упала, карточка вернулась в "
+                    f"In progress. Разбор в комментарии карточки, почини и снова report done.",
+                    "ci-red")
+            except Exception as e:  # noqa: BLE001, do not leave In progress with a dead handle
+                _block_rework_worker_failure(ref, rec, records, "ci-red", e)
+                return True
         STATE.log_run("validate", reference=ref, to=model.IN_PROGRESS, reason="ci-red", job=job, pr=pr)
         return True
     if status["rollup"] == "SUCCESS":
@@ -343,7 +415,7 @@ def _validate_card(card: dict, records: dict, watchdog_seconds: int, save_cards,
         # stand_cfg was already resolved above — pass its presence down instead of re-reading the
         # manifest a second time in the green-review path.
         return _review_gate(ref, pr, card, records, view, stand_cfg is not None,
-                            watchdog_seconds, save_cards, statuses) or changed
+                            watchdog_seconds, save_cards, statuses, refresh_worker_task) or changed
     return _ci_pending_watchdog(ref, rec, records, pr, status["rollup"]) or changed
 
 
@@ -401,7 +473,8 @@ def _apply_provision_after_merge(ref: str, project: str, pr: str) -> None:
 
 
 def _validate_contrib_card(ref: str, card: dict, rec: dict | None, records: dict, view: dict,
-                           watchdog_seconds: int, save_cards, statuses: dict[str, str]) -> bool:
+                           watchdog_seconds: int, save_cards, statuses: dict[str, str],
+                           refresh_worker_task: RefreshWorkerTask | None = None) -> bool:
     """Validate a contrib (fork) card: it has no PR in this pipeline by definition (a human opens
     it against upstream from the pushed branch afterward, out of scope) — so layer 1 is just the
     worker's own report (local tests, already in its report:done; no CI to poll — CI-in-fork is
@@ -451,7 +524,8 @@ def _validate_contrib_card(ref: str, card: dict, rec: dict | None, records: dict
         view = ops.show_card(ref)
     return _review_gate(ref, None, card, records, view, is_stand=False,
                         watchdog_seconds=watchdog_seconds, save_cards=save_cards,
-                        statuses=statuses, contrib=(branch, sha)) or changed
+                        statuses=statuses, refresh_worker_task=refresh_worker_task,
+                        contrib=(branch, sha)) or changed
 
 
 def _validate_stall(ref: str, reason: str, rec: dict | None, records: dict, **log_fields) -> bool:
@@ -591,6 +665,7 @@ def _review_verdict(view: dict, baseline: int) -> str | None:
 
 def _review_gate(ref: str, pr: str | None, card: dict, records: dict, view: dict, is_stand: bool,
                  watchdog_seconds: int, save_cards, statuses: dict[str, str],
+                 refresh_worker_task: RefreshWorkerTask | None = None,
                  contrib: tuple[str, str] | None = None) -> bool:
     """Drive layer 3 for a card whose lower layers are green. Returns whether `records` changed.
     `is_stand` is the caller's already-resolved stand_cfg presence — passed through rather than
@@ -609,7 +684,7 @@ def _review_gate(ref: str, pr: str | None, card: dict, records: dict, view: dict
         return _review_watchdog(ref, rec, records, watchdog_seconds, statuses)
     if verdict == "green":
         return _review_green(ref, pr, card, is_stand, rec, records, contrib)
-    return _review_red(ref, pr, rec, records, contrib)
+    return _review_red(ref, pr, card, rec, records, save_cards, refresh_worker_task, contrib)
 
 
 def _spawn_reviewer(ref: str, pr: str | None, card: dict, rec: dict, records: dict, save_cards,
@@ -796,7 +871,8 @@ def _review_green(ref: str, pr: str | None, card: dict, is_stand: bool, rec: dic
     return True
 
 
-def _review_red(ref: str, pr: str | None, rec: dict, records: dict,
+def _review_red(ref: str, pr: str | None, card: dict, rec: dict, records: dict, save_cards,
+                refresh_worker_task: RefreshWorkerTask | None = None,
                 contrib: tuple[str, str] | None = None) -> bool:
     """Red verdict (a blocker in some lens). Return the card for rework, or — once the lifetime cap
     of returns is spent — Block it до vladmesh with the full verdict already on the card. Same cap
@@ -827,10 +903,15 @@ def _review_red(ref: str, pr: str | None, rec: dict, records: dict,
     rec["last_activity"] = time.time()
     rec["stand_fails"] = 0
     rec.pop("ci_pending_since", None)
-    _ensure_worker_alive(rec)
-    worker.notify(rec.get("handle", ""),
-                  f"Ревью по {phrase} красное — есть блокеры (слой 3). Карточка вернулась в "
-                  f"In progress. Разбор в вердикте на карточке, почини и снова report done.")
+    try:
+        _notify_worker_for_rework(
+            ref, card, rec, records, save_cards, refresh_worker_task,
+            f"Ревью по {phrase} красное: есть блокеры (слой 3). Карточка вернулась в "
+            f"In progress. Разбор в вердикте на карточке, почини и снова report done.",
+            "review-red")
+    except Exception as e:  # noqa: BLE001, do not leave In progress with a dead handle
+        _block_rework_worker_failure(ref, rec, records, "review-red", e)
+        return True
     STATE.log_run("review", reference=ref, to=model.IN_PROGRESS, reason="review-red",
                   returns=prior + 1, pr=pr)
     return True
