@@ -1354,6 +1354,27 @@ class ValidateTest(_DispatcherBase):
         self.assertIn("Lint, Typecheck & Test", self.worker.notified[0][1])
         self.assertTrue(any(r.get("reason") == "ci-red" for r in self._runs()))
 
+    def test_red_ci_move_failure_does_not_nudge_live_worker(self):
+        ref = self._to_validate()
+        rec_before = dispatcher._load_cards()[ref]
+        launched_before = len(self.worker.launched)
+        notified_before = len(self.worker.notified)
+        self.board.move_fails = True
+        self.worker.pr_status = {
+            "merged": False, "state": "OPEN", "rollup": "FAILURE",
+            "failed_job": "CI", "failed_log": "boom",
+        }
+
+        dispatcher.tick()
+
+        self.assertEqual(self._column(ref), "Validate")
+        rec_after = dispatcher._load_cards()[ref]
+        self.assertEqual(rec_after["handle"], rec_before["handle"])
+        self.assertEqual(rec_after.get("comment_baseline"), rec_before.get("comment_baseline"))
+        self.assertEqual(len(self.worker.launched), launched_before)
+        self.assertEqual(len(self.worker.notified), notified_before)
+        self.assertFalse(any(r.get("reason") == "ci-red" for r in self._runs()))
+
     def test_red_ci_then_rework_done_returns_to_validate(self):
         # A stale done comment (below the new baseline) must not bounce the card straight back.
         ref = self._to_validate()
@@ -1931,6 +1952,32 @@ class ValidateReviewTest(_DispatcherBase):
         self.assertIn("блокер: TASK.md должен содержать свежую историю", task_md)
         self.assertIn(f"[{model.MARKER_REVIEW_RETURN}]", task_md)
         self.assertGreaterEqual(rec_after["last_activity"], rec_before["last_activity"])
+
+    def test_red_verdict_move_failure_does_not_relaunch_dead_worker(self):
+        self.worker.unique_launch_handles = True
+        ref = self._spawned()
+        rec_before = dispatcher._load_cards()[ref]
+        old_handle = rec_before["handle"]
+        launched_before = len(self.worker.launched)
+        tasks_before = len(self.worker.tasks_written)
+        notified_before = len(self.worker.notified)
+        torn_down_before = len(self._rev_ws_torndown())
+        self.worker.dead_handles.add(old_handle)
+        self.board.move_fails = True
+
+        ops.verdict(ref, "red", "блокер: нельзя будить воркера до move")
+        dispatcher.tick()
+
+        self.assertEqual(self._column(ref), "Validate")
+        rec_after = dispatcher._load_cards()[ref]
+        self.assertEqual(rec_after["handle"], old_handle)
+        self.assertIn("review_baseline", rec_after)
+        self.assertEqual(rec_after.get("review_returns", 0), rec_before.get("review_returns", 0))
+        self.assertEqual(len(self.worker.launched), launched_before)
+        self.assertEqual(len(self.worker.tasks_written), tasks_before)
+        self.assertEqual(len(self.worker.notified), notified_before)
+        self.assertEqual(len(self._rev_ws_torndown()), torn_down_before)
+        self.assertFalse(any(r.get("reason") == "review-red" for r in self._runs()))
 
     def test_red_then_rework_reruns_review_and_ignores_stale_verdict(self):
         ref = self._spawned()

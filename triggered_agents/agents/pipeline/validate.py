@@ -336,13 +336,14 @@ def _validate_card(card: dict, records: dict, watchdog_seconds: int, save_cards,
         tail = worker.scrub_secrets(status.get("failed_log") or "(лог недоступен)")
         comment = (f"CI красный: джоба «{job}» упала. Хвост лога:\n```\n{tail}\n```\n"
                    f"Карточка возвращена в In progress на доработку. PR: {pr}")
+        ops.add_comment("dispatcher", ref, comment, marker=model.MARKER_VALIDATE_RED)
+        ops.move_card("dispatcher", ref, model.IN_PROGRESS)
         if rec is not None:
             # Baseline past the red comment so the stale done report isn't re-read as a new one,
-            # and restart the watchdog clock — the worker is only now handed work again. The stand
-            # fail-count and any in-flight review reset too: rework is a fresh code state.
+            # and restart the watchdog clock. The stand fail-count and any in-flight review reset
+            # too: rework is a fresh code state. Keep this after move_card so a failed board move
+            # cannot leave a worker running against a card that still sits in Validate.
             clear_review(rec)
-        ops.add_comment("dispatcher", ref, comment, marker=model.MARKER_VALIDATE_RED)
-        if rec is not None:
             rec["comment_baseline"] = len(ops.show_card(ref)["comments"])
             rec["last_activity"] = time.time()
             rec["stand_fails"] = 0
@@ -352,7 +353,6 @@ def _validate_card(card: dict, records: dict, watchdog_seconds: int, save_cards,
                 f"CI по {pr} красный: джоба «{job}» упала, карточка вернулась в "
                 f"In progress. Разбор в комментарии карточки, почини и снова report done.",
                 "ci-red")
-        ops.move_card("dispatcher", ref, model.IN_PROGRESS)
         STATE.log_run("validate", reference=ref, to=model.IN_PROGRESS, reason="ci-red", job=job, pr=pr)
         return True
     if status["rollup"] == "SUCCESS":
@@ -864,6 +864,7 @@ def _review_red(ref: str, pr: str | None, card: dict, rec: dict, records: dict, 
                     f"возвращена в In progress на доработку (возврат {prior + 1} из "
                     f"{REVIEW_RETURN_CAP}). Разбор — в вердикте выше. {note}",
                     marker=model.MARKER_REVIEW_RETURN)
+    ops.move_card("dispatcher", ref, model.IN_PROGRESS)
     clear_review(rec)                                   # tear down reviewer ws, drop its baseline
     rec["review_returns"] = prior + 1
     rec["comment_baseline"] = len(ops.show_card(ref)["comments"])
@@ -875,7 +876,6 @@ def _review_red(ref: str, pr: str | None, card: dict, rec: dict, records: dict, 
         f"Ревью по {phrase} красное: есть блокеры (слой 3). Карточка вернулась в "
         f"In progress. Разбор в вердикте на карточке, почини и снова report done.",
         "review-red")
-    ops.move_card("dispatcher", ref, model.IN_PROGRESS)
     STATE.log_run("review", reference=ref, to=model.IN_PROGRESS, reason="review-red",
                   returns=prior + 1, pr=pr)
     return True
