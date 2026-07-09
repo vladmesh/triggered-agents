@@ -659,6 +659,16 @@ def _task_md(card: dict, view: dict, base: str) -> str:
     return "\n".join(lines).rstrip("\n") + "\n"
 
 
+def _refresh_worker_task(card: dict, rec: dict) -> None:
+    """Rewrite TASK.md in an existing worker workspace from the card's current journal."""
+    workspace = rec.get("workspace")
+    if not workspace:
+        return
+    project = card.get("project") or ""
+    base = worker.resolve_base_branch(project, card.get("base_branch") or "")
+    worker.write_task(workspace, _task_md(card, ops.show_card(card["reference"]), base))
+
+
 def _block(ref: str, reason: str, body: str, **log_fields) -> None:
     """Comment (scrubbed: provision logs / orca errors may echo env) + move to Blocked."""
     ops.add_comment("dispatcher", ref, worker.scrub_secrets(body))
@@ -785,7 +795,8 @@ def tick() -> int:
             statuses = {}
         changed = _reconcile(records)
         changed = _advance(records, statuses) or changed
-        changed = validate.run(records, WATCHDOG_SECONDS, _save_cards, statuses) or changed
+        changed = validate.run(records, WATCHDOG_SECONDS, _save_cards, statuses,
+                               _refresh_worker_task) or changed
         before = json.dumps(records, sort_keys=True)
         if paused:
             STATE.log_run("claim-skip", result="paused", mode="soft")
@@ -873,12 +884,12 @@ def resume() -> dict:
     exact branch right now — a fresh worker head reading TASK.md from scratch would start a new
     turn and risk pushing commits under it, branch drift under review (triggered-agents-281
     review). Its handle is cleared instead, so nothing mistakes it for live; validate.py relaunches
-    it lazily (_ensure_worker_alive), only if/when a CI-red or review-red return actually hands the
-    card back for rework. Either way ci_pending_since is dropped for a Validate card, so one still
-    on a non-terminal CI rollup gets a fresh CI_PENDING_STALL_SECONDS window instead of one that
-    already expired during the pause. A card pause() stopped but that no longer wants a head when
-    resume() runs (moved on, or its record vanished) is skipped rather than relaunched into a state
-    nobody is waiting on."""
+    it lazily on the CI-red or review-red return path, only after TASK.md has been refreshed with
+    the latest card history. Either way ci_pending_since is dropped for a Validate card, so one
+    still on a non-terminal CI rollup gets a fresh CI_PENDING_STALL_SECONDS window instead of one
+    that already expired during the pause. A card pause() stopped but that no longer wants a head
+    when resume() runs (moved on, or its record vanished) is skipped rather than relaunched into a
+    state nobody is waiting on."""
     with _admin_lock():
         state = pause_flag.load()
         if not state:
@@ -914,11 +925,12 @@ def resume() -> dict:
                     # a new turn and risk pushing commits under it — branch drift under review
                     # (triggered-agents-281 review, blocker B1). Leave it stopped (handle cleared,
                     # so nothing mistakes it for live); validate.py relaunches it lazily, only if/
-                    # when a CI-red or review-red return actually hands the card back for rework
-                    # (see _ensure_worker_alive there). ci_pending_since is still dropped — a
-                    # plain wall-clock stall timer with no head to reset it, so a card still on a
-                    # non-terminal CI rollup gets a fresh CI_PENDING_STALL_SECONDS window instead
-                    # of one that already elapsed during the pause.
+                    # when a CI-red or review-red return actually hands the card back for rework.
+                    # That path refreshes TASK.md, checks the saved handle and relaunches if it is
+                    # gone. ci_pending_since is still dropped: a plain wall-clock stall timer with
+                    # no head to reset it, so a card still on a non-terminal CI rollup gets a fresh
+                    # CI_PENDING_STALL_SECONDS window instead of one that already elapsed during
+                    # the pause.
                     rec["handle"] = ""
                     rec.pop("ci_pending_since", None)
                     parked.append(f"{ref}:worker")

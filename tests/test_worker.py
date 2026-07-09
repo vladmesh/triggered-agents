@@ -545,6 +545,35 @@ class SpawnReviewerClosesOrphanTest(unittest.TestCase):
         close.assert_called_once_with("/ws", "term-rev")
 
 
+class TerminalLiveTest(unittest.TestCase):
+    def test_rejects_shell_prompt_preview(self):
+        def fake_orca_json(args):
+            self.assertEqual(args, ["terminal", "list", "--limit", "50",
+                                    "--worktree", "path:/ws/fresh"])
+            return {"terminals": [{
+                "handle": "term-shell",
+                "title": "worker 304: Validate return",
+                "connected": True,
+                "writable": True,
+                "preview": "dev@host:~/orca/workspaces/triggered-agents/card$",
+            }]}
+
+        with mock.patch.object(worker, "_orca_json", fake_orca_json):
+            self.assertFalse(worker.terminal_live("term-shell", "/ws/fresh"))
+
+    def test_accepts_non_shell_preview(self):
+        def fake_orca_json(args):
+            return {"terminals": [{
+                "handle": "term-worker",
+                "connected": True,
+                "writable": True,
+                "preview": "exec\n/bin/bash -lc 'python3 -m unittest tests/test_worker.py'",
+            }]}
+
+        with mock.patch.object(worker, "_orca_json", fake_orca_json):
+            self.assertTrue(worker.terminal_live("term-worker", "/ws/fresh"))
+
+
 class ApplyProvisionTest(unittest.TestCase):
     """worker.apply_provision (triggered-agents-256): fetch+hard-reset the canonical checkout to
     origin/main, then run its deploy/provision.py for the given agents. subprocess.run is faked
