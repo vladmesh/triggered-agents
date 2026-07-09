@@ -57,6 +57,7 @@ class FakeWorker:
         self.pr_base_polled = []         # PR urls pr_base_branch was asked about
         self.notified = []               # (handle, text) nudges sent to worker terminals
         self.dead_handles = set()         # handles terminal_live should report as gone
+        self.terminal_entries = {}        # handle -> Orca terminal-list entry for terminal_live
         self.unique_launch_handles = False
         self.stand_config = None         # dict from read_stand_config, or None for no-stand project
         self.stand_branch = "pipeline/x"  # branch pr_branch returns (None -> gh can't answer)
@@ -148,7 +149,11 @@ class FakeWorker:
         return bool(handle)
 
     def terminal_live(self, handle, workspace=None):
-        return bool(handle) and handle not in self.dead_handles
+        if not handle or handle in self.dead_handles:
+            return False
+        if handle in self.terminal_entries:
+            return worker._terminal_entry_live(self.terminal_entries[handle])
+        return True
 
     def read_stand_config(self, project):
         return self.stand_config
@@ -1354,6 +1359,35 @@ class ValidateTest(_DispatcherBase):
         self.assertIn("Lint, Typecheck & Test", self.worker.notified[0][1])
         self.assertTrue(any(r.get("reason") == "ci-red" for r in self._runs()))
 
+    def test_red_ci_relaunches_shell_prompt_handle(self):
+        self.worker.unique_launch_handles = True
+        ref = self._to_validate()
+        rec_before = dispatcher._load_cards()[ref]
+        old_handle = rec_before["handle"]
+        launched_before = len(self.worker.launched)
+        tasks_before = len(self.worker.tasks_written)
+        self.worker.terminal_entries[old_handle] = {
+            "handle": old_handle,
+            "connected": True,
+            "writable": True,
+            "preview": "dev@host:~/orca/workspaces/triggered-agents/card$",
+        }
+        self.worker.pr_status = {
+            "merged": False, "state": "OPEN", "rollup": "FAILURE",
+            "failed_job": "CI", "failed_log": "boom",
+        }
+
+        dispatcher.tick()
+
+        self.assertEqual(self._column(ref), model.IN_PROGRESS)
+        rec_after = dispatcher._load_cards()[ref]
+        self.assertNotEqual(rec_after["handle"], old_handle)
+        self.assertEqual(len(self.worker.launched), launched_before + 1)
+        self.assertEqual(len(self.worker.tasks_written), tasks_before + 1)
+        self.assertEqual(self.worker.notified[-1][0], rec_after["handle"])
+        self.assertNotEqual(self.worker.notified[-1][0], old_handle)
+        self.assertIn("CI красный", self.worker.tasks_written[-1][1])
+
     def test_red_ci_move_failure_does_not_nudge_live_worker(self):
         ref = self._to_validate()
         rec_before = dispatcher._load_cards()[ref]
@@ -1983,6 +2017,33 @@ class ValidateReviewTest(_DispatcherBase):
         self.assertIn("блокер: TASK.md должен содержать свежую историю", task_md)
         self.assertIn(f"[{model.MARKER_REVIEW_RETURN}]", task_md)
         self.assertGreaterEqual(rec_after["last_activity"], rec_before["last_activity"])
+
+    def test_red_verdict_relaunches_shell_prompt_handle(self):
+        self.worker.unique_launch_handles = True
+        ref = self._spawned()
+        rec_before = dispatcher._load_cards()[ref]
+        old_handle = rec_before["handle"]
+        launched_before = len(self.worker.launched)
+        tasks_before = len(self.worker.tasks_written)
+        self.worker.terminal_entries[old_handle] = {
+            "handle": old_handle,
+            "connected": True,
+            "writable": True,
+            "preview": "dev@host:~/orca/workspaces/triggered-agents/card$",
+        }
+
+        ops.verdict(ref, "red", "блокер: shell handle должен перезапустить воркера")
+        dispatcher.tick()
+
+        self.assertEqual(self._column(ref), model.IN_PROGRESS)
+        rec_after = dispatcher._load_cards()[ref]
+        self.assertNotEqual(rec_after["handle"], old_handle)
+        self.assertEqual(len(self.worker.launched), launched_before + 1)
+        self.assertEqual(len(self.worker.tasks_written), tasks_before + 1)
+        self.assertEqual(self.worker.notified[-1][0], rec_after["handle"])
+        self.assertNotEqual(self.worker.notified[-1][0], old_handle)
+        self.assertIn("блокер: shell handle должен перезапустить воркера",
+                      self.worker.tasks_written[-1][1])
 
     def test_red_verdict_move_failure_does_not_relaunch_dead_worker(self):
         self.worker.unique_launch_handles = True

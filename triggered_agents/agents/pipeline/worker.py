@@ -54,6 +54,11 @@ class WorkspaceError(RuntimeError):
 _ASSIGN_RE = re.compile(r"(?i)\b([A-Z0-9_]*(?:TOKEN|KEY|SECRET|PASSWORD|PASSWD)[A-Z0-9_]*)\s*=\s*\S+")
 _BLOB_RE = re.compile(r"\b[A-Za-z0-9+=_-]{40,}\b")
 _HEX_RE = re.compile(r"^[0-9a-fA-F]{7,40}$")
+_ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+_SHELL_PROMPT_RE = re.compile(
+    r"(?:^|\n)\s*(?:\([^)\n]+\)\s*)?(?:[\w.-]+@[\w.-]+:\s*)?"
+    r"(?:~|/|[A-Za-z]:\\)[^\n]{0,240}[$#%]\s*$"
+)
 
 
 def _is_git_sha(blob: str) -> bool:
@@ -379,13 +384,23 @@ def workspace_exists(project: str, name: str) -> bool:
     return Path(workspace_path(project, name)).is_dir()
 
 
+def _terminal_entry_live(term: dict) -> bool:
+    if term.get("connected") is False or term.get("writable") is False:
+        return False
+    preview = _ANSI_RE.sub("", str(term.get("preview") or "")).strip()
+    if preview and _SHELL_PROMPT_RE.search(preview):
+        return False
+    return True
+
+
 def terminal_live(handle: str, workspace: str | None = None) -> bool:
     """Whether `handle` is a live Orca terminal, optionally scoped to `workspace`.
 
     `terminal send` has a dangerous degraded mode for this pipeline: an old handle that no longer
     names a live head can leave the nudge landing somewhere else in the worktree, commonly a
-    plain shell. Listing live terminals first makes an exited/ghost/missing handle a clean false,
-    so the caller can relaunch instead of probing by sending the rework prompt."""
+    plain shell. Listing live terminals first makes an exited/ghost/missing handle a clean false.
+    A writable terminal whose preview is back at a shell prompt is also treated as dead, so the
+    caller can relaunch instead of probing by sending the rework prompt."""
     if not handle:
         return False
     args = ["terminal", "list", "--limit", "50"]
@@ -398,7 +413,7 @@ def terminal_live(handle: str, workspace: str | None = None) -> bool:
     for t in data.get("terminals") or []:
         if (t.get("handle") or t.get("id")) != handle:
             continue
-        return t.get("connected") is not False and t.get("writable") is not False
+        return _terminal_entry_live(t)
     return False
 
 
