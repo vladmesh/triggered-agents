@@ -44,8 +44,10 @@ class FakeWorker:
         self.provision_ok = True
         self.provision_log = "[provision] done\n"
         self.create_raises = None
-        self.activity_ts = None          # None -> dispatcher falls back to stored last_activity
-        self.activity_polled = []        # every workspace worker.activity() was asked about
+        self.activity_ts = None          # default tracked-terminal activity
+        self.activity_by_handle = {}     # handle -> activity timestamp, overriding activity_ts
+        self.activity_polled = []        # every workspace activity helper was asked about
+        self.terminal_activity_polled = []  # (handle, workspace) for tracked activity polls
         self.launched = []
         self.tasks_written = []
         self.torn_down = []
@@ -132,6 +134,11 @@ class FakeWorker:
         self.activity_polled.append(workspace)
         return self.activity_ts
 
+    def terminal_activity(self, handle, workspace):
+        self.activity_polled.append(workspace)
+        self.terminal_activity_polled.append((handle, workspace))
+        return self.activity_by_handle.get(handle, self.activity_ts)
+
     def poll_pr(self, pr_url):
         self.polled.append(pr_url)
         return self.pr_status
@@ -207,7 +214,7 @@ class _DispatcherBase(unittest.TestCase):
 
         self.worker = FakeWorker()
         for name in ("read_base_branch", "is_contrib", "create_workspace", "set_branch", "provision",
-                     "write_task", "launch_worker", "activity", "poll_pr", "notify",
+                     "write_task", "launch_worker", "activity", "terminal_activity", "poll_pr", "notify",
                      "terminal_live", "teardown", "read_stand_config", "pr_branch", "run_stand",
                      "spawn_reviewer",
                      "workspace_exists", "workspace_path", "rename_terminal", "merge_pr",
@@ -728,6 +735,22 @@ class DispatcherTest(_DispatcherBase):
         self.worker.activity_ts = time.time()   # fresh output within threshold
         dispatcher.tick()
         self.assertEqual(self._column(ref), model.IN_PROGRESS)
+
+    def test_watchdog_uses_tracked_worker_handle_not_active_shell_in_workspace(self):
+        ref = self._claim_one()
+        rec = dispatcher._load_cards()[ref]
+        tracked = rec["handle"]
+        shell = "plain-shell"
+        dispatcher.WATCHDOG_SECONDS = -1
+        self.worker.activity_by_handle[tracked] = None
+        self.worker.activity_by_handle[shell] = time.time()
+
+        dispatcher.tick()
+
+        self.assertIn((tracked, rec["workspace"]), self.worker.terminal_activity_polled)
+        self.assertNotIn((shell, rec["workspace"]), self.worker.terminal_activity_polled)
+        self.assertIn(rec["workspace"], self.worker.torn_down)
+        self.assertEqual(ops.show_card(ref)["metadata"][model.META_RETRY_SAME], "1")
 
     # bring-up failure after claim (review #1) --------------------------------
     def test_launch_worker_fail_blocks_not_hangs(self):
@@ -2170,6 +2193,22 @@ class ValidateReviewTest(_DispatcherBase):
         self.assertNotIn(ref, dispatcher._load_cards())
         self.assertIn("watchdog", self._markers(ref))
         self.assertEqual(self._rev_ws_torndown(), [])           # reviewer ws left for a human
+        self.assertTrue(any(r.get("reason") == "review-watchdog" for r in self._runs()))
+
+    def test_reviewer_watchdog_uses_tracked_handle_not_active_shell_in_workspace(self):
+        ref = self._spawned()
+        rec = dispatcher._load_cards()[ref]
+        tracked = rec["review_handle"]
+        shell = "review-shell"
+        self.worker.activity_by_handle[tracked] = None
+        self.worker.activity_by_handle[shell] = time.time()
+        dispatcher.WATCHDOG_SECONDS = -1
+
+        dispatcher.tick()
+
+        self.assertIn((tracked, rec["review_ws"]), self.worker.terminal_activity_polled)
+        self.assertNotIn((shell, rec["review_ws"]), self.worker.terminal_activity_polled)
+        self.assertEqual(self._column(ref), "Blocked")
         self.assertTrue(any(r.get("reason") == "review-watchdog" for r in self._runs()))
 
     def test_review_watchdog_frozen_while_reviewer_resource_is_red(self):

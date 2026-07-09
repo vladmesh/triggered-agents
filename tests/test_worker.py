@@ -574,6 +574,54 @@ class TerminalLiveTest(unittest.TestCase):
             self.assertTrue(worker.terminal_live("term-worker", "/ws/fresh"))
 
 
+class TerminalActivityTest(unittest.TestCase):
+    def test_returns_tracked_handle_last_output(self):
+        def fake_orca_json(args):
+            self.assertEqual(args, ["terminal", "list", "--worktree", "path:/ws/fresh",
+                                    "--limit", "50"])
+            return {"terminals": [{
+                "handle": "term-worker",
+                "connected": True,
+                "writable": True,
+                "preview": "running tests",
+                "lastOutputAt": 123456,
+            }]}
+
+        with mock.patch.object(worker, "_orca_json", fake_orca_json):
+            self.assertEqual(worker.terminal_activity("term-worker", "/ws/fresh"), 123.456)
+
+    def test_ignores_shell_activity_when_tracked_handle_missing_or_has_no_output(self):
+        cases = [
+            [{"handle": "term-shell", "lastOutputAt": 999999}],
+            [{"handle": "term-worker"}, {"handle": "term-shell", "lastOutputAt": 999999}],
+        ]
+        for terminals in cases:
+            with self.subTest(terminals=terminals):
+                with mock.patch.object(worker, "_orca_json", return_value={"terminals": terminals}):
+                    self.assertIsNone(worker.terminal_activity("term-worker", "/ws/fresh"))
+
+    def test_rejects_tracked_shell_prompt_even_with_output(self):
+        with mock.patch.object(worker, "_orca_json", return_value={"terminals": [{
+            "handle": "term-worker",
+            "connected": True,
+            "writable": True,
+            "preview": "dev@host:~/orca/workspaces/triggered-agents/card$",
+            "lastOutputAt": 999999,
+        }]}):
+            self.assertIsNone(worker.terminal_activity("term-worker", "/ws/fresh"))
+
+    def test_rejects_tracked_handle_from_different_workspace(self):
+        with mock.patch.object(worker, "_orca_json", return_value={"terminals": [{
+            "handle": "term-worker",
+            "connected": True,
+            "writable": True,
+            "preview": "running",
+            "worktree": "path:/ws/other",
+            "lastOutputAt": 999999,
+        }]}):
+            self.assertIsNone(worker.terminal_activity("term-worker", "/ws/fresh"))
+
+
 class ApplyProvisionTest(unittest.TestCase):
     """worker.apply_provision (triggered-agents-256): fetch+hard-reset the canonical checkout to
     origin/main, then run its deploy/provision.py for the given agents. subprocess.run is faked

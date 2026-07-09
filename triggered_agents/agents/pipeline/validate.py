@@ -759,7 +759,7 @@ def _review_watchdog(ref: str, rec: dict, records: dict, watchdog_seconds: int,
     ws = rec.get("review_ws")
     changed = False
     worker.rename_terminal(rec.get("review_handle", ""), rec.get("review_title", ""))
-    last = worker.activity(ws) if ws else None
+    last = worker.terminal_activity(rec.get("review_handle", ""), ws) if ws else None
     if last and last > rec.get("review_activity", 0):
         rec["review_activity"] = last
         changed = True
