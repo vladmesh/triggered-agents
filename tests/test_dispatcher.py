@@ -2135,6 +2135,8 @@ class ValidateReviewTest(_DispatcherBase):
         self.assertTrue(any(r.get("reason") == "review-red" for r in self._runs()))
 
     def test_red_verdict_relaunches_dead_worker_and_rewrites_task(self):
+        # Regression for triggered-agents-276: a review/CI return hands work back to a live
+        # worker terminal with refreshed TASK.md, not just to the In progress column.
         self.worker.unique_launch_handles = True
         ref = self._spawned()
         rec_before = dispatcher._load_cards()[ref]
@@ -2148,9 +2150,13 @@ class ValidateReviewTest(_DispatcherBase):
 
         self.assertEqual(self._column(ref), model.IN_PROGRESS)
         rec_after = dispatcher._load_cards()[ref]
+        self.assertEqual(rec_after["workspace"], rec_before["workspace"])
+        self.assertEqual(rec_after["worker"], rec_before["worker"])
         self.assertNotEqual(rec_after["handle"], old_handle)
         self.assertEqual(len(self.worker.launched), launched_before + 1)
+        self.assertEqual(self.worker.launched[-1]["ws"], rec_before["workspace"])
         self.assertEqual(self.worker.notified[-1][0], rec_after["handle"])
+        self.assertNotIn(old_handle, [handle for handle, _ in self.worker.notified])
         self.assertEqual(len(self.worker.tasks_written), tasks_before + 1)
         task_workspace, task_md = self.worker.tasks_written[-1]
         self.assertEqual(task_workspace, rec_before["workspace"])
@@ -2158,6 +2164,11 @@ class ValidateReviewTest(_DispatcherBase):
         self.assertIn("блокер: TASK.md должен содержать свежую историю", task_md)
         self.assertIn(f"[{model.MARKER_REVIEW_RETURN}]", task_md)
         self.assertGreaterEqual(rec_after["last_activity"], rec_before["last_activity"])
+        self.assertTrue(any(r["event"] == "rework-worker" and r.get("result") == "relaunched"
+                            and r.get("reason") == "review-red"
+                            and r.get("old_handle") == old_handle
+                            and r.get("new_handle") == rec_after["handle"]
+                            for r in self._runs()))
 
     def test_red_verdict_relaunches_shell_prompt_handle(self):
         self.worker.unique_launch_handles = True
