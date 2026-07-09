@@ -63,12 +63,48 @@ model = "gpt-5.5"
 effort = "extra"
 fallback = []
 
+[profiles.codex-tui]
+# Opt-in interactive Codex worker profile. Same account/model as `codex`, but worker.py launches
+# the TUI, waits for Orca `tui-idle`, then sends the task prompt into that live session.
+resource = "openai-sub"
+adapter = "codex"
+model = "gpt-5.5"
+effort = "default"
+codex_mode = "tui"
+fallback = []
+
+[profiles.codex-high-tui]
+resource = "openai-sub"
+adapter = "codex"
+model = "gpt-5.5"
+effort = "high"
+codex_mode = "tui"
+fallback = []
+
+[profiles.codex-extra-tui]
+resource = "openai-sub"
+adapter = "codex"
+model = "gpt-5.5"
+effort = "extra"
+codex_mode = "tui"
+fallback = []
+
 [profiles.codex-reviewer]
 # Layer-3 reviewer: prefer Codex extra, keep the previous claude-opus reviewer as second priority.
 resource = "openai-sub"
 adapter = "codex"
 model = "gpt-5.5"
 effort = "extra"
+fallback = ["claude-opus"]
+
+[profiles.codex-reviewer-tui]
+# Opt-in interactive reviewer profile. TA_REVIEWER_HEAD can point here while `codex-reviewer`
+# remains the one-shot rollback profile.
+resource = "openai-sub"
+adapter = "codex"
+model = "gpt-5.5"
+effort = "extra"
+codex_mode = "tui"
 fallback = ["claude-opus"]
 
 [profiles.codex-curator]

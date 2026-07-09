@@ -37,6 +37,7 @@ ORCA_TIMEOUT_S = 120       # worktree create runs repo git; give it room, but ne
 PROVISION_TIMEOUT_S = int(os.environ.get("TA_PROVISION_TIMEOUT_S", "900"))
 GH_TIMEOUT_S = 60          # a gh call may hit the network; bounded so a tick never hangs on it
 _GH_LOG_TAIL_LINES = 40
+TUI_IDLE_TIMEOUT_MS = int(os.environ.get("TA_TUI_IDLE_TIMEOUT_MS", "60000"))
 # Head profile for the layer-3 reviewer. A plain config knob (not a per-card choice): the reviewer
 # is independent of the worker, so the card's `head` field is not reused here — this names a
 # profile in heads.toml, same registry every worker head resolves against.
@@ -399,7 +400,8 @@ def _terminal_entry_live(term: dict) -> bool:
     return _terminal_entry_dead_reason(term) is None
 
 
-def terminal_status(handle: str, workspace: str | None = None) -> dict:
+def terminal_status(handle: str, workspace: str | None = None,
+                    expected_kind: str | None = None) -> dict:
     """Status for exactly `handle`, optionally scoped to `workspace`.
 
     `terminal send` has a dangerous degraded mode for this pipeline: an old handle that no longer
@@ -407,6 +409,10 @@ def terminal_status(handle: str, workspace: str | None = None) -> dict:
     plain shell. Listing live terminals first makes an exited/ghost/missing handle a clean false.
     A writable terminal whose preview is back at a shell prompt is also treated as dead, so the
     caller can relaunch instead of probing by sending the rework prompt.
+
+    `expected_kind` carries the launch contract recorded in cards.json. Orca does not expose a
+    stable Codex-agent id in `terminal list` today, so the hard gate remains the tracked handle
+    scoped to the workspace plus shell-prompt rejection.
 
     `known=false` means Orca itself could not be queried. Callers should keep their ordinary
     watchdog path for that case instead of treating a transport failure as proof that the tracked
@@ -439,9 +445,10 @@ def terminal_status(handle: str, workspace: str | None = None) -> dict:
     return {"known": True, "live": False, "reason": "missing-terminal"}
 
 
-def terminal_live(handle: str, workspace: str | None = None) -> bool:
+def terminal_live(handle: str, workspace: str | None = None,
+                  expected_kind: str | None = None) -> bool:
     """Whether `handle` is a live Orca terminal, optionally scoped to `workspace`."""
-    return bool(terminal_status(handle, workspace).get("live"))
+    return bool(terminal_status(handle, workspace, expected_kind).get("live"))
 
 
 def _terminal_belongs_to_workspace(term: dict, workspace: str) -> bool:
@@ -517,13 +524,20 @@ def rename_terminal(handle: str, title: str) -> bool:
     return p.returncode == 0
 
 
-def _launch_command(head: str | None, worker_id: str) -> str:
-    prompt = (
+def _worker_prompt() -> str:
+    return (
         "Ты — воркер task-пайплайна. Твоя задача целиком в TASK.md в корне воркспейса — прочти "
         "его первым и следуй ему. Роль на доске — worker (BOARD_ROLE уже выставлен): карточку сам "
         "не двигаешь, только report/comment/feedback через board-CLI. TASK.md в репо не коммить."
     )
-    return heads.render_command(head or heads.DEFAULT_PROFILE, role="worker", prompt=prompt)
+
+
+def _launch_spec(head: str | None) -> heads.LaunchSpec:
+    return heads.render_launch(head or heads.DEFAULT_PROFILE, role="worker", prompt=_worker_prompt())
+
+
+def terminal_kind(head: str | None) -> str | None:
+    return heads.terminal_kind(head or heads.DEFAULT_PROFILE)
 
 
 def ensure_trust(workspace: str) -> None:
@@ -576,29 +590,64 @@ def _close_orphan_terminals(workspace: str, keep_handle: str) -> None:
             pass
 
 
+def _close_terminal(handle: str) -> None:
+    if not handle:
+        return
+    try:
+        _orca_json(["terminal", "close", "--terminal", handle])
+    except (WorkspaceError, subprocess.TimeoutExpired):
+        pass
+
+
+def _deliver_initial_prompt(handle: str, launch: heads.LaunchSpec) -> None:
+    if not launch.initial_prompt:
+        return
+    if not handle:
+        raise WorkspaceError("terminal create returned no handle for TUI prompt delivery")
+    _orca_json(["terminal", "wait", "--terminal", handle, "--for", "tui-idle",
+                "--timeout-ms", str(TUI_IDLE_TIMEOUT_MS)])
+    _orca_json(["terminal", "send", "--terminal", handle, "--text", launch.initial_prompt,
+                "--enter"])
+
+
+def _create_head_terminal(workspace: str, title: str, launch: heads.LaunchSpec) -> str:
+    data = _orca_json(["terminal", "create", "--worktree", f"path:{workspace}",
+                       "--title", title, "--command", launch.command])
+    term = data.get("terminal", data)
+    handle = term.get("handle") or term.get("id") or ""
+    try:
+        _deliver_initial_prompt(handle, launch)
+    except Exception:
+        _close_terminal(handle)
+        raise
+    _close_orphan_terminals(workspace, handle)
+    return handle
+
+
 def launch_worker(workspace: str, head: str | None, worker_id: str, title: str) -> str:
     """Spawn the worker head in the workspace; return the terminal handle. `title` seeds the
     tab's display name; the caller (dispatcher) pins it back every tick via rename_terminal since
     Claude Code overwrites it once the head starts working."""
     ensure_trust(workspace)
     ensure_theme()
-    data = _orca_json(["terminal", "create", "--worktree", f"path:{workspace}",
-                       "--title", title,
-                       "--command", _launch_command(head, worker_id)])
-    term = data.get("terminal", data)
-    handle = term.get("handle") or term.get("id") or ""
-    _close_orphan_terminals(workspace, handle)
-    return handle
+    return _create_head_terminal(workspace, title, _launch_spec(head))
 
 
-def _reviewer_command(worker_id: str) -> str:
-    prompt = (
+def _reviewer_prompt() -> str:
+    return (
         "Ты — независимая голова-ревьюер task-пайплайна (слой 3 валидации). Твоя работа целиком в "
         "REVIEW.md в корне воркспейса — прочти его первым и следуй ему. Роль на доске — reviewer "
         "(BOARD_ROLE уже выставлен): прав на код нет, не коммить и не пушь; артефакты — один "
         "вердикт-коммент и, при необходимости, карточки-идеи через board-CLI."
     )
-    return heads.render_command(REVIEWER_HEAD, role="reviewer", prompt=prompt)
+
+
+def _reviewer_launch_spec() -> heads.LaunchSpec:
+    return heads.render_launch(REVIEWER_HEAD, role="reviewer", prompt=_reviewer_prompt())
+
+
+def reviewer_terminal_kind() -> str | None:
+    return heads.terminal_kind(REVIEWER_HEAD)
 
 
 def spawn_reviewer(project: str, worker_id: str, base_branch: str, review_md: str, title: str,
@@ -619,9 +668,7 @@ def spawn_reviewer(project: str, worker_id: str, base_branch: str, review_md: st
         _write_excluded(ws, "REVIEW.md", review_md)
         ensure_trust(ws)
         ensure_theme()
-        data = _orca_json(["terminal", "create", "--worktree", f"path:{ws}",
-                           "--title", title,
-                           "--command", _reviewer_command(worker_id)])
+        handle = _create_head_terminal(ws, title, _reviewer_launch_spec())
     except Exception as e:
         teardown(ws)   # the worktree already exists; don't leave an orphan on a failed launch
         # Normalize to WorkspaceError so every bring-up failure (orca error/timeout, an OSError from
@@ -629,9 +676,6 @@ def spawn_reviewer(project: str, worker_id: str, base_branch: str, review_md: st
         if isinstance(e, WorkspaceError):
             raise
         raise WorkspaceError(f"reviewer head bring-up failed: {e}") from e
-    term = data.get("terminal", data)
-    handle = term.get("handle") or term.get("id") or ""
-    _close_orphan_terminals(ws, handle)
     return ws, handle
 
 
@@ -643,13 +687,7 @@ def relaunch_reviewer(workspace: str, worker_id: str, title: str) -> str:
     orphans) against the reviewer's own command instead of the worker's."""
     ensure_trust(workspace)
     ensure_theme()
-    data = _orca_json(["terminal", "create", "--worktree", f"path:{workspace}",
-                       "--title", title,
-                       "--command", _reviewer_command(worker_id)])
-    term = data.get("terminal", data)
-    handle = term.get("handle") or term.get("id") or ""
-    _close_orphan_terminals(workspace, handle)
-    return handle
+    return _create_head_terminal(workspace, title, _reviewer_launch_spec())
 
 
 def activity(workspace: str) -> float | None:

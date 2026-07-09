@@ -131,6 +131,12 @@ class FakeWorker:
         self.renamed.append((handle, title))
         return bool(handle)
 
+    def terminal_kind(self, head):
+        return "codex-tui" if head and str(head).endswith("-tui") else None
+
+    def reviewer_terminal_kind(self):
+        return None
+
     def activity(self, workspace):
         self.activity_polled.append(workspace)
         return self.activity_ts
@@ -140,7 +146,7 @@ class FakeWorker:
         self.terminal_activity_polled.append((handle, workspace))
         return self.activity_by_handle.get(handle, self.activity_ts)
 
-    def terminal_status(self, handle, workspace=None):
+    def terminal_status(self, handle, workspace=None, expected_kind=None):
         if workspace:
             self.activity_polled.append(workspace)
         self.terminal_activity_polled.append((handle, workspace))
@@ -175,7 +181,7 @@ class FakeWorker:
         self.notified.append((handle, text))
         return bool(handle)
 
-    def terminal_live(self, handle, workspace=None):
+    def terminal_live(self, handle, workspace=None, expected_kind=None):
         if not handle or handle in self.dead_handles:
             return False
         if handle in self.terminal_entries:
@@ -239,7 +245,8 @@ class _DispatcherBase(unittest.TestCase):
                      "spawn_reviewer",
                      "workspace_exists", "workspace_path", "rename_terminal", "merge_pr",
                      "pr_base_branch", "list_agent_worktrees", "ff_worktree", "remote_head_sha",
-                     "stop_terminals", "pr_files", "apply_provision", "relaunch_reviewer"):
+                     "stop_terminals", "pr_files", "apply_provision", "relaunch_reviewer",
+                     "terminal_kind", "reviewer_terminal_kind"):
             wp = mock.patch(f"triggered_agents.agents.pipeline.worker.{name}",
                             getattr(self.worker, name))
             wp.start()
@@ -2022,8 +2029,8 @@ class ValidateReviewTest(_DispatcherBase):
         tid = next(t["id"] for t in self.board.tasks.values() if t["reference"] == ref)
         return " ".join(c["comment"] for c in self.board.comments.get(tid, []))
 
-    def _to_validate(self, pr=PR):
-        ref = self._claim_one()
+    def _to_validate(self, pr=PR, head=None):
+        ref = self._claim_one(head=head)
         ops.report(ref, "done", f"готово\nPR: {pr}")
         self.worker.pr_status = None
         dispatcher.tick()
@@ -2034,9 +2041,9 @@ class ValidateReviewTest(_DispatcherBase):
         self.worker.pr_status = {"merged": False, "state": "OPEN", "rollup": "SUCCESS",
                                  "failed_job": None, "failed_log": None}
 
-    def _spawned(self, pr=PR):
+    def _spawned(self, pr=PR, head=None):
         """Land a card in Validate with the reviewer head up: done -> Validate, CI green -> spawn."""
-        ref = self._to_validate(pr)
+        ref = self._to_validate(pr, head=head)
         self._ci_green()
         dispatcher.tick()
         self.assertEqual(len(self.worker.reviewer_spawns), 1)
@@ -2196,6 +2203,28 @@ class ValidateReviewTest(_DispatcherBase):
         self.assertNotEqual(self.worker.notified[-1][0], old_handle)
         self.assertIn("блокер: shell handle должен перезапустить воркера",
                       self.worker.tasks_written[-1][1])
+
+    def test_red_verdict_relaunches_codex_tui_shell_handle_with_same_kind(self):
+        self.worker.unique_launch_handles = True
+        ref = self._spawned(head="codex-tui")
+        rec_before = dispatcher._load_cards()[ref]
+        old_handle = rec_before["handle"]
+        self.assertEqual(rec_before["terminal_kind"], "codex-tui")
+        self.worker.terminal_entries[old_handle] = {
+            "handle": old_handle,
+            "connected": True,
+            "writable": True,
+            "preview": "dev@host:~/orca/workspaces/triggered-agents/card$",
+        }
+
+        ops.verdict(ref, "red", "блокер: shell handle не должен получать follow-up")
+        dispatcher.tick()
+
+        rec_after = dispatcher._load_cards()[ref]
+        self.assertEqual(rec_after["terminal_kind"], "codex-tui")
+        self.assertNotEqual(rec_after["handle"], old_handle)
+        self.assertEqual(self.worker.notified[-1][0], rec_after["handle"])
+        self.assertNotIn(old_handle, [handle for handle, _ in self.worker.notified])
 
     def test_red_verdict_move_failure_does_not_relaunch_dead_worker(self):
         self.worker.unique_launch_handles = True
@@ -3451,6 +3480,41 @@ class WorkerHostCallsTest(unittest.TestCase):
         self.assertEqual(self.ensured, ["ensure_trust", "ensure_theme"])
         self.assertEqual(self.calls[0][0], "terminal")
         self.assertIn("worker A-1: title", self.calls[0])
+
+    def test_launch_worker_codex_tui_waits_then_sends_initial_prompt(self):
+        calls = []
+
+        def fake_orca_json(args):
+            calls.append(args)
+            if args[:2] == ["terminal", "create"]:
+                return {"terminal": {"handle": "term-tui"}}
+            if args[:2] == ["terminal", "list"]:
+                return {"terminals": [{"handle": "term-tui"}]}
+            return {}
+
+        with mock.patch.object(self.worker, "_orca_json", fake_orca_json):
+            handle = self.worker.launch_worker("/ws/fresh", "codex-tui", "worker-1",
+                                               "worker A-1: title")
+
+        self.assertEqual(handle, "term-tui")
+        create_i = next(i for i, c in enumerate(calls) if c[:2] == ["terminal", "create"])
+        wait_i = next(i for i, c in enumerate(calls) if c[:2] == ["terminal", "wait"])
+        send_i = next(i for i, c in enumerate(calls) if c[:2] == ["terminal", "send"])
+        self.assertLess(create_i, wait_i)
+        self.assertLess(wait_i, send_i)
+        self.assertEqual(calls[wait_i], ["terminal", "wait", "--terminal", "term-tui",
+                                         "--for", "tui-idle", "--timeout-ms",
+                                         str(self.worker.TUI_IDLE_TIMEOUT_MS)])
+        self.assertEqual(calls[send_i][calls[send_i].index("--terminal") + 1], "term-tui")
+        self.assertIn("TASK.md", calls[send_i][calls[send_i].index("--text") + 1])
+        self.assertNotIn("codex exec", calls[create_i][calls[create_i].index("--command") + 1])
+
+    def test_launch_worker_codex_exec_does_not_send_post_start_prompt(self):
+        self.worker.launch_worker("/ws/fresh", "codex", "worker-1", "worker A-1: title")
+        self.assertFalse(any(c[:2] == ["terminal", "wait"] for c in self.calls))
+        self.assertFalse(any(c[:2] == ["terminal", "send"] for c in self.calls))
+        create = next(c for c in self.calls if c[:2] == ["terminal", "create"])
+        self.assertIn("codex exec", create[create.index("--command") + 1])
 
     def test_spawn_reviewer_tears_down_worktree_on_launch_failure(self):
         # The worktree is created first; if the head fails to launch after that, the worktree must
