@@ -63,6 +63,8 @@ WORKER_CAP = int(os.environ.get("TA_WORKER_CAP", "3"))
 RETRY_SAME_BUDGET = int(os.environ.get("TA_RETRY_SAME_BUDGET", "1"))
 RETRY_SWITCH_BUDGET = int(os.environ.get("TA_RETRY_SWITCH_BUDGET", "1"))
 _LOG_TAIL_LINES = 40
+WATCHDOG_TRIGGER_SILENCE = "silence-timeout"
+WATCHDOG_TRIGGER_DEAD_HANDLE = "dead-terminal-handle"
 
 
 @contextmanager
@@ -370,8 +372,18 @@ def _advance(records: dict, statuses: dict[str, str]) -> bool:
             records.pop(ref)
             changed = True
         else:
-            last = (worker.terminal_activity(rec.get("handle", ""), rec["workspace"])
-                    if rec.get("workspace") else None)
+            handle = rec.get("handle", "")
+            status = worker.terminal_status(handle, rec.get("workspace"))
+            if handle and status.get("known") and not status.get("live"):
+                elapsed = time.time() - rec.get("last_activity", rec.get("claimed_at", time.time()))
+                _watchdog_retry(ref, card, rec, statuses, elapsed,
+                                trigger=WATCHDOG_TRIGGER_DEAD_HANDLE,
+                                handle_status=status.get("reason") or "dead",
+                                handle=handle)
+                records.pop(ref)
+                changed = True
+                continue
+            last = status.get("last_activity") if status.get("live") else None
             if last:
                 rec["last_activity"] = last
                 changed = True
@@ -418,7 +430,28 @@ def _stop_terminal_best_effort(ref: str, ws: str | None) -> None:
                       error=worker.scrub_secrets(str(e)))
 
 
-def _watchdog_retry(ref: str, card: dict, rec: dict, statuses: dict[str, str], silent: float) -> None:
+def _watchdog_observation(current_head: str, silent: float, trigger: str,
+                          handle_status: str | None, handle: str | None) -> str:
+    if trigger == WATCHDOG_TRIGGER_DEAD_HANDLE:
+        shown = handle or "(empty)"
+        detail = f" ({handle_status})" if handle_status else ""
+        return f"tracked terminal handle {shown} для головы {current_head} не живой{detail}"
+    return f"голова {current_head} молчала {int(silent)}s (порог {WATCHDOG_SECONDS}s)"
+
+
+def _watchdog_log_fields(trigger: str, silent: float, handle_status: str | None,
+                         handle: str | None) -> dict:
+    fields = {"trigger": trigger, "silent": int(silent)}
+    if handle_status:
+        fields["handle_status"] = handle_status
+    if handle is not None:
+        fields["handle"] = handle
+    return fields
+
+
+def _watchdog_retry(ref: str, card: dict, rec: dict, statuses: dict[str, str], silent: float,
+                    *, trigger: str = WATCHDOG_TRIGGER_SILENCE,
+                    handle_status: str | None = None, handle: str | None = None) -> None:
     """A watchdog timeout on an In-progress card is a head-technical failure — the resource-red
     freeze just above already ruled out "the account is down", so this is the head process itself
     gone silent/dead. Retried by budget (RETRY_SAME_BUDGET same head, RETRY_SWITCH_BUDGET the next
@@ -450,6 +483,8 @@ def _watchdog_retry(ref: str, card: dict, rec: dict, statuses: dict[str, str], s
     tried = [h for h in (meta.get(model.META_RETRY_HEADS) or "").split(",") if h]
     if current_head not in tried:
         tried.append(current_head)
+    observed = _watchdog_observation(current_head, silent, trigger, handle_status, handle)
+    log_fields = _watchdog_log_fields(trigger, silent, handle_status, handle)
 
     if retry_same < RETRY_SAME_BUDGET:
         retry_same += 1
@@ -459,12 +494,12 @@ def _watchdog_retry(ref: str, card: dict, rec: dict, statuses: dict[str, str], s
                             retry_heads=",".join(tried))
         ops.add_comment(
             "dispatcher", ref,
-            f"watchdog: голова {current_head} молчала {int(silent)}s (порог {WATCHDOG_SECONDS}s). "
+            f"watchdog: {observed}. "
             f"Авторетрай той же головой (попытка {retry_same}/{RETRY_SAME_BUDGET}), воркспейс "
             f"{ws or '(неизвестен)'} снесён, карточка в Ready на переклейм.",
             marker=model.MARKER_WATCHDOG_RETRY)
         STATE.log_run("advance", reference=ref, to="Ready", reason="watchdog-retry-same",
-                      silent=int(silent), head=current_head, retry_same=retry_same)
+                      head=current_head, retry_same=retry_same, **log_fields)
         return
 
     if retry_switch < RETRY_SWITCH_BUDGET:
@@ -478,14 +513,14 @@ def _watchdog_retry(ref: str, card: dict, rec: dict, statuses: dict[str, str], s
                                 retry_heads=",".join(tried), head=resolved)
             ops.add_comment(
                 "dispatcher", ref,
-                f"watchdog: голова {current_head} молчала {int(silent)}s, ретрай той же головой "
-                f"исчерпан. Авторетрай сменой головы на {resolved} (попытка {retry_switch}/"
+                f"watchdog: {observed}, ретрай той же головой исчерпан. Авторетрай сменой головы "
+                f"на {resolved} (попытка {retry_switch}/"
                 f"{RETRY_SWITCH_BUDGET} по цепочке heads.toml), воркспейс снесён, карточка в "
                 f"Ready на переклейм.",
                 marker=model.MARKER_WATCHDOG_RETRY)
             STATE.log_run("advance", reference=ref, to="Ready", reason="watchdog-retry-switch",
-                          silent=int(silent), head=current_head, switched_to=resolved,
-                          retry_switch=retry_switch)
+                          head=current_head, switched_to=resolved, retry_switch=retry_switch,
+                          **log_fields)
             return
         if not exhausted:
             _teardown_best_effort(ref, ws)
@@ -494,12 +529,12 @@ def _watchdog_retry(ref: str, card: dict, rec: dict, statuses: dict[str, str], s
                                 retry_heads=",".join(tried))
             ops.add_comment(
                 "dispatcher", ref,
-                f"watchdog: голова {current_head} молчала {int(silent)}s, ретрай той же головой "
-                f"исчерпан, а вся оставшаяся цепочка heads.toml сейчас красная. Бюджет смены не "
-                f"тратится, карточка в Ready ждёт зелёного ресурса.",
+                f"watchdog: {observed}, ретрай той же головой исчерпан, а вся оставшаяся цепочка "
+                f"heads.toml сейчас красная. Бюджет смены не тратится, карточка в Ready ждёт "
+                f"зелёного ресурса.",
                 marker=model.MARKER_WATCHDOG_RETRY)
             STATE.log_run("advance", reference=ref, to="Ready", reason="watchdog-retry-wait",
-                          silent=int(silent), head=current_head)
+                          head=current_head, **log_fields)
             return
 
     ws_note = (f"воркспейс {ws} оставлен для разбора" if ws
@@ -508,12 +543,11 @@ def _watchdog_retry(ref: str, card: dict, rec: dict, statuses: dict[str, str], s
         "dispatcher", ref,
         f"watchdog: бюджет авторетраев исчерпан ({RETRY_SAME_BUDGET} той же головой + "
         f"{RETRY_SWITCH_BUDGET} сменой). Попытки: {', '.join(tried)}. Последняя голова "
-        f"{current_head} молчала {int(silent)}s (порог {WATCHDOG_SECONDS}s). Карточка в Blocked, "
-        f"{ws_note}.")
+        f"дала сбой: {observed}. Карточка в Blocked, {ws_note}.")
     ops.move_card("dispatcher", ref, "Blocked")
-    STATE.log_run("advance", reference=ref, to="Blocked", reason="watchdog", silent=int(silent),
-                  head=current_head, retry_same=retry_same, retry_switch=retry_switch,
-                  tried_heads=tried)
+    STATE.log_run("advance", reference=ref, to="Blocked", reason="watchdog", head=current_head,
+                  retry_same=retry_same, retry_switch=retry_switch, tried_heads=tried,
+                  **log_fields)
 
 
 def _format_comment_ts(ts) -> str:
