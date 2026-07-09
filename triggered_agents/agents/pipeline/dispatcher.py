@@ -374,7 +374,7 @@ def _advance(records: dict, statuses: dict[str, str]) -> bool:
         else:
             handle = rec.get("handle", "")
             status = worker.terminal_status(handle, rec.get("workspace"))
-            if handle and status.get("known") and not status.get("live"):
+            if status.get("known") and not status.get("live"):
                 elapsed = time.time() - rec.get("last_activity", rec.get("claimed_at", time.time()))
                 _watchdog_retry(ref, card, rec, statuses, elapsed,
                                 trigger=WATCHDOG_TRIGGER_DEAD_HANDLE,
@@ -602,15 +602,11 @@ def _task_md(card: dict, view: dict, base: str) -> str:
     was added (plus the new always-on protocol lines below). A card returning from Blocked or a
     dead head carries its history, so the header also warns that a branch/PR may already exist.
 
-    `base` is the already-resolved base branch (card's own base_branch override, or the project's
-    manifest default — worker.resolve_base_branch, computed once by the caller) — named explicitly
-    in the PR-open instruction so a card with a sprint-shim override never has the worker guess at
-    `gh pr create`'s own default branch.
+    `base` is the already-resolved base branch (card override or manifest default, computed once
+    by the caller), so a sprint-shim card never has the worker guess at `gh pr create`'s default.
 
-    A contrib (fork) project never opens a PR in this pipeline (a human does it against upstream
-    from the pushed branch) — its Done/report protocol replaces the PR-link paragraphs with a
-    push-to-origin-only Done and a report:done that must carry `branch:`/`head:` protocol lines
-    instead of a PR link (parsed back by validate._contrib_ref)."""
+    A contrib project never opens a PR here; its Done/report protocol carries `branch:`/`head:`
+    lines instead of a PR link (parsed back by validate._contrib_ref)."""
     ref = card["reference"]
     branch = naming.worker_branch(ref)
     comments = view.get("comments") or []

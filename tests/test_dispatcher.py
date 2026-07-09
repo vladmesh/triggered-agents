@@ -486,9 +486,22 @@ class DispatcherTest(_DispatcherBase):
         self.assertEqual(self._column(ref_a), model.IN_PROGRESS)
 
     def test_claim_stops_at_cap(self):
-        self.board.add_task("busy", "In progress", swimlane="other",
-                            meta={model.META_TASK_TYPE: "research", model.META_PROJECT: "other",
-                                  model.META_CLAIM: "w0"})
+        busy = self.board.add_task("busy", "In progress", swimlane="other",
+                                   meta={model.META_TASK_TYPE: "research", model.META_PROJECT: "other",
+                                         model.META_CLAIM: "w0"})
+        now = time.time()
+        dispatcher._save_cards({
+            busy: {
+                "workspace": "/ws/w0",
+                "worker": "w0",
+                "handle": "handle-w0",
+                "title": "worker busy",
+                "head": heads.DEFAULT_PROFILE,
+                "claimed_at": now,
+                "last_activity": now,
+                "comment_baseline": 0,
+            }
+        })
         ref = self._ready_card("A")
         with mock.patch.object(dispatcher, "WORKER_CAP", 1):
             dispatcher.tick()
@@ -796,6 +809,29 @@ class DispatcherTest(_DispatcherBase):
                             and r.get("handle_status") == "unwritable"
                             for r in self._runs()))
 
+    def test_missing_worker_handle_retries_same_head_without_waiting_for_silence(self):
+        ref = self._claim_one()
+        records = dispatcher._load_cards()
+        rec = records[ref]
+        rec["handle"] = ""
+        rec["last_activity"] = time.time()
+        dispatcher._save_cards(records)
+        dispatcher.WATCHDOG_SECONDS = 3600
+
+        dispatcher.tick()
+
+        self.assertIn(("", rec["workspace"]), self.worker.terminal_status_polled)
+        self.assertEqual(self._column(ref), model.IN_PROGRESS)
+        self.assertIn(rec["workspace"], self.worker.torn_down)
+        meta = ops.show_card(ref)["metadata"]
+        self.assertEqual(meta[model.META_RETRY_SAME], "1")
+        self.assertTrue(any(r.get("event") == "advance"
+                            and r.get("reason") == "watchdog-retry-same"
+                            and r.get("trigger") == dispatcher.WATCHDOG_TRIGGER_DEAD_HANDLE
+                            and r.get("handle_status") == "missing-handle"
+                            and r.get("handle") == ""
+                            for r in self._runs()))
+
     def test_dead_worker_handle_follows_same_switch_then_blocked_budget(self):
         reg = heads.Registry(
             resources={"res-a": {"probe": "true"}, "res-b": {"probe": "true"}},
@@ -858,7 +894,9 @@ class DispatcherTest(_DispatcherBase):
         dispatcher.tick()
         records = dispatcher._load_cards()
         self.assertIn(ref, records)
-        self.assertEqual(records[ref]["worker"], "w-crash")
+        self.assertEqual(records[ref]["worker"], "1-a")
+        self.assertIn("/ws/w-crash", self.worker.torn_down)
+        self.assertEqual(ops.show_card(ref)["metadata"][model.META_RETRY_SAME], "1")
         self.assertTrue(any(r["event"] == "reconcile" for r in self._runs()))
         # From here the normal machinery applies: a report moves it to Validate.
         ops.report(ref, "done", "shipped after crash")
@@ -868,12 +906,16 @@ class DispatcherTest(_DispatcherBase):
     def test_reconciled_card_hits_watchdog_on_silence(self):
         ref = self._ready_card("A")
         ops.claim_card(ref, "w-crash")
-        dispatcher.tick()  # adopt
-        dispatcher.WATCHDOG_SECONDS = -1
-        dispatcher.tick()  # live budget -> same-head retry, not a terminal Blocked
+        dispatcher.WATCHDOG_SECONDS = 3600
+        dispatcher.tick()
         self.assertEqual(self._column(ref), model.IN_PROGRESS)
         self.assertIn("/ws/w-crash", self.worker.torn_down)
         self.assertEqual(ops.show_card(ref)["metadata"][model.META_RETRY_SAME], "1")
+        self.assertTrue(any(r.get("event") == "advance"
+                            and r.get("reason") == "watchdog-retry-same"
+                            and r.get("trigger") == dispatcher.WATCHDOG_TRIGGER_DEAD_HANDLE
+                            and r.get("handle_status") == "missing-handle"
+                            for r in self._runs()))
 
     def test_reconcile_restores_workspace_from_claim(self):
         # The claim IS the card's workspace base name (naming._worker_id) — reconcile must rebuild
@@ -881,12 +923,8 @@ class DispatcherTest(_DispatcherBase):
         ref = self._ready_card("A")
         ops.claim_card(ref, "w-crash")
         dispatcher.tick()
-        records = dispatcher._load_cards()
-        self.assertEqual(records[ref]["workspace"], "/ws/w-crash")
-        dispatcher.WATCHDOG_SECONDS = 600
-        self.worker.activity_ts = None
-        dispatcher.tick()  # advance polls activity for the watchdog clock
-        self.assertIn("/ws/w-crash", self.worker.activity_polled)
+        self.assertIn(("", "/ws/w-crash"), self.worker.terminal_status_polled)
+        self.assertIn("/ws/w-crash", self.worker.torn_down)
 
     def test_restore_workspace_warns_on_empty_claim(self):
         # Nothing to rebuild a workspace name from — an explicit warn, not a silent "" adoption.
