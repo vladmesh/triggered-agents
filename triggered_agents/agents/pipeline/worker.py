@@ -157,6 +157,13 @@ def is_contrib(project: str) -> bool:
     return bool(_load_manifest(project).get("workspace", {}).get("contrib", False))
 
 
+def ci_expected(project: str) -> bool:
+    """Whether Validate should wait for a GitHub CI rollup. `[validate] ci = "none"` declares that
+    no GitHub checks are expected; absent config keeps the historical required-CI behavior."""
+    mode = _load_manifest(project).get("validate", {}).get("ci", "required")
+    return str(mode).strip().lower() != "none"
+
+
 # --- Agent worktrees (curator/pipeline/retro/steward's own worktrees, not a task workspace) ---
 # Each triggered-agent gets its own named Orca worktree under AGENTS_ROOT (deploy/provision.py
 # creates it, pinned to origin/main at provision time). Agents never commit to this repo, so from
