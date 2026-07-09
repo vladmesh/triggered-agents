@@ -255,6 +255,17 @@ class ManifestLookupTest(unittest.TestCase):
         self._project_dir("bare-proj")
         self.assertEqual(worker.read_base_branch("bare-proj"), "main")
         self.assertFalse(worker.is_contrib("bare-proj"))
+        self.assertTrue(worker.ci_expected("bare-proj"))
+
+    def test_validate_ci_none_disables_required_ci(self):
+        d = self._project_dir("no-ci-proj")
+        (d / "workspace.toml").write_text('[validate]\nci = "none"\n')
+        self.assertFalse(worker.ci_expected("no-ci-proj"))
+
+    def test_validate_ci_defaults_to_required_when_unset(self):
+        d = self._project_dir("ci-proj")
+        (d / "workspace.toml").write_text('[workspace]\nbase_branch = "main"\n')
+        self.assertTrue(worker.ci_expected("ci-proj"))
 
     def test_resolve_base_branch_card_override_wins_over_manifest(self):
         d = self._project_dir("sprint-proj")

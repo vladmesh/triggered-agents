@@ -391,12 +391,15 @@ def _validate_card(card: dict, records: dict, watchdog_seconds: int, save_cards,
                 return True
         STATE.log_run("validate", reference=ref, to=model.IN_PROGRESS, reason="ci-red", job=job, pr=pr)
         return True
-    if status["rollup"] == "SUCCESS":
+    ci_not_expected = status["rollup"] == "NONE" and not worker.ci_expected(card.get("project") or "")
+    if status["rollup"] == "SUCCESS" or ci_not_expected:
         # SUCCESS is a terminal rollup too (symmetric to the FAILURE reset above): a card that sat
         # on PENDING for a while before going green must not carry that stale clock into a LATER
         # PENDING spell (the worker keeps pushing after report:done, or a human re-runs the
         # workflow) — that would consume the fresh restart's own budget with old, already-green
-        # elapsed time and trip the watchdog on a CI run that only just started.
+        # elapsed time and trip the watchdog on a CI run that only just started. A declared no-CI
+        # project takes the same reset when rollup is NONE: layer 1 is settled by the workspace
+        # smoke gate, so the ci-none watchdog must not keep counting.
         if rec is not None:
             rec.pop("ci_pending_since", None)
         # Marker checks are scoped to the card's report baseline (reset on every re-entry to
@@ -406,10 +409,18 @@ def _validate_card(card: dict, records: dict, watchdog_seconds: int, save_cards,
         if stand_cfg is None:
             # No stand: CI is the only mechanical layer. Note it once per code state, then layer 3.
             if not _has_marker_since(view, model.MARKER_VALIDATE_GREEN, baseline):
+                if ci_not_expected:
+                    comment = (f"CI не ожидается по манифесту проекта, GitHub checks для {pr} "
+                               f"отсутствуют. Слой 1 пройден, запускаю независимое ревью (слой 3).")
+                    result = "ci-none-declared"
+                else:
+                    comment = (f"CI зелёный по {pr}. Слой 1 пройден, запускаю независимое "
+                               f"ревью (слой 3).")
+                    result = "ci-green"
                 ops.add_comment("dispatcher", ref,
-                                f"CI зелёный по {pr}. Слой 1 пройден, запускаю независимое ревью (слой 3).",
+                                comment,
                                 marker=model.MARKER_VALIDATE_GREEN)
-                STATE.log_run("validate", reference=ref, result="ci-green", pr=pr)
+                STATE.log_run("validate", reference=ref, result=result, pr=pr)
                 view = ops.show_card(ref)
         elif not _has_marker_since(view, model.MARKER_STAND_GREEN, baseline):
             # Stand project: layer 2 not passed for this code state yet — gate on the stand first.

@@ -75,6 +75,7 @@ class FakeWorker:
         self.ff_results = {}             # path -> ff_worktree result dict (default: clean no-op ff)
         self.ff_calls = []               # (path, base_branch) every ff_worktree call
         self.contrib_projects = set()    # project names is_contrib() should report True for
+        self.no_ci_projects = set()      # project names ci_expected() should report False for
         self.remote_head_shas = {}       # branch -> sha remote_head_sha returns; missing -> None
         self.stopped_terminals = []      # workspaces stop_terminals was asked to stop (no rm)
         self.workspace_calls = []        # (project, name, base_branch) every create_workspace call
@@ -90,6 +91,9 @@ class FakeWorker:
 
     def is_contrib(self, project):
         return project in self.contrib_projects
+
+    def ci_expected(self, project):
+        return project not in self.no_ci_projects
 
     def list_agent_worktrees(self):
         return list(self.agent_worktrees)
@@ -246,7 +250,8 @@ class _DispatcherBase(unittest.TestCase):
         self.addCleanup(p.stop)
 
         self.worker = FakeWorker()
-        for name in ("read_base_branch", "is_contrib", "create_workspace", "set_branch", "provision",
+        for name in ("read_base_branch", "is_contrib", "ci_expected",
+                     "create_workspace", "set_branch", "provision",
                      "write_task", "launch_worker", "activity", "terminal_activity", "poll_pr", "notify",
                      "terminal_status", "terminal_live", "teardown", "read_stand_config", "pr_branch", "run_stand",
                      "spawn_reviewer",
@@ -1744,7 +1749,7 @@ class ValidateTest(_DispatcherBase):
         self.assertTrue(any(r["event"] == "validate" and r.get("result") == "ci-pending"
                             for r in self._runs()))
 
-    def test_ci_none_within_budget_stays_in_validate(self):
+    def test_ci_none_without_manifest_flag_stays_in_validate(self):
         # NONE (no checks configured at all) is the same non-terminal case as PENDING; several
         # ticks under the (generous default) budget must not touch the card.
         ref = self._to_validate()
@@ -1754,6 +1759,48 @@ class ValidateTest(_DispatcherBase):
             dispatcher.tick()
         self.assertEqual(self._column(ref), "Validate")
         self.assertIn(ref, dispatcher._load_cards())
+
+    def test_ci_none_with_manifest_flag_reaches_review(self):
+        self.worker.no_ci_projects.add("personal_site")
+        ref = self._to_validate()
+        self.worker.pr_status = {"merged": False, "state": "OPEN", "rollup": "NONE",
+                                 "failed_job": None, "failed_log": None}
+
+        dispatcher.tick()
+
+        self.assertEqual(self._column(ref), "Validate")
+        rec = dispatcher._load_cards()[ref]
+        self.assertNotIn("ci_pending_since", rec)
+        self.assertNotIn("validate_stall_fails", rec)
+        self.assertIn("review_ws", rec)
+        self.assertEqual(len(self.worker.reviewer_spawns), 1)
+        journal = self._markers(ref)
+        self.assertIn("CI не ожидается", journal)
+        self.assertTrue(any(r["event"] == "validate" and r.get("result") == "ci-none-declared"
+                            for r in self._runs()))
+
+    def test_no_ci_project_pending_rollup_still_waits(self):
+        self.worker.no_ci_projects.add("personal_site")
+        ref = self._to_validate()
+        self.worker.pr_status = {"merged": False, "state": "OPEN", "rollup": "PENDING",
+                                 "failed_job": None, "failed_log": None}
+
+        dispatcher.tick()
+
+        self.assertEqual(self._column(ref), "Validate")
+        self.assertIn("ci_pending_since", dispatcher._load_cards()[ref])
+        self.assertEqual(self.worker.reviewer_spawns, [])
+
+    def test_no_ci_project_red_ci_still_returns_to_in_progress(self):
+        self.worker.no_ci_projects.add("personal_site")
+        ref = self._to_validate()
+        self.worker.pr_status = {"merged": False, "state": "OPEN", "rollup": "FAILURE",
+                                 "failed_job": "CI", "failed_log": "boom"}
+
+        dispatcher.tick()
+
+        self.assertEqual(self._column(ref), model.IN_PROGRESS)
+        self.assertIn("CI красный", self._markers(ref))
 
     def test_ci_pending_escalates_once_past_stall_budget(self):
         ref = self._to_validate()
