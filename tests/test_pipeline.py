@@ -18,7 +18,7 @@ os.environ["TA_PIPELINE_STATE_DIR"] = _PIPELINE_STATE_DIR
 os.environ.pop("KANBOARD_ADMIN_USER", None)
 
 from triggered_agents.runtime.kanboard import KanboardError  # noqa: E402
-from triggered_agents.agents.pipeline import model, ops  # noqa: E402
+from triggered_agents.agents.pipeline import model, ops, worker  # noqa: E402
 
 
 class FakeBoard:
@@ -288,10 +288,21 @@ class TestCreate(PatchedBoardTest):
         out = ops.create_card("personal_site", "code", "T", head="claude-opus")
         self.assertEqual(board.metadata[out["id"]][model.META_HEAD], "claude-opus")
 
+    def test_review_head_is_stored_in_metadata(self):
+        board = self.make_board()
+        out = ops.create_card("personal_site", "code", "T", review_head="claude-opus")
+        self.assertEqual(board.metadata[out["id"]][model.META_REVIEW_HEAD], "claude-opus")
+
     def test_unknown_head_raises_and_creates_nothing(self):
         board = self.make_board()
         with self.assertRaises(model.GuardError):
             ops.create_card("personal_site", "code", "T", head="codex-nope")
+        self.assertEqual(board.tasks, {})
+
+    def test_unknown_review_head_raises_and_creates_nothing(self):
+        board = self.make_board()
+        with self.assertRaises(model.GuardError):
+            ops.create_card("personal_site", "code", "T", review_head="codex-nope")
         self.assertEqual(board.tasks, {})
 
     def test_steward_role_scrubs_title_and_description(self):
@@ -428,7 +439,7 @@ class TestUpdate(PatchedBoardTest):
         self.assertEqual(board.metadata[tid][model.META_HEAD], "claude-opus")
         self.assertEqual(out, {"action": "updated", "reference": ref,
                                "slug": "old-slug", "head": "claude-opus", "blocked_by": "",
-                               "base_branch": ""})
+                               "review_head": "", "base_branch": ""})
 
     def test_unknown_head_raises_and_writes_nothing(self):
         board = self.make_board()
@@ -436,6 +447,26 @@ class TestUpdate(PatchedBoardTest):
                                                  model.META_PROJECT: "personal_site"})
         with self.assertRaises(model.GuardError):
             ops.update_card("po", ref, head="nope-not-a-profile")
+        self.assertEqual(board.method_calls("saveTaskMetadata"), [])
+
+    def test_review_head_is_stored_and_clearable(self):
+        board = self.make_board()
+        ref = board.add_task("A", "Ready", meta={model.META_TASK_TYPE: "code",
+                                                 model.META_PROJECT: "personal_site"})
+        out = ops.update_card("po", ref, review_head="claude-opus")
+        self.assertEqual(out["review_head"], "claude-opus")
+        tid = next(t["id"] for t in board.tasks.values() if t["reference"] == ref)
+        self.assertEqual(board.metadata[tid][model.META_REVIEW_HEAD], "claude-opus")
+        out = ops.update_card("po", ref, review_head="")
+        self.assertEqual(out["review_head"], "")
+        self.assertEqual(board.metadata[tid][model.META_REVIEW_HEAD], "")
+
+    def test_unknown_review_head_raises_and_writes_nothing(self):
+        board = self.make_board()
+        ref = board.add_task("A", "Ready", meta={model.META_TASK_TYPE: "code",
+                                                 model.META_PROJECT: "personal_site"})
+        with self.assertRaises(model.GuardError):
+            ops.update_card("po", ref, review_head="nope-not-a-profile")
         self.assertEqual(board.method_calls("saveTaskMetadata"), [])
 
     def test_valid_blocked_by_is_stored(self):
@@ -537,6 +568,16 @@ class TestCliUpdate(PatchedBoardTest):
         tid = next(t["id"] for t in board.tasks.values() if t["reference"] == ref)
         self.assertEqual(board.metadata[tid][model.META_BASE_BRANCH], "sprint/007-dnd")
 
+    def test_po_update_review_head_ok(self):
+        board = self.make_board()
+        ref = board.add_task("A", "Ready", meta={model.META_TASK_TYPE: "code",
+                                                 model.META_PROJECT: "personal_site"})
+        rc = self.cli.main(["--role", "po", "update", "--ref", ref,
+                           "--review-head", "claude-opus"])
+        self.assertEqual(rc, 0)
+        tid = next(t["id"] for t in board.tasks.values() if t["reference"] == ref)
+        self.assertEqual(board.metadata[tid][model.META_REVIEW_HEAD], "claude-opus")
+
 
 class TestCliCreateBaseBranch(PatchedBoardTest):
     def setUp(self):
@@ -551,6 +592,46 @@ class TestCliCreateBaseBranch(PatchedBoardTest):
         self.assertEqual(rc, 0)
         tid = next(iter(board.tasks))
         self.assertEqual(board.metadata[tid][model.META_BASE_BRANCH], "sprint/007-dnd")
+
+
+class TestCliCreateReviewHead(PatchedBoardTest):
+    def setUp(self):
+        from triggered_agents.agents.pipeline import cli
+        self.cli = cli
+
+    def test_po_create_with_review_head_ok(self):
+        board = self.make_board()
+        rc = self.cli.main(["--role", "po", "create", "--project", "personal_site",
+                           "--type", "code", "--title", "T",
+                           "--review-head", "claude-opus"])
+        self.assertEqual(rc, 0)
+        tid = next(iter(board.tasks))
+        self.assertEqual(board.metadata[tid][model.META_REVIEW_HEAD], "claude-opus")
+
+
+class TestListShowHeads(PatchedBoardTest):
+    def test_list_includes_review_head_and_defaults(self):
+        board = self.make_board()
+        ref = board.add_task("A", "Ready", meta={model.META_TASK_TYPE: "code",
+                                                 model.META_PROJECT: "personal_site",
+                                                 model.META_HEAD: "codex-extra",
+                                                 model.META_REVIEW_HEAD: "claude-opus"})
+        card = ops.list_cards(column="Ready")[0]
+        self.assertEqual(card["reference"], ref)
+        self.assertEqual(card["head"], "codex-extra")
+        self.assertEqual(card["effective_head"], "codex-extra")
+        self.assertEqual(card["review_head"], "claude-opus")
+        self.assertEqual(card["effective_review_head"], "claude-opus")
+
+    def test_show_exposes_default_reviewer_for_old_cards(self):
+        board = self.make_board()
+        ref = board.add_task("A", "Ready", meta={model.META_TASK_TYPE: "code",
+                                                 model.META_PROJECT: "personal_site"})
+        card = ops.show_card(ref)
+        self.assertEqual(card["head"], "")
+        self.assertEqual(card["effective_head"], "codex")
+        self.assertEqual(card["review_head"], "")
+        self.assertEqual(card["effective_review_head"], worker.REVIEWER_HEAD)
 
 
 class TestClaim(PatchedBoardTest):
@@ -573,6 +654,13 @@ class TestClaim(PatchedBoardTest):
                                                  model.META_HEAD: "hermes"})
         ops.claim_card(ref, "w1")  # must not raise
 
+    def test_known_review_head_claims_fine(self):
+        board = self.make_board()
+        ref = board.add_task("A", "Ready", meta={model.META_TASK_TYPE: "code",
+                                                 model.META_PROJECT: "personal_site",
+                                                 model.META_REVIEW_HEAD: "claude-opus"})
+        ops.claim_card(ref, "w1")  # must not raise
+
     def test_refuses_unknown_head_with_clear_message(self):
         board = self.make_board()
         ref = board.add_task("A", "Ready", meta={model.META_TASK_TYPE: "code",
@@ -583,6 +671,17 @@ class TestClaim(PatchedBoardTest):
         self.assertIn("codex-nope", str(ctx.exception))
         tid = next(t["id"] for t in board.tasks.values() if t["reference"] == ref)
         self.assertEqual(board._column_title_for(tid), "Ready")  # claim never touched the card
+
+    def test_refuses_unknown_review_head_with_clear_message(self):
+        board = self.make_board()
+        ref = board.add_task("A", "Ready", meta={model.META_TASK_TYPE: "code",
+                                                 model.META_PROJECT: "personal_site",
+                                                 model.META_REVIEW_HEAD: "codex-nope"})
+        with self.assertRaises(model.GuardError) as ctx:
+            ops.claim_card(ref, "w1")
+        self.assertIn("codex-nope", str(ctx.exception))
+        tid = next(t["id"] for t in board.tasks.values() if t["reference"] == ref)
+        self.assertEqual(board._column_title_for(tid), "Ready")
 
     def test_refuses_when_not_ready(self):
         board = self.make_board()

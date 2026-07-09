@@ -650,12 +650,18 @@ def _review_id(card: dict) -> str:
     return naming.dedupe(base, lambda n: worker.workspace_exists(project, n))
 
 
+def _card_review_head(card: dict) -> str:
+    """Reviewer profile selected for this card, falling back to the global default."""
+    return card.get("review_head") or worker.REVIEWER_HEAD
+
+
 def clear_review(rec: dict) -> None:
     """Drop the reviewer bookkeeping and tear down its throwaway worktree. The lifetime return
     count (review_returns) is deliberately kept — it caps returns across the whole card life."""
     ws = rec.pop("review_ws", "")
     rec.pop("review_baseline", None)
     rec.pop("review_handle", None)
+    rec.pop("review_head", None)
     rec.pop("review_title", None)
     rec.pop("review_activity", None)
     rec.pop("review_spawn_fails", None)
@@ -711,6 +717,7 @@ def _spawn_reviewer(ref: str, pr: str | None, card: dict, rec: dict, records: di
     project = card.get("project") or ""
     spec = ops.show_card(ref).get("description", "")
     review_title = naming.reviewer_title(naming.card_id(ref), card.get("title") or ref)
+    review_head = _card_review_head(card)
     label = pr if pr else f"ветке `{contrib[0]}` @ `{contrib[1]}`"
     note = f"PR: {pr}" if pr else f"Ветка: `{contrib[0]}` @ `{contrib[1]}`"
     try:
@@ -720,7 +727,8 @@ def _spawn_reviewer(ref: str, pr: str | None, card: dict, rec: dict, records: di
                                         head_sha=contrib[1] if contrib else None)
         ws, handle = worker.spawn_reviewer(project, _review_id(card), base, review_md, review_title,
                                            naming.worker_branch(ref), naming.reviewer_branch(ref),
-                                           head_sha=contrib[1] if contrib else None)
+                                           head_sha=contrib[1] if contrib else None,
+                                           review_head=review_head)
     except worker.WorkspaceError as e:
         # spawn_reviewer already tore down any half-created worktree. Retry a few ticks (transient
         # orca), then escalate to Blocked — a persistent failure must not retry forever with no
@@ -735,26 +743,28 @@ def _spawn_reviewer(ref: str, pr: str | None, card: dict, rec: dict, records: di
             ops.move_card("dispatcher", ref, "Blocked")
             records.pop(ref, None)
             STATE.log_run("review", reference=ref, to="Blocked", reason="spawn-cap",
-                          fails=fails, pr=pr)
+                          fails=fails, pr=pr, review_head=review_head)
             return True
         rec["review_spawn_fails"] = fails
         save_cards(records)
         STATE.log_run("review", reference=ref, result="spawn-failed", level="warn",
-                      error=scrubbed, fails=fails, pr=pr)
+                      error=scrubbed, fails=fails, pr=pr, review_head=review_head)
         return True
     ops.add_comment("dispatcher", ref,
                     f"Нижние слои валидации зелёные. Запущена независимая голова-ревьюер (слой 3) "
-                    f"по {label}: вердикт по каждому criterion спеки и находки блокер/замечание "
-                    f"появятся в комментарии.")
+                    f"`{review_head}` по {label}: вердикт по каждому criterion спеки и находки "
+                    f"блокер/замечание появятся в комментарии.")
     rec.pop("review_spawn_fails", None)
     rec["review_ws"] = ws
     rec["review_handle"] = handle
-    rec["review_terminal_kind"] = worker.reviewer_terminal_kind()
+    rec["review_head"] = review_head
+    rec["review_terminal_kind"] = worker.reviewer_terminal_kind(review_head)
     rec["review_title"] = review_title
     rec["review_activity"] = time.time()
     rec["review_baseline"] = len(ops.show_card(ref)["comments"])
     save_cards(records)
-    STATE.log_run("review", reference=ref, result="spawned", workspace=ws, pr=pr)
+    STATE.log_run("review", reference=ref, result="spawned", workspace=ws, pr=pr,
+                  review_head=review_head)
     return True
 
 
@@ -764,14 +774,13 @@ def _review_watchdog(ref: str, rec: dict, records: dict, watchdog_seconds: int,
     Block the card до vladmesh — a dead reviewer must never leave the card stuck in Validate.
 
     `statuses` (this tick's resource health, from health.refresh) freezes this clock the same way
-    dispatcher._advance freezes the worker's: the reviewer head is spawned under
-    worker.REVIEWER_HEAD, a config knob rather than a per-card field, so its resource is resolved
-    through health.resource_of(worker.REVIEWER_HEAD) rather than a stored head id. While that
-    resource is red, silence is "the subscription/key is down right now", not "the reviewer died"
-    (2026-07-04 incident — same 5h subscription limit as #31, this time silencing the reviewer
-    instead of a worker). Frozen means review_activity keeps sliding to now every tick the
-    resource stays red, so once it turns green again the card gets a full fresh watchdog_seconds
-    window rather than an instantly-expired one."""
+    dispatcher._advance freezes the worker's. The reviewer head is stored in `rec["review_head"]`
+    when spawned, so the freeze follows the actual reviewer profile chosen for this card. While
+    that resource is red, silence is "the subscription/key is down right now", not "the reviewer
+    died" (2026-07-04 incident, same 5h subscription limit as #31, this time silencing the reviewer
+    instead of a worker). Frozen means review_activity keeps sliding to now every tick the resource
+    stays red, so once it turns green again the card gets a full fresh watchdog_seconds window
+    rather than an instantly-expired one."""
     ws = rec.get("review_ws")
     changed = False
     worker.rename_terminal(rec.get("review_handle", ""), rec.get("review_title", ""))
@@ -788,7 +797,8 @@ def _review_watchdog(ref: str, rec: dict, records: dict, watchdog_seconds: int,
     if last and last > rec.get("review_activity", 0):
         rec["review_activity"] = last
         changed = True
-    resource = health.resource_of(worker.REVIEWER_HEAD)
+    review_head = rec.get("review_head") or worker.REVIEWER_HEAD
+    resource = health.resource_of(review_head)
     if resource and statuses.get(resource) == health.RED:
         rec["review_activity"] = time.time()
         return True

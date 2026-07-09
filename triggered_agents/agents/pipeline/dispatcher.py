@@ -41,10 +41,9 @@ import os
 import sys
 import time
 from contextlib import contextmanager
-from datetime import datetime, timezone
 
 from ...runtime.state import PRECHECK_SKIP
-from . import health, heads, model, naming, ops, pause as pause_flag, validate, worker
+from . import health, heads, model, naming, ops, pause as pause_flag, taskdoc, validate, worker
 from .state import STATE
 # Re-exported so dispatcher.<NAME> keeps resolving for existing callers/tests — validate.py owns
 # these now (its layer-3 rework/spawn/stall caps), dispatcher just orchestrates the tick.
@@ -550,143 +549,9 @@ def _watchdog_retry(ref: str, card: dict, rec: dict, statuses: dict[str, str], s
                   **log_fields)
 
 
-def _format_comment_ts(ts) -> str:
-    """A comment's `date_creation` (unix seconds, from Kanboard) as a readable UTC stamp. Any
-    unparsable value (a fake/test board, a future API change) falls back to the raw value rather
-    than blowing up TASK.md rendering."""
-    try:
-        return datetime.fromtimestamp(int(ts), tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    except (TypeError, ValueError):
-        return str(ts) if ts else "?"
-
-
-def _task_md_metadata(card: dict, base: str) -> list[str]:
-    """Metadata block: type, head, slug (always resolved — a card may rely on the fallback),
-    the resolved base branch (card override or manifest default — worker.resolve_base_branch already
-    picked it before this is rendered), blocked_by only when the card actually has a predecessor."""
-    lines = [
-        "## Метаданные",
-        "",
-        f"- тип: {card.get('task_type') or '?'}",
-        f"- голова: {card.get('head') or '(не задана — дефолт)'}",
-        f"- слаг: {naming.card_slug(card)}",
-        f"- база: {base}",
-    ]
-    if card.get("blocked_by"):
-        lines.append(f"- blocked_by: {card['blocked_by']}")
-    lines.append("")
-    return lines
-
-
-def _task_md_history(comments: list[dict]) -> list[str]:
-    """«История» section: every comment on the card, chronological (board API already returns
-    them in creation order), each with its date and the comment text — which already carries its
-    own `[marker]` line (report/verdict/dispatcher note), so the marker rides along verbatim
-    rather than being re-derived here. Empty when the card has no comments, so a fresh card's
-    TASK.md carries no section at all."""
-    if not comments:
-        return []
-    lines = ["## История", ""]
-    for c in comments:
-        lines.append(f"### {_format_comment_ts(c.get('ts'))}")
-        lines.append("")
-        lines.append((c.get("text") or "").strip())
-        lines.append("")
-    return lines
-
-
 def _task_md(card: dict, view: dict, base: str) -> str:
-    """The one-time TASK.md handed to the worker head: protocol header, card metadata, the spec,
-    and — when the card has prior comments — its full history. A card claimed for the first time
-    has no comments, so it gets exactly the header+metadata+spec that existed before this section
-    was added (plus the new always-on protocol lines below). A card returning from Blocked or a
-    dead head carries its history, so the header also warns that a branch/PR may already exist.
-
-    `base` is the already-resolved base branch (card override or manifest default, computed once
-    by the caller), so a sprint-shim card never has the worker guess at `gh pr create`'s default.
-
-    A contrib project never opens a PR here; its Done/report protocol carries `branch:`/`head:`
-    lines instead of a PR link (parsed back by validate._contrib_ref)."""
-    ref = card["reference"]
-    branch = naming.worker_branch(ref)
-    comments = view.get("comments") or []
-    is_contrib = worker.is_contrib(card.get("project") or "")
-    if is_contrib:
-        done_clause = (
-            f"Контриб-проект (форк): PR в этом пайплайне не открывается — ветку в форк для "
-            f"upstream-автора готовит человек. Done для тебя: код закоммичен туда, локальные тесты "
-            f"зелёные, ветка запушена в `origin` (твой форк). В коммитах никаких упоминаний AI "
-            f"и Co-Authored-By, стиль — как в git log репо."
-        )
-        report_clause = (
-            f"Отчёт по каждому acceptance criterion (сделано/нет и как проверял) — через board-CLI: "
-            f"`python3 -m triggered_agents pipeline --role worker report --ref {ref} --kind "
-            f"done|blocked --body-file <файл>`. Вместо ссылки на PR отчёт done обязан нести ветку и "
-            f"head sha пуша, ровно этими протокольными строками в теле:\n"
-            f"```\nbranch: {branch}\nhead: <sha HEAD после пуша>\n```\n"
-            f"Несогласие со спекой — `--kind blocked` с обоснованием. Карточку сам не двигаешь. "
-            f"TASK.md в репо не коммить."
-        )
-        history_tail = "origin: начни с `git fetch`, продолжай существующую ветку, не пересоздавай её."
-    else:
-        done_clause = (
-            f"Done для тебя: код закоммичен туда, локальные тесты зелёные, ветка запушена, PR "
-            f"открыт через `gh` (base — `{base}`). В коммитах и PR никаких упоминаний "
-            f"AI и Co-Authored-By, стиль — как в git log репо."
-        )
-        report_clause = (
-            f"Отчёт по каждому acceptance criterion (сделано/нет и как проверял, плюс ссылка на PR) "
-            f"— через board-CLI: `python3 -m triggered_agents pipeline --role worker report "
-            f"--ref {ref} --kind done|blocked --body-file <файл>`. Несогласие со спекой — "
-            f"`--kind blocked` с обоснованием. Карточку сам не двигаешь. TASK.md в репо не коммить."
-        )
-        history_tail = ("origin, PR может быть уже открыт: начни с `git fetch`, продолжай "
-                        "существующие ветку/PR, не пересоздавай их.")
-    lines = [
-        f"# Задача {ref} ({card.get('project', '?')})",
-        "",
-        f"Роль на доске — worker. Воркспейс уже стоит на ветке `{branch}` (её завели при подъёме "
-        f"воркспейса) — ветку создавать или переименовывать не нужно, коммить прямо в неё. "
-        f"{done_clause}",
-        "",
-        report_clause,
-        "",
-    ]
-    if comments:
-        lines += [
-            f"У карточки ниже есть история — она уже была в работе раньше (возврат из Blocked, "
-            f"умершая голова или похожий случай). Ветка `{branch}` может уже существовать на "
-            f"{history_tail}",
-            "",
-        ]
-    lines += [
-        f"Всегда (независимо от истории): force-push запрещён; пушь только в репозиторий своего "
-        f"проекта и только в свою ветку `{branch}`.",
-        "",
-        "Пауза пайплайна (`drain` или `freeze`) это админ-состояние всей очереди, не поломка "
-        "твоей карточки. Не репорти `blocked` только из-за паузы; после `resume` продолжай ту же "
-        "карточку в этом же воркспейсе.",
-        "",
-    ]
-    if is_contrib:
-        lines += [
-            f"Контриб-проект (форк): пуш только в `origin` (твой форк) — `upstream` (репо "
-            f"автора) не трогать, туда не пушить и не мержить.",
-            "",
-        ]
-    lines += _task_md_metadata(card, base)
-    lines += [
-        naming.memory_block("worker", card.get("project") or "?"),
-        "",
-    ]
-    lines += [
-        "## Спека",
-        "",
-        view.get("description") or "(описание карточки пустое)",
-        "",
-    ]
-    lines += _task_md_history(comments)
-    return "\n".join(lines).rstrip("\n") + "\n"
+    """Compatibility wrapper for tests and old doc references."""
+    return taskdoc.render(card, view, base)
 
 
 def _refresh_worker_task(card: dict, rec: dict) -> None:
@@ -977,8 +842,10 @@ def resume() -> dict:
                     continue
                 try:
                     rec["review_handle"] = worker.relaunch_reviewer(
-                        rec["review_ws"], rec.get("worker", ref), rec.get("review_title", ref))
-                    rec["review_terminal_kind"] = worker.reviewer_terminal_kind()
+                        rec["review_ws"], rec.get("worker", ref), rec.get("review_title", ref),
+                        rec.get("review_head"))
+                    rec["review_terminal_kind"] = worker.reviewer_terminal_kind(
+                        rec.get("review_head"))
                 except Exception as e:  # noqa: BLE001 — one bad relaunch must not lose the rest
                     skipped.append(f"{ref}:reviewer")
                     STATE.log_run("resume", reference=ref, result="relaunch-failed",

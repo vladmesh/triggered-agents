@@ -53,6 +53,7 @@ TASK_TYPES = ("code", "research", "debug")
 #   head         worker head profile id (heads.toml [profiles.*]); empty -> heads.DEFAULT_PROFILE.
 #                On a watchdog retry-switch this is overwritten with the head actually launched,
 #                so a later reclaim keeps using it instead of bouncing back to the original.
+#   review_head  reviewer head profile id for Validate layer 3; empty -> worker.REVIEWER_HEAD.
 #   claim        worker/workspace id, set by the claim command
 #   slug         short [a-z0-9-]{1,30} tag naming the card's worker/reviewer workspace; a card
 #                without one (old/manual) falls back to a transliterated slug of its title
@@ -74,6 +75,7 @@ META_TASK_TYPE = "task_type"
 META_PROJECT = "project"
 META_BLOCKED_BY = "blocked_by"
 META_HEAD = "head"
+META_REVIEW_HEAD = "review_head"
 META_CLAIM = "claim"
 META_SLUG = "slug"
 META_BASE_BRANCH = "base_branch"

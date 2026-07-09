@@ -184,7 +184,8 @@ def create_card(project: str, task_type: str, title: str, description: str = "",
                 ref: str | None = None, column: str = "Идеи",
                 blocked_by: str | None = None, head: str | None = None,
                 slug: str | None = None, base_branch: str | None = None,
-                role: str | None = None, own_ref: str | None = None) -> dict:
+                review_head: str | None = None, role: str | None = None,
+                own_ref: str | None = None) -> dict:
     """PO/steward/worker: create a spec card in Идеи or Ready, keyed by reference, with metadata.
 
     `role="worker"` may only reach Ready via its own chain — see _check_worker_continuation
@@ -196,9 +197,10 @@ def create_card(project: str, task_type: str, title: str, description: str = "",
     omitted, claim falls back to a transliterated slug of the title (naming.fallback_slug) so an
     old/manual card without one still claims fine. `head`, when given, must name a profile in
     heads.toml (checked before anything is written); omitted, the card gets heads.DEFAULT_PROFILE
-    at bring-up. `base_branch`, when given, overrides the project's manifest base_branch for this
-    card only (worker.resolve_base_branch); omitted, bring-up falls back to the manifest lookup
-    exactly as before this field existed.
+    at bring-up. `review_head`, when given, must name a profile too; omitted, Validate uses
+    worker.REVIEWER_HEAD. `base_branch`, when given, overrides the project's manifest base_branch
+    for this card only (worker.resolve_base_branch); omitted, bring-up falls back to the manifest
+    lookup exactly as before this field existed.
 
     `role="steward"` scrubs title/description the same way add_comment does for steward — the
     escalation/idea path SKILL.md sends steward through (create in Идеи/Ready, then move to
@@ -214,6 +216,8 @@ def create_card(project: str, task_type: str, title: str, description: str = "",
         raise model.GuardError(f"slug {slug!r} must match [a-z0-9-]{{1,30}}")
     if head:
         _check_head(head)
+    if review_head:
+        _check_head(review_head)
     if role == "worker":
         _check_worker_continuation(project, column, blocked_by, own_ref)
     if role == "steward":
@@ -233,6 +237,8 @@ def create_card(project: str, task_type: str, title: str, description: str = "",
         values[model.META_BLOCKED_BY] = blocked_by
     if head:
         values[model.META_HEAD] = head
+    if review_head:
+        values[model.META_REVIEW_HEAD] = review_head
     if slug:
         values[model.META_SLUG] = slug
     if base_branch:
@@ -274,18 +280,21 @@ def create_report_card(project: str, title: str, slug: str, description: str = "
 
 def update_card(role: str, reference: str, slug: str | None = None,
                 head: str | None = None, blocked_by: str | None = None,
-                base_branch: str | None = None) -> dict:
-    """PO-only: patch slug/head/blocked_by/base_branch metadata on an existing card. Only the
-    fields passed (not None) change; column and claim are never touched. Same validation as
-    create_card (slug SLUG_RE, head against heads.toml, blocked_by pointing at an existing
-    card), all checked before anything is written so a rejected update leaves metadata
-    untouched. `base_branch=""` clears the override back to the manifest default."""
+                base_branch: str | None = None, review_head: str | None = None) -> dict:
+    """PO-only: patch slug/head/review_head/blocked_by/base_branch metadata on an existing card.
+    Only the fields passed (not None) change; column and claim are never touched. Same validation
+    as create_card (slug SLUG_RE, head/review_head against heads.toml, blocked_by pointing at an
+    existing card), all checked before anything is written so a rejected update leaves metadata
+    untouched. `base_branch=""` clears the override back to the manifest default;
+    `review_head=""` clears the reviewer override back to worker.REVIEWER_HEAD."""
     if role != "po":
         raise model.GuardError(f"role {role!r} may not update card metadata (po only)")
     if slug is not None and not naming.SLUG_RE.match(slug):
         raise model.GuardError(f"slug {slug!r} must match [a-z0-9-]{{1,30}}")
     if head:
         _check_head(head)
+    if review_head:
+        _check_head(review_head)
     pid = board_id()
     task = _get_by_ref(reference)
     if blocked_by is not None and not call("getTaskByReference", project_id=pid, reference=blocked_by):
@@ -295,6 +304,8 @@ def update_card(role: str, reference: str, slug: str | None = None,
         values[model.META_SLUG] = slug
     if head is not None:
         values[model.META_HEAD] = head
+    if review_head is not None:
+        values[model.META_REVIEW_HEAD] = review_head
     if blocked_by is not None:
         values[model.META_BLOCKED_BY] = blocked_by
     if base_branch is not None:
@@ -307,6 +318,7 @@ def update_card(role: str, reference: str, slug: str | None = None,
         "reference": reference,
         "slug": meta.get(model.META_SLUG, ""),
         "head": meta.get(model.META_HEAD, ""),
+        "review_head": meta.get(model.META_REVIEW_HEAD, ""),
         "blocked_by": meta.get(model.META_BLOCKED_BY, ""),
         "base_branch": meta.get(model.META_BASE_BRANCH, ""),
     }
@@ -428,6 +440,9 @@ def claim_card(reference: str, worker: str, cap: int = 3) -> dict:
         head = meta.get(model.META_HEAD)
         if head:
             _check_head(head)
+        review_head = meta.get(model.META_REVIEW_HEAD)
+        if review_head:
+            _check_head(review_head)
 
         blocked_by = meta.get(model.META_BLOCKED_BY)
         if blocked_by:
@@ -566,6 +581,9 @@ def _card_view(pid: int, task: dict, cols: dict, lanes: dict) -> dict:
         "project": meta.get(model.META_PROJECT, ""),
         "blocked_by": meta.get(model.META_BLOCKED_BY, ""),
         "head": meta.get(model.META_HEAD, ""),
+        "effective_head": meta.get(model.META_HEAD) or heads.DEFAULT_PROFILE,
+        "review_head": meta.get(model.META_REVIEW_HEAD, ""),
+        "effective_review_head": meta.get(model.META_REVIEW_HEAD) or worker.REVIEWER_HEAD,
         "claim": meta.get(model.META_CLAIM, ""),
         "slug": meta.get(model.META_SLUG, ""),
         "base_branch": meta.get(model.META_BASE_BRANCH, ""),
@@ -604,6 +622,16 @@ def show_card(reference: str) -> dict:
         "title": task["title"],
         "description": task.get("description", ""),
         "column": _column_title(pid, int(task["column_id"])),
+        "task_type": meta.get(model.META_TASK_TYPE, ""),
+        "project": meta.get(model.META_PROJECT, ""),
+        "blocked_by": meta.get(model.META_BLOCKED_BY, ""),
+        "head": meta.get(model.META_HEAD, ""),
+        "effective_head": meta.get(model.META_HEAD) or heads.DEFAULT_PROFILE,
+        "review_head": meta.get(model.META_REVIEW_HEAD, ""),
+        "effective_review_head": meta.get(model.META_REVIEW_HEAD) or worker.REVIEWER_HEAD,
+        "claim": meta.get(model.META_CLAIM, ""),
+        "slug": meta.get(model.META_SLUG, ""),
+        "base_branch": meta.get(model.META_BASE_BRANCH, ""),
         "metadata": meta,
         "comments": comments,
     }

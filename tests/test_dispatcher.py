@@ -67,6 +67,7 @@ class FakeWorker:
         self.stand_result = None         # dict from run_stand, or None for unavailable
         self.stand_runs = []             # (project, branch) each run_stand was asked about
         self.reviewer_spawns = []        # (project, worker_id, base, title, pr_branch, review_branch)
+        self.reviewer_heads = []         # review_head passed to each spawn_reviewer call
         self.reviewer_raises = None      # set to raise from spawn_reviewer (orca failure)
         self.existing_workspaces = set()  # (project, name) pairs treated as already on disk
         self.renamed = []                # (handle, title) every rename_terminal call
@@ -138,8 +139,8 @@ class FakeWorker:
     def terminal_kind(self, head):
         return "codex-tui" if head and str(head).endswith("-tui") else None
 
-    def reviewer_terminal_kind(self):
-        return None
+    def reviewer_terminal_kind(self, head=None):
+        return "codex-tui" if head and str(head).endswith("-tui") else None
 
     def activity(self, workspace):
         self.activity_polled.append(workspace)
@@ -210,11 +211,12 @@ class FakeWorker:
         return self.stand_result
 
     def spawn_reviewer(self, project, worker_id, base_branch, review_md, title, pr_branch,
-                       review_branch, head_sha=None):
+                       review_branch, head_sha=None, review_head=None):
         if self.reviewer_raises:
             raise self.reviewer_raises
         self.reviewer_spawns.append((project, worker_id, base_branch, title, pr_branch,
                                      review_branch, head_sha))
+        self.reviewer_heads.append(review_head)
         return f"/rev/{worker_id}", f"rev-handle-{worker_id}"
 
     def remote_head_sha(self, project, branch):
@@ -234,8 +236,13 @@ class FakeWorker:
     def stop_terminals(self, workspace):
         self.stopped_terminals.append(workspace)
 
-    def relaunch_reviewer(self, workspace, worker_id, title):
-        self.relaunched_reviewers.append({"ws": workspace, "worker": worker_id, "title": title})
+    def relaunch_reviewer(self, workspace, worker_id, title, review_head=None):
+        self.relaunched_reviewers.append({
+            "ws": workspace,
+            "worker": worker_id,
+            "title": title,
+            "review_head": review_head,
+        })
         return f"resumed-rev-handle-{worker_id}"
 
 
@@ -1326,7 +1333,8 @@ class TaskMdHistoryTest(_DispatcherBase):
         dispatcher.tick()
         (_, content), = self.worker.tasks_written
         self.assertIn("тип: code", content)
-        self.assertIn("голова: claude-opus", content)
+        self.assertIn("голова worker: claude-opus", content)
+        self.assertIn("голова reviewer: codex-reviewer", content)
         self.assertIn("слаг: my-slug", content)
         self.assertIn(f"blocked_by: {pred}", content)
 
@@ -2133,8 +2141,9 @@ class ValidateReviewTest(_DispatcherBase):
         tid = next(t["id"] for t in self.board.tasks.values() if t["reference"] == ref)
         return " ".join(c["comment"] for c in self.board.comments.get(tid, []))
 
-    def _to_validate(self, pr=PR, head=None):
-        ref = self._claim_one(head=head)
+    def _to_validate(self, pr=PR, head=None, review_head=None):
+        meta = {model.META_REVIEW_HEAD: review_head} if review_head else None
+        ref = self._claim_one(head=head, meta=meta)
         ops.report(ref, "done", f"готово\nPR: {pr}")
         self.worker.pr_status = None
         dispatcher.tick()
@@ -2145,9 +2154,9 @@ class ValidateReviewTest(_DispatcherBase):
         self.worker.pr_status = {"merged": False, "state": "OPEN", "rollup": "SUCCESS",
                                  "failed_job": None, "failed_log": None}
 
-    def _spawned(self, pr=PR, head=None):
+    def _spawned(self, pr=PR, head=None, review_head=None):
         """Land a card in Validate with the reviewer head up: done -> Validate, CI green -> spawn."""
-        ref = self._to_validate(pr, head=head)
+        ref = self._to_validate(pr, head=head, review_head=review_head)
         self._ci_green()
         dispatcher.tick()
         self.assertEqual(len(self.worker.reviewer_spawns), 1)
@@ -2178,6 +2187,29 @@ class ValidateReviewTest(_DispatcherBase):
         self.assertEqual(len(self.worker.reviewer_spawns), 1)
         base_used = self.worker.reviewer_spawns[0][2]
         self.assertEqual(base_used, "sprint/007-dnd")
+
+    def test_codex_worker_can_use_claude_reviewer_from_card_metadata(self):
+        ref = self._spawned(head="codex-extra", review_head="claude-opus")
+        rec = dispatcher._load_cards()[ref]
+        self.assertEqual(self.worker.launched[0]["head"], "codex-extra")
+        self.assertEqual(self.worker.reviewer_heads, ["claude-opus"])
+        self.assertEqual(rec["head"], "codex-extra")
+        self.assertEqual(rec["review_head"], "claude-opus")
+        self.assertIn("`claude-opus`", self._markers(ref))
+
+    def test_claude_worker_can_use_codex_reviewer_from_card_metadata(self):
+        ref = self._spawned(head="claude-opus", review_head="codex-reviewer")
+        rec = dispatcher._load_cards()[ref]
+        self.assertEqual(self.worker.launched[0]["head"], "claude-opus")
+        self.assertEqual(self.worker.reviewer_heads, ["codex-reviewer"])
+        self.assertEqual(rec["head"], "claude-opus")
+        self.assertEqual(rec["review_head"], "codex-reviewer")
+
+    def test_missing_review_head_uses_default_reviewer(self):
+        ref = self._spawned(head="codex-extra")
+        rec = dispatcher._load_cards()[ref]
+        self.assertEqual(self.worker.reviewer_heads, [worker.REVIEWER_HEAD])
+        self.assertEqual(rec["review_head"], worker.REVIEWER_HEAD)
 
     def _automerge_off(self):
         os.environ["TA_AUTOMERGE"] = "off"
@@ -2526,6 +2558,18 @@ class ValidateReviewTest(_DispatcherBase):
         dispatcher.tick()
         self.assertEqual(self._column(ref), "Validate")   # frozen, not Blocked
         self.assertEqual(self._rev_ws_torndown(), [])
+
+    def test_review_watchdog_uses_selected_reviewer_head_resource(self):
+        ref = self._spawned(review_head="claude-opus")
+        self.worker.activity_ts = None
+        dispatcher.WATCHDOG_SECONDS = -1
+        self.statuses["claude-sub"] = "red"
+        dispatcher.tick()
+        self.assertEqual(self._column(ref), "Validate")   # frozen on claude-sub, not default reviewer
+        self.statuses["claude-sub"] = "green"
+        dispatcher.tick()
+        self.assertEqual(self._column(ref), "Blocked")
+        self.assertTrue(any(r.get("reason") == "review-watchdog" for r in self._runs()))
 
     def test_review_watchdog_resumes_once_reviewer_resource_goes_green_again(self):
         ref = self._spawned()
