@@ -1375,6 +1375,37 @@ class ValidateTest(_DispatcherBase):
         self.assertEqual(len(self.worker.notified), notified_before)
         self.assertFalse(any(r.get("reason") == "ci-red" for r in self._runs()))
 
+    def test_red_ci_relaunch_failure_blocks_dead_worker_after_move(self):
+        ref = self._to_validate()
+        rec_before = dispatcher._load_cards()[ref]
+        old_handle = rec_before["handle"]
+        launched_before = len(self.worker.launched)
+        tasks_before = len(self.worker.tasks_written)
+        notified_before = len(self.worker.notified)
+        self.worker.dead_handles.add(old_handle)
+        self.worker.pr_status = {
+            "merged": False, "state": "OPEN", "rollup": "FAILURE",
+            "failed_job": "CI", "failed_log": "boom",
+        }
+
+        with mock.patch.object(worker, "launch_worker",
+                               side_effect=RuntimeError("orca create failed")):
+            dispatcher.tick()
+
+        self.assertEqual(self._column(ref), "Blocked")
+        self.assertNotIn(ref, dispatcher._load_cards())
+        self.assertEqual(len(self.worker.launched), launched_before)
+        self.assertEqual(len(self.worker.tasks_written), tasks_before + 1)
+        self.assertEqual(len(self.worker.notified), notified_before)
+        self.assertIn(rec_before["workspace"], self.worker.stopped_terminals)
+        journal = self._markers(ref)
+        self.assertIn("CI красный", journal)
+        self.assertIn("orca create failed", journal)
+        self.assertTrue(any(r["event"] == "rework-worker" and r.get("to") == "Blocked"
+                            and r.get("reason") == "ci-red" for r in self._runs()))
+        self.assertFalse(any(r["event"] == "validate" and r.get("to") == model.IN_PROGRESS
+                             and r.get("reason") == "ci-red" for r in self._runs()))
+
     def test_red_ci_then_rework_done_returns_to_validate(self):
         # A stale done comment (below the new baseline) must not bounce the card straight back.
         ref = self._to_validate()
@@ -1978,6 +2009,36 @@ class ValidateReviewTest(_DispatcherBase):
         self.assertEqual(len(self.worker.notified), notified_before)
         self.assertEqual(len(self._rev_ws_torndown()), torn_down_before)
         self.assertFalse(any(r.get("reason") == "review-red" for r in self._runs()))
+
+    def test_red_verdict_relaunch_failure_blocks_dead_worker_after_move(self):
+        ref = self._spawned()
+        rec_before = dispatcher._load_cards()[ref]
+        old_handle = rec_before["handle"]
+        launched_before = len(self.worker.launched)
+        tasks_before = len(self.worker.tasks_written)
+        notified_before = len(self.worker.notified)
+        torn_down_before = len(self._rev_ws_torndown())
+        self.worker.dead_handles.add(old_handle)
+
+        ops.verdict(ref, "red", "блокер: launch_worker упал после возврата")
+        with mock.patch.object(worker, "launch_worker",
+                               side_effect=RuntimeError("orca create failed")):
+            dispatcher.tick()
+
+        self.assertEqual(self._column(ref), "Blocked")
+        self.assertNotIn(ref, dispatcher._load_cards())
+        self.assertEqual(len(self.worker.launched), launched_before)
+        self.assertEqual(len(self.worker.tasks_written), tasks_before + 1)
+        self.assertEqual(len(self.worker.notified), notified_before)
+        self.assertIn(rec_before["workspace"], self.worker.stopped_terminals)
+        self.assertEqual(len(self._rev_ws_torndown()), torn_down_before + 1)
+        journal = self._markers(ref)
+        self.assertIn("launch_worker упал после возврата", journal)
+        self.assertIn("orca create failed", journal)
+        self.assertTrue(any(r["event"] == "rework-worker" and r.get("to") == "Blocked"
+                            and r.get("reason") == "review-red" for r in self._runs()))
+        self.assertFalse(any(r["event"] == "review" and r.get("to") == model.IN_PROGRESS
+                             and r.get("reason") == "review-red" for r in self._runs()))
 
     def test_red_then_rework_reruns_review_and_ignores_stale_verdict(self):
         ref = self._spawned()

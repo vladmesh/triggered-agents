@@ -159,14 +159,17 @@ def _relaunch_worker_for_rework(ref: str, card: dict, rec: dict, records: dict, 
     milliseconds earlier is part of the prompt the relaunched worker reads."""
     workspace = rec.get("workspace")
     if not workspace:
-        return None
+        raise RuntimeError("worker workspace is missing")
     old_handle = rec.get("handle") or ""
     if refresh_worker_task is not None:
         refresh_worker_task(card, rec)
     rec["title"] = _worker_title(card, rec)
     rec["head"] = _worker_head(card, rec)
-    rec["handle"] = worker.launch_worker(workspace, rec.get("head"), rec.get("worker", ""),
-                                         rec["title"])
+    handle = worker.launch_worker(workspace, rec.get("head"), rec.get("worker", ""),
+                                  rec["title"])
+    if not handle:
+        raise RuntimeError("worker launch returned no handle")
+    rec["handle"] = handle
     rec["last_activity"] = time.time()
     save_cards(records)
     STATE.log_run("rework-worker", reference=ref, result="relaunched", reason=reason,
@@ -186,6 +189,31 @@ def _notify_worker_for_rework(ref: str, card: dict, rec: dict, records: dict, sa
                                          reason)
     if handle:
         worker.notify(handle, message)
+
+
+def _block_rework_worker_failure(ref: str, rec: dict, records: dict,
+                                 reason: str, exc: Exception) -> None:
+    """After a Validate -> In progress return, failure to refresh/relaunch is terminal.
+
+    At this point the board move already succeeded, so leaving the old dead handle in cards.json
+    would make the pipeline treat the card as working. Escalate instead and stop any terminal that
+    might have been created before the failure surfaced."""
+    scrubbed = worker.scrub_secrets(str(exc))
+    workspace = rec.get("workspace")
+    if workspace:
+        try:
+            worker.stop_terminals(workspace)
+        except Exception as stop_exc:  # noqa: BLE001, escalation must not be masked by cleanup
+            STATE.log_run("rework-worker", reference=ref, result="stop-failed", level="warn",
+                          reason=reason, error=worker.scrub_secrets(str(stop_exc)))
+    ws_note = f"Воркспейс {workspace} оставлен для разбора." if workspace else "Воркспейс неизвестен."
+    ops.add_comment("dispatcher", ref,
+                    f"Не удалось вернуть карточку в работу после {reason}: worker head не поднят "
+                    f"или TASK.md не обновлён: {scrubbed}. Карточка в Blocked до vladmesh. "
+                    f"{ws_note}")
+    ops.move_card("dispatcher", ref, "Blocked")
+    records.pop(ref, None)
+    STATE.log_run("rework-worker", reference=ref, to="Blocked", reason=reason, error=scrubbed)
 
 
 def _stand_gate(ref: str, pr: str, card: dict, cfg: dict, records: dict, view: dict) -> bool:
@@ -348,11 +376,15 @@ def _validate_card(card: dict, records: dict, watchdog_seconds: int, save_cards,
             rec["last_activity"] = time.time()
             rec["stand_fails"] = 0
             rec.pop("ci_pending_since", None)
-            _notify_worker_for_rework(
-                ref, card, rec, records, save_cards, refresh_worker_task,
-                f"CI по {pr} красный: джоба «{job}» упала, карточка вернулась в "
-                f"In progress. Разбор в комментарии карточки, почини и снова report done.",
-                "ci-red")
+            try:
+                _notify_worker_for_rework(
+                    ref, card, rec, records, save_cards, refresh_worker_task,
+                    f"CI по {pr} красный: джоба «{job}» упала, карточка вернулась в "
+                    f"In progress. Разбор в комментарии карточки, почини и снова report done.",
+                    "ci-red")
+            except Exception as e:  # noqa: BLE001, do not leave In progress with a dead handle
+                _block_rework_worker_failure(ref, rec, records, "ci-red", e)
+                return True
         STATE.log_run("validate", reference=ref, to=model.IN_PROGRESS, reason="ci-red", job=job, pr=pr)
         return True
     if status["rollup"] == "SUCCESS":
@@ -871,11 +903,15 @@ def _review_red(ref: str, pr: str | None, card: dict, rec: dict, records: dict, 
     rec["last_activity"] = time.time()
     rec["stand_fails"] = 0
     rec.pop("ci_pending_since", None)
-    _notify_worker_for_rework(
-        ref, card, rec, records, save_cards, refresh_worker_task,
-        f"Ревью по {phrase} красное: есть блокеры (слой 3). Карточка вернулась в "
-        f"In progress. Разбор в вердикте на карточке, почини и снова report done.",
-        "review-red")
+    try:
+        _notify_worker_for_rework(
+            ref, card, rec, records, save_cards, refresh_worker_task,
+            f"Ревью по {phrase} красное: есть блокеры (слой 3). Карточка вернулась в "
+            f"In progress. Разбор в вердикте на карточке, почини и снова report done.",
+            "review-red")
+    except Exception as e:  # noqa: BLE001, do not leave In progress with a dead handle
+        _block_rework_worker_failure(ref, rec, records, "review-red", e)
+        return True
     STATE.log_run("review", reference=ref, to=model.IN_PROGRESS, reason="review-red",
                   returns=prior + 1, pr=pr)
     return True
