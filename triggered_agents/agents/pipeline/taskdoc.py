@@ -1,0 +1,120 @@
+"""Render the one-time TASK.md handed to a pipeline worker."""
+from __future__ import annotations
+
+from datetime import datetime, timezone
+
+from . import heads, naming, worker
+
+
+def _format_comment_ts(ts) -> str:
+    """A comment's `date_creation` (unix seconds, from Kanboard) as a readable UTC stamp."""
+    try:
+        return datetime.fromtimestamp(int(ts), tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    except (TypeError, ValueError):
+        return str(ts) if ts else "?"
+
+
+def _metadata(card: dict, base: str) -> list[str]:
+    worker_head = card.get("effective_head") or card.get("head") or heads.DEFAULT_PROFILE
+    review_head = card.get("effective_review_head") or card.get("review_head") or worker.REVIEWER_HEAD
+    lines = [
+        "## Метаданные",
+        "",
+        f"- тип: {card.get('task_type') or '?'}",
+        f"- голова worker: {worker_head}",
+        f"- голова reviewer: {review_head}",
+        f"- слаг: {naming.card_slug(card)}",
+        f"- база: {base}",
+    ]
+    if card.get("blocked_by"):
+        lines.append(f"- blocked_by: {card['blocked_by']}")
+    lines.append("")
+    return lines
+
+
+def _history(comments: list[dict]) -> list[str]:
+    if not comments:
+        return []
+    lines = ["## История", ""]
+    for c in comments:
+        lines.append(f"### {_format_comment_ts(c.get('ts'))}")
+        lines.append("")
+        lines.append((c.get("text") or "").strip())
+        lines.append("")
+    return lines
+
+
+def render(card: dict, view: dict, base: str) -> str:
+    """Build TASK.md from the current card view and resolved base branch."""
+    ref = card["reference"]
+    branch = naming.worker_branch(ref)
+    comments = view.get("comments") or []
+    is_contrib = worker.is_contrib(card.get("project") or "")
+    if is_contrib:
+        done_clause = (
+            f"Контриб-проект (форк): PR в этом пайплайне не открывается — ветку в форк для "
+            f"upstream-автора готовит человек. Done для тебя: код закоммичен туда, локальные тесты "
+            f"зелёные, ветка запушена в `origin` (твой форк). В коммитах никаких упоминаний AI "
+            f"и Co-Authored-By, стиль — как в git log репо."
+        )
+        report_clause = (
+            f"Отчёт по каждому acceptance criterion (сделано/нет и как проверял) — через board-CLI: "
+            f"`python3 -m triggered_agents pipeline --role worker report --ref {ref} --kind "
+            f"done|blocked --body-file <файл>`. Вместо ссылки на PR отчёт done обязан нести ветку и "
+            f"head sha пуша, ровно этими протокольными строками в теле:\n"
+            f"```\nbranch: {branch}\nhead: <sha HEAD после пуша>\n```\n"
+            f"Несогласие со спекой — `--kind blocked` с обоснованием. Карточку сам не двигаешь. "
+            f"TASK.md в репо не коммить."
+        )
+        history_tail = "origin: начни с `git fetch`, продолжай существующую ветку, не пересоздавай её."
+    else:
+        done_clause = (
+            f"Done для тебя: код закоммичен туда, локальные тесты зелёные, ветка запушена, PR "
+            f"открыт через `gh` (base — `{base}`). В коммитах и PR никаких упоминаний "
+            f"AI и Co-Authored-By, стиль — как в git log репо."
+        )
+        report_clause = (
+            f"Отчёт по каждому acceptance criterion (сделано/нет и как проверял, плюс ссылка на PR) "
+            f"— через board-CLI: `python3 -m triggered_agents pipeline --role worker report "
+            f"--ref {ref} --kind done|blocked --body-file <файл>`. Несогласие со спекой — "
+            f"`--kind blocked` с обоснованием. Карточку сам не двигаешь. TASK.md в репо не коммить."
+        )
+        history_tail = ("origin, PR может быть уже открыт: начни с `git fetch`, продолжай "
+                        "существующие ветку/PR, не пересоздавай их.")
+    lines = [
+        f"# Задача {ref} ({card.get('project', '?')})",
+        "",
+        f"Роль на доске — worker. Воркспейс уже стоит на ветке `{branch}` (её завели при подъёме "
+        f"воркспейса) — ветку создавать или переименовывать не нужно, коммить прямо в неё. "
+        f"{done_clause}",
+        "",
+        report_clause,
+        "",
+    ]
+    if comments:
+        lines += [
+            f"У карточки ниже есть история — она уже была в работе раньше (возврат из Blocked, "
+            f"умершая голова или похожий случай). Ветка `{branch}` может уже существовать на "
+            f"{history_tail}",
+            "",
+        ]
+    lines += [
+        f"Всегда (независимо от истории): force-push запрещён; пушь только в репозиторий своего "
+        f"проекта и только в свою ветку `{branch}`.",
+        "",
+        "Пауза пайплайна (`drain` или `freeze`) это админ-состояние всей очереди, не поломка "
+        "твоей карточки. Не репорти `blocked` только из-за паузы; после `resume` продолжай ту же "
+        "карточку в этом же воркспейсе.",
+        "",
+    ]
+    if is_contrib:
+        lines += [
+            f"Контриб-проект (форк): пуш только в `origin` (твой форк) — `upstream` (репо "
+            f"автора) не трогать, туда не пушить и не мержить.",
+            "",
+        ]
+    lines += _metadata(card, base)
+    lines += [naming.memory_block("worker", card.get("project") or "?"), ""]
+    lines += ["## Спека", "", view.get("description") or "(описание карточки пустое)", ""]
+    lines += _history(comments)
+    return "\n".join(lines).rstrip("\n") + "\n"
