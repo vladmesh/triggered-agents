@@ -2,8 +2,9 @@
 
 Flow the agent follows each run:
   1. `python3 -m triggered_agents curator harvest`  -> redacted batch (markdown) of new
-                                     session turns and changed personal-memory files on
-                                     stdout, and the pending watermark cached on disk.
+                                     Claude/Hermes/Codex session turns and changed
+                                     personal-memory files on stdout, and the pending
+                                     watermark cached on disk.
   2. agent extracts durable facts, dedups via panelmem memory_search, writes .md to
      panelmem-kb, commits+pushes the canon.
   3. `python3 -m triggered_agents curator advance`  -> moves the watermark past step 1.
@@ -66,7 +67,7 @@ def cmd_precheck() -> int:
 
 def cmd_sessions() -> int:
     for s in discover.all_sessions():
-        print(f"{s['head']:8} {s['session_id'][:8]}  {s['cwd']}")
+        print(f"{s['head']:8} {s['session_id']}  {s['cwd']}  {s['path']}")
     return 0
 
 

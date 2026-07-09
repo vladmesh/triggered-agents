@@ -7,7 +7,7 @@ then calls `advance(st, pending)` to move the watermark. A crash between the two
 the same turns next run (at worst a duplicate the agent dedups), never a silent drop.
 
 Signal only: user text + assistant text blocks. Dropped as noise — thinking blocks,
-tool_use/tool_result payloads, meta/sidechain lines, and local-command wrappers (the
+tool_use/tool_result payloads, meta/sidechain lines, Codex context injection, and local-command wrappers (the
 `<local-command-*>` and `<command-*>` scaffolding Claude Code injects, not real turns).
 
 Personal-memory files are a second, independent source: whole-file reads instead of line
@@ -27,6 +27,10 @@ from . import discover
 
 # Local-command / harness scaffolding that shows up as user "messages" but isn't a turn.
 _SCAFFOLD = re.compile(r"<(local-command|command-name|command-message|command-args)[\s>]")
+_CODEX_CONTEXT_PREFIXES = (
+    "# AGENTS.md instructions for ",
+    "<environment_context>",
+)
 
 
 def _text_from_content(content) -> str:
@@ -64,6 +68,46 @@ def parse_claude_lines(lines) -> list[dict]:
     return turns
 
 
+def _text_from_codex_content(content) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") in ("input_text", "output_text", "text"):
+                parts.append(block.get("text", ""))
+        return "\n".join(p for p in parts if p)
+    return ""
+
+
+def parse_codex_lines(lines) -> list[dict]:
+    """Extract user/assistant text turns from Codex JSONL response items."""
+    turns = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            d = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if d.get("type") != "response_item":
+            continue
+        payload = d.get("payload") or {}
+        if payload.get("type") != "message":
+            continue
+        role = payload.get("role")
+        if role not in ("user", "assistant"):
+            continue
+        text = _text_from_codex_content(payload.get("content")).strip()
+        if not text or _SCAFFOLD.search(text) or text.startswith(_CODEX_CONTEXT_PREFIXES):
+            continue
+        turns.append({"role": role, "text": text, "ts": d.get("timestamp")})
+    return turns
+
+
 def _iso_ts(ts) -> str | None:
     if not ts:
         return None
@@ -92,9 +136,17 @@ def parse_hermes_rows(rows) -> list[dict]:
     return turns
 
 
-def _harvest_claude_sessions(mark: dict) -> tuple[list[dict], dict]:
+def _completed_jsonl_lines(text: str) -> tuple[list[str], int]:
+    """Return only newline-terminated JSONL records."""
+    lines = text.splitlines()
+    if text and not text.endswith("\n"):
+        return lines[:-1], max(len(lines) - 1, 0)
+    return lines, len(lines)
+
+
+def _harvest_jsonl_sessions(mark: dict, sessions: list[dict], parse_lines) -> tuple[list[dict], dict]:
     sessions_out, pending = [], {}
-    for sess in discover.claude_sessions():
+    for sess in sessions:
         path = Path(sess["path"])
         try:
             stat = path.stat()
@@ -102,19 +154,28 @@ def _harvest_claude_sessions(mark: dict) -> tuple[list[dict], dict]:
             continue
         prev = mark.get(sess["path"], {})
         prev_lines = prev.get("lines", 0)
-        if prev.get("mtime") == stat.st_mtime and prev_lines:
+        if prev.get("mtime") == stat.st_mtime and prev.get("size") == stat.st_size and prev_lines:
             continue  # unchanged since last run
-        all_lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-        new_lines = all_lines[prev_lines:]
-        pending[sess["path"]] = {"lines": len(all_lines), "mtime": stat.st_mtime}
+        text = path.read_text(encoding="utf-8", errors="replace")
+        complete_lines, complete_count = _completed_jsonl_lines(text)
+        new_lines = complete_lines[prev_lines:]
+        pending[sess["path"]] = {"lines": complete_count, "mtime": stat.st_mtime, "size": stat.st_size}
         if not new_lines:
             continue
-        turns = parse_claude_lines(new_lines)
+        turns = parse_lines(new_lines)
         for t in turns:
             t["text"] = redact(t["text"])
         if turns:
             sessions_out.append({**sess, "turns": turns})
     return sessions_out, pending
+
+
+def _harvest_claude_sessions(mark: dict) -> tuple[list[dict], dict]:
+    return _harvest_jsonl_sessions(mark, discover.claude_sessions(), parse_claude_lines)
+
+
+def _harvest_codex_sessions(mark: dict) -> tuple[list[dict], dict]:
+    return _harvest_jsonl_sessions(mark, discover.codex_sessions(), parse_codex_lines)
 
 
 def _harvest_hermes_sessions(mark: dict) -> tuple[list[dict], dict]:
@@ -171,10 +232,11 @@ def harvest(st) -> dict:
     mark = st.load_watermark()
     claude_out, claude_pending = _harvest_claude_sessions(mark)
     hermes_out, hermes_pending = _harvest_hermes_sessions(mark)
-    pending = {**claude_pending, **hermes_pending}
+    codex_out, codex_pending = _harvest_codex_sessions(mark)
+    pending = {**claude_pending, **hermes_pending, **codex_pending}
     memory_out, mem_pending = harvest_memory_files(mark)
     pending.update(mem_pending)
-    return {"sessions": claude_out + hermes_out, "memory": memory_out, "pending": pending}
+    return {"sessions": claude_out + hermes_out + codex_out, "memory": memory_out, "pending": pending}
 
 
 def advance(st, pending: dict) -> None:
