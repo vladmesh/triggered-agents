@@ -166,8 +166,8 @@ def main() -> int:
         # assertions noisy; the "stop everything, not just one card" behavior is already covered
         # by the unit tests.
         # -------------------------------------------------------------------------------
-        ops.move_card("steward", ref_a, "Blocked")
-        ops.move_card("steward", ref_b, "Blocked")
+        ops.move_card("steward", ref_a, "Blocked", reason="e2e setup: clear scenario 1 card A")
+        ops.move_card("steward", ref_b, "Blocked", reason="e2e setup: clear scenario 1 card B")
 
         ref_c = _create_ready_card("e2e-pause: hard live worker")
         dispatcher.tick()

@@ -345,10 +345,10 @@ def move_card(role: str, reference: str, to_column: str, reason: str = "") -> di
     (dispatcher._watchdog_retry) restates the real counters (and, on a head switch, the new head)
     right after via set_retry_state, so this reset is never the last write for that path.
 
-    `reason` only matters for model.STEWARD_OVERRIDE (Blocked->Done): it must be non-empty (the
-    justification for skipping review) and is posted as a [steward:blocked-done] comment in this
-    same call, right after the move succeeds — so a card never ends up in Done with the override
-    used and no comment explaining why, and a rejected (empty-reason) call moves nothing.
+    A non-empty `reason` is posted as a comment after any successful move. The Blocked->Done
+    override keeps its [steward:blocked-done] marker and still requires a reason. Steward's manual
+    escalations into Blocked also require a reason, so a card never reaches a human-only state
+    without the intent recorded. A rejected empty-reason call moves nothing.
 
     model.STEWARD_REPORT_DONE (In progress -> Done) needs its own check beyond role/column: the
     card must actually carry META_STEWARD_REPORT (set only by create_report_card) — otherwise any
@@ -359,12 +359,19 @@ def move_card(role: str, reference: str, to_column: str, reason: str = "") -> di
     task = _get_by_ref(reference)
     cur = _column_title(pid, int(task["column_id"]))
     model.check_move(role, cur, to_column)
-    if (cur, to_column) == model.STEWARD_OVERRIDE and not reason.strip():
+    move = (cur, to_column)
+    reason_text = reason.strip()
+    if move == model.STEWARD_OVERRIDE and not reason_text:
         raise model.GuardError(
             "Blocked -> Done requires a non-empty justification comment (--reason), "
             "supplied in the same call"
         )
-    if (cur, to_column) == model.STEWARD_REPORT_DONE:
+    if role == "steward" and move in model.STEWARD_ESCALATIONS and not reason_text:
+        raise model.GuardError(
+            f"{cur} -> Blocked requires a non-empty escalation reason (--reason), "
+            "supplied in the same call"
+        )
+    if move == model.STEWARD_REPORT_DONE:
         meta = call("getTaskMetadata", task_id=int(task["id"])) or {}
         if meta.get(model.META_STEWARD_REPORT) != "1":
             raise model.GuardError(
@@ -379,8 +386,10 @@ def move_card(role: str, reference: str, to_column: str, reason: str = "") -> di
             model.META_RETRY_HEADS: "",
         })
     _move_position(pid, int(task["id"]), _column_id(pid, to_column), int(task["swimlane_id"]))
-    if (cur, to_column) == model.STEWARD_OVERRIDE:
+    if move == model.STEWARD_OVERRIDE:
         add_comment(role, reference, reason, marker=model.MARKER_STEWARD_OVERRIDE)
+    elif reason_text:
+        add_comment(role, reference, reason)
     return {"action": "moved", "reference": reference, "from": cur, "to": to_column}
 
 

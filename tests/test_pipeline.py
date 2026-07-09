@@ -193,13 +193,9 @@ class TestMatrix(unittest.TestCase):
             model.check_move("dispatcher", "Идеи", "Ready")
 
     def test_steward_gets_every_po_transition_plus_the_override(self):
-        steward_escalations = {
-            ("Идеи", "Blocked"), ("Ready", "Blocked"),
-            ("In progress", "Blocked"), ("Validate", "Blocked"),
-        }
         self.assertEqual(model.TRANSITIONS["steward"],
                          model.TRANSITIONS["po"] | {model.STEWARD_OVERRIDE}
-                         | {model.STEWARD_REPORT_DONE} | steward_escalations)
+                         | {model.STEWARD_REPORT_DONE} | model.STEWARD_ESCALATIONS)
 
     def test_only_steward_may_move_blocked_to_done(self):
         model.check_move("steward", "Blocked", "Done")  # must not raise
@@ -947,13 +943,57 @@ class TestStewardOverride(PatchedBoardTest):
             with self.assertRaises(model.GuardError):
                 ops.move_card(role, ref, "Done", reason="whatever")
 
-    def test_reason_ignored_for_ordinary_transitions(self):
+    def test_reason_posts_role_comment_for_ordinary_transition(self):
         board = self.make_board()
         ref = board.add_task("A", "Blocked", meta={model.META_TASK_TYPE: "code",
                                                    model.META_PROJECT: "personal_site"})
-        ops.move_card("steward", ref, "Ready")  # no reason needed, not the override pair
+        ops.move_card("po", ref, "Ready", reason="разобрано, можно вернуть в очередь")
         tid = next(t["id"] for t in board.tasks.values() if t["reference"] == ref)
         self.assertEqual(board._column_title_for(tid), "Ready")
+        posted = board.method_calls("createComment")
+        self.assertEqual(len(posted), 1)
+        self.assertEqual(posted[0]["content"], "[po]\nразобрано, можно вернуть в очередь")
+
+    def test_steward_escalation_posts_role_comment(self):
+        board = self.make_board()
+        ref = board.add_task("A", "In progress", meta={model.META_TASK_TYPE: "code",
+                                                       model.META_PROJECT: "personal_site",
+                                                       model.META_CLAIM: "w1"})
+        ops.move_card("steward", ref, "Blocked", reason="worker завис, нужен ручной разбор")
+        tid = next(t["id"] for t in board.tasks.values() if t["reference"] == ref)
+        self.assertEqual(board._column_title_for(tid), "Blocked")
+        posted = board.method_calls("createComment")
+        self.assertEqual(len(posted), 1)
+        self.assertEqual(posted[0]["content"], "[steward]\nworker завис, нужен ручной разбор")
+
+    def test_steward_escalation_without_reason_raises_and_moves_nothing(self):
+        for source, _ in model.STEWARD_ESCALATIONS:
+            with self.subTest(source=source):
+                board = self.make_board()
+                ref = board.add_task("A", source, meta={model.META_TASK_TYPE: "code",
+                                                        model.META_PROJECT: "personal_site"})
+                with self.assertRaises(model.GuardError):
+                    ops.move_card("steward", ref, "Blocked")
+                tid = next(t["id"] for t in board.tasks.values() if t["reference"] == ref)
+                self.assertEqual(board._column_title_for(tid), source)
+                self.assertEqual(board.method_calls("createComment"), [])
+
+    def test_po_recoveries_still_work_without_reason(self):
+        for source in ("Идеи", "Blocked"):
+            with self.subTest(source=source):
+                board = self.make_board()
+                ref = board.add_task("A", source, meta={model.META_TASK_TYPE: "code",
+                                                        model.META_PROJECT: "personal_site"})
+                ops.move_card("po", ref, "Ready")
+                tid = next(t["id"] for t in board.tasks.values() if t["reference"] == ref)
+                self.assertEqual(board._column_title_for(tid), "Ready")
+                self.assertEqual(board.method_calls("createComment"), [])
+
+    def test_no_reason_posts_no_comment_for_ordinary_transition(self):
+        board = self.make_board()
+        ref = board.add_task("A", "Blocked", meta={model.META_TASK_TYPE: "code",
+                                                   model.META_PROJECT: "personal_site"})
+        ops.move_card("po", ref, "Ready")
         self.assertEqual(board.method_calls("createComment"), [])
 
 

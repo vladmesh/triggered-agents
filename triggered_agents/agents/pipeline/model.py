@@ -22,8 +22,10 @@ steward can also move any active card straight to Blocked (2026-07-04 design gri
 решается своими силами -> Blocked с разбором и жди человека", no numeric caps). This is a manual
 break-glass action a human would otherwise have to do by hand through the Kanboard UI when the
 dispatcher itself is the thing that broke (a claimed In-progress/Validate card's watchdog never
-fires if the tick that would run it is dead) — the dispatcher's own In progress/Validate -> Blocked
-stays automatic and unaffected; this is steward reaching in from outside that loop.
+fires if the tick that would run it is dead). The dispatcher's own In progress/Validate -> Blocked
+stays automatic and unaffected; this is steward reaching in from outside that loop. ops.move_card
+requires the steward's escalation reason in the same call, so a Blocked card records why a human is
+needed.
 
 steward also gets In progress -> Done (STEWARD_REPORT_DONE, triggered-agents-255), but only for its
 own wake-up report card: ops.create_report_card puts that card straight into In progress (never
@@ -89,6 +91,15 @@ META_STEWARD_REPORT = "steward_report"
 
 IN_PROGRESS = "In progress"
 
+# Steward's manual escalation moves. ops.move_card requires a non-empty reason for these, but the
+# dispatcher keeps its own automatic In progress/Validate -> Blocked moves reasonless.
+STEWARD_ESCALATIONS = {
+    ("Идеи", "Blocked"),
+    ("Ready", "Blocked"),
+    ("In progress", "Blocked"),
+    ("Validate", "Blocked"),
+}
+
 # Allowed (from, to) column moves per role, for the generic `move` command. Claim owns the
 # only entry into In progress and is not listed here (see module docstring).
 TRANSITIONS: dict[str, set[tuple[str, str]]] = {
@@ -113,14 +124,12 @@ TRANSITIONS: dict[str, set[tuple[str, str]]] = {
     # override is only safe with a paper trail, so check_move alone does not gate it — ops.move_card
     # additionally requires a non-empty justification comment in the same call (see STEWARD_OVERRIDE).
     # Plus escalation to Blocked from every active column (its "give up, wait for a human" escape
-    # hatch — see module docstring) — Done is deliberately absent as a source, there is nothing
+    # hatch, see module docstring). Done is deliberately absent as a source, there is nothing
     # left to escalate on a finished card.
     "steward": {
         ("Идеи", "Ready"), ("Blocked", "Ready"), ("Blocked", "Done"),
-        ("Идеи", "Blocked"), ("Ready", "Blocked"),
-        ("In progress", "Blocked"), ("Validate", "Blocked"),
         ("In progress", "Done"),
-    },
+    } | STEWARD_ESCALATIONS,
 }
 
 # The one transition in TRANSITIONS that needs more than a role/column check: a non-empty

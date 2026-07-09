@@ -161,7 +161,8 @@ def main() -> int:
         rc, card2 = run_board("po", ["create", "--project", "personal_site", "--type", "code",
                                      "--title", "E2E: override target", "--column", "Ready"])
         ref2 = card2["reference"]
-        rc, _ = run_board("steward", ["move", "--ref", ref2, "--to", "Blocked"])
+        rc, _ = run_board("steward", ["move", "--ref", ref2, "--to", "Blocked",
+                                      "--reason", "e2e: prepare override target"])
         check("second card -> Blocked rc=0", rc == 0)
         rc, _ = run_board("steward", ["move", "--ref", ref2, "--to", "Done"])
         check("override without --reason is refused (rc=3)", rc == 3)

@@ -1118,7 +1118,8 @@ class LeftInProgressAnotherWayTest(_DispatcherBase):
     def test_stops_the_terminal_but_does_not_remove_the_workspace(self):
         ref = self._claim_one("A")
         ws = self.worker.launched[-1]["ws"]
-        ops.move_card("steward", ref, "Blocked")   # escalation happens outside a dispatcher tick
+        ops.move_card("steward", ref, "Blocked",
+                      reason="test setup: escalation happens outside a dispatcher tick")
         dispatcher.tick()
         self.assertIn(ws, self.worker.stopped_terminals)
         self.assertNotIn(ws, self.worker.torn_down)
@@ -1143,7 +1144,8 @@ class LeftInProgressAnotherWayTest(_DispatcherBase):
         dispatcher.tick()   # -> Validate, record kept
         ws = self.worker.launched[-1]["ws"]
         self.assertEqual(self._column(ref), "Validate")
-        ops.move_card("steward", ref, "Blocked")
+        ops.move_card("steward", ref, "Blocked",
+                      reason="test setup: escalation happens outside a dispatcher tick")
         dispatcher.tick()
         self.assertIn(ws, self.worker.stopped_terminals)
         self.assertNotIn(ws, self.worker.torn_down)
@@ -3434,7 +3436,8 @@ class PipelinePauseTest(_DispatcherBase):
         # moved it to Blocked by hand while paused) must not get a head relaunched into it.
         ref = self._claim_one()
         self._pause("hard")
-        ops.move_card("steward", ref, "Blocked")   # escalation happens outside a dispatcher tick
+        ops.move_card("steward", ref, "Blocked",
+                      reason="test setup: escalation happens outside a dispatcher tick")
         self.worker.launched.clear()
         dispatcher.resume()
         self.assertEqual(self.worker.launched, [])

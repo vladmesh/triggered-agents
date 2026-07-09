@@ -7,10 +7,11 @@ only as a continuation of its own chain, see ops._check_worker_continuation, oth
 any other agent idea), claim is dispatcher-only, report/feedback are worker-only, move/ready defer
 to the transition matrix for the role, comment is open to any role (the role becomes the marker).
 update accepts any role at this layer but is PO-only in ops (GuardError otherwise), same as
-move's per-role matrix. steward gets every po transition (via move/ready) plus one more: Blocked
--> Done, which additionally needs `move --reason` (a non-empty justification, posted as a comment
-in the same call) — see model.STEWARD_OVERRIDE and ops.move_card. idea is reviewer- or retro-only
-(both file an Идеи-only card, never move anything — model.TRANSITIONS leaves each an empty set).
+move's per-role matrix. `move --reason` records a comment on the moved card. steward gets every po
+transition (via move/ready) plus one more: Blocked -> Done, which additionally needs a non-empty
+reason in the same call, see model.STEWARD_OVERRIDE and ops.move_card. steward escalations to
+Blocked also need a non-empty reason. idea is reviewer- or retro-only (both file an Идеи-only card,
+never move anything, model.TRANSITIONS leaves each an empty set).
 setup/list/show/probe need no role. Guards live in model/ops; this layer only wires argv to them
 and maps failures to exit codes.
 
@@ -136,7 +137,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_move = sub.add_parser("move")
     p_move.add_argument("--ref", required=True)
     p_move.add_argument("--to", required=True, dest="to_column")
-    p_move.add_argument("--reason")           # steward's Blocked->Done justification
+    p_move.add_argument("--reason")           # comment body; required for steward break-glass moves
     p_move.add_argument("--reason-file")
 
     p_claim = sub.add_parser("claim")
