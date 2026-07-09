@@ -373,7 +373,7 @@ def _advance(records: dict, statuses: dict[str, str]) -> bool:
             changed = True
         else:
             handle = rec.get("handle", "")
-            status = worker.terminal_status(handle, rec.get("workspace"))
+            status = worker.terminal_status(handle, rec.get("workspace"), rec.get("terminal_kind"))
             if status.get("known") and not status.get("live"):
                 elapsed = time.time() - rec.get("last_activity", rec.get("claimed_at", time.time()))
                 _watchdog_retry(ref, card, rec, statuses, elapsed,
@@ -756,6 +756,7 @@ def _bring_up(card: dict, worker_id: str, records: dict, head: str) -> None:
         "handle": handle,
         "title": title,
         "head": head,
+        "terminal_kind": worker.terminal_kind(head),
         "claimed_at": now,
         "last_activity": now,
         "comment_baseline": len(view["comments"]),
@@ -941,6 +942,7 @@ def resume() -> dict:
                     try:
                         rec["handle"] = worker.launch_worker(rec["workspace"], rec.get("head"),
                                                              rec["worker"], rec.get("title", ref))
+                        rec["terminal_kind"] = worker.terminal_kind(rec.get("head"))
                     except Exception as e:  # noqa: BLE001 — one bad relaunch must not lose the rest
                         skipped.append(f"{ref}:worker")
                         STATE.log_run("resume", reference=ref, result="relaunch-failed",
@@ -976,6 +978,7 @@ def resume() -> dict:
                 try:
                     rec["review_handle"] = worker.relaunch_reviewer(
                         rec["review_ws"], rec.get("worker", ref), rec.get("review_title", ref))
+                    rec["review_terminal_kind"] = worker.reviewer_terminal_kind()
                 except Exception as e:  # noqa: BLE001 — one bad relaunch must not lose the rest
                     skipped.append(f"{ref}:reviewer")
                     STATE.log_run("resume", reference=ref, result="relaunch-failed",

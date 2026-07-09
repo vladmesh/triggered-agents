@@ -172,6 +172,7 @@ def _relaunch_worker_for_rework(ref: str, card: dict, rec: dict, records: dict, 
     if not handle:
         raise RuntimeError("worker launch returned no handle")
     rec["handle"] = handle
+    rec["terminal_kind"] = worker.terminal_kind(rec.get("head"))
     rec["last_activity"] = time.time()
     save_cards(records)
     STATE.log_run("rework-worker", reference=ref, result="relaunched", reason=reason,
@@ -185,7 +186,8 @@ def _notify_worker_for_rework(ref: str, card: dict, rec: dict, records: dict, sa
     """Nudge the tracked worker, relaunching first when the saved terminal is not usable."""
     handle = rec.get("handle") or ""
     workspace = rec.get("workspace")
-    if handle and worker.terminal_live(handle, workspace) and worker.notify(handle, message):
+    if (handle and worker.terminal_live(handle, workspace, rec.get("terminal_kind"))
+            and worker.notify(handle, message)):
         return
     handle = _relaunch_worker_for_rework(ref, card, rec, records, save_cards, refresh_worker_task,
                                          reason)
@@ -736,6 +738,7 @@ def _spawn_reviewer(ref: str, pr: str | None, card: dict, rec: dict, records: di
     rec.pop("review_spawn_fails", None)
     rec["review_ws"] = ws
     rec["review_handle"] = handle
+    rec["review_terminal_kind"] = worker.reviewer_terminal_kind()
     rec["review_title"] = review_title
     rec["review_activity"] = time.time()
     rec["review_baseline"] = len(ops.show_card(ref)["comments"])
@@ -761,7 +764,8 @@ def _review_watchdog(ref: str, rec: dict, records: dict, watchdog_seconds: int,
     ws = rec.get("review_ws")
     changed = False
     worker.rename_terminal(rec.get("review_handle", ""), rec.get("review_title", ""))
-    status = worker.terminal_status(rec.get("review_handle", ""), ws)
+    status = worker.terminal_status(rec.get("review_handle", ""), ws,
+                                    rec.get("review_terminal_kind"))
     if status.get("known") and not status.get("live"):
         elapsed = time.time() - rec.get("review_activity", time.time())
         return _review_watchdog_block(

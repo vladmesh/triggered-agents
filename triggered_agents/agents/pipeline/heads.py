@@ -15,6 +15,7 @@ from __future__ import annotations
 import os
 import shlex
 import tomllib
+from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 
@@ -42,6 +43,17 @@ CODEX_EFFORTS = {
     "extra": "xhigh",
     "xhigh": "xhigh",
 }
+
+CODEX_LAUNCH_MODES = {"exec", "tui"}
+
+
+@dataclass(frozen=True)
+class LaunchSpec:
+    """A terminal create command plus an optional prompt delivered after the TUI is ready."""
+
+    command: str
+    initial_prompt: str | None = None
+    terminal_kind: str | None = None
 
 
 class HeadRegistryError(RuntimeError):
@@ -87,6 +99,44 @@ def _render_codex(profile: dict, *, prompt: str) -> str:
             f"--skip-git-repo-check{model_flag}{effort_flag} {prompt!r}")
 
 
+def _render_codex_tui(profile: dict) -> str:
+    """Interactive Codex TUI command. The prompt is sent after Orca reports `tui-idle`.
+
+    `--skip-git-repo-check` is an `exec`-only flag in Codex 0.143; the top-level TUI rejects it.
+    Pipeline worker/reviewer workspaces are git worktrees already, so the TUI path does not need it.
+    """
+    home = profile.get("codex_home") or CODEX_HOME
+    model = profile.get("model")
+    model_flag = f" -m {model}" if model else ""
+    effort = CODEX_EFFORTS.get(profile.get("effort", "default"))
+    effort_flag = ""
+    if effort:
+        effort_flag = " -c " + shlex.quote(f'model_reasoning_effort="{effort}"')
+    return (f"CODEX_HOME={home} codex --dangerously-bypass-approvals-and-sandbox"
+            f"{model_flag}{effort_flag}")
+
+
+def _env_codex_mode() -> str | None:
+    mode = os.environ.get("TA_CODEX_MODE")
+    if mode:
+        mode = mode.strip().lower()
+        if mode not in CODEX_LAUNCH_MODES:
+            known = ", ".join(sorted(CODEX_LAUNCH_MODES))
+            raise HeadRegistryError(f"unknown TA_CODEX_MODE {mode!r} (known: {known})")
+        return mode
+    flag = os.environ.get("TA_CODEX_TUI")
+    if flag is None:
+        return None
+    flag = flag.strip().lower()
+    if flag in {"", "0", "false", "no", "off"}:
+        return "exec"
+    return "tui"
+
+
+def _codex_launch_mode(profile: dict) -> str:
+    return _env_codex_mode() or profile.get("codex_mode", "exec")
+
+
 ADAPTERS = {
     "claude": _render_claude,
     "hermes": _render_hermes,
@@ -127,6 +177,11 @@ def _validate(resources: dict, profiles: dict) -> None:
                 known = ", ".join(sorted(CODEX_EFFORTS))
                 raise HeadRegistryError(f"profile {pid!r} has unknown codex effort {effort!r} "
                                         f"(known: {known})")
+            mode = prof.get("codex_mode", "exec")
+            if mode not in CODEX_LAUNCH_MODES:
+                known = ", ".join(sorted(CODEX_LAUNCH_MODES))
+                raise HeadRegistryError(f"profile {pid!r} has unknown codex launch mode {mode!r} "
+                                        f"(known: {known})")
         for fb in prof.get("fallback") or []:
             if fb not in profiles:
                 raise HeadRegistryError(f"profile {pid!r} fallback references unknown profile {fb!r}")
@@ -157,8 +212,38 @@ def load_registry(path: Path = HEADS_TOML) -> Registry:
 def render_command(profile_id: str, *, role: str, prompt: str, registry: Registry | None = None) -> str:
     """The full shell command for `orca terminal create --command`: `BOARD_ROLE=<role>` (read by
     the board-CLI itself, so every adapter gets role-gating for free) followed by the profile's
-    own adapter rendering. Raises HeadRegistryError on an unknown profile/adapter."""
+    own adapter rendering. This is the batch-compatible path: Codex stays `codex exec` here so
+    singleton agents that cannot deliver a post-start prompt keep their old launch contract.
+    Raises HeadRegistryError on an unknown profile/adapter."""
     reg = registry or load_registry()
     profile = reg.profile(profile_id)
     render = ADAPTERS[profile["adapter"]]
     return f"BOARD_ROLE={role} {render(profile, prompt=prompt)}"
+
+
+def render_launch(profile_id: str, *, role: str, prompt: str,
+                  registry: Registry | None = None) -> LaunchSpec:
+    """Launch contract for worker/reviewer terminals.
+
+    Most adapters are single-command batch launches. Codex can opt into TUI mode through
+    `codex_mode = "tui"` or `TA_CODEX_MODE=tui`: the terminal starts plain `codex`, waits for
+    `tui-idle`, then receives `prompt` through `orca terminal send`.
+    """
+    reg = registry or load_registry()
+    profile = reg.profile(profile_id)
+    if profile["adapter"] == "codex" and _codex_launch_mode(profile) == "tui":
+        return LaunchSpec(
+            command=f"BOARD_ROLE={role} {_render_codex_tui(profile)}",
+            initial_prompt=prompt,
+            terminal_kind="codex-tui",
+        )
+    return LaunchSpec(command=render_command(profile_id, role=role, prompt=prompt, registry=reg))
+
+
+def terminal_kind(profile_id: str, *, registry: Registry | None = None) -> str | None:
+    """The tracked Orca terminal kind this profile expects, or None for legacy batch sessions."""
+    reg = registry or load_registry()
+    profile = reg.profile(profile_id)
+    if profile["adapter"] == "codex" and _codex_launch_mode(profile) == "tui":
+        return "codex-tui"
+    return None

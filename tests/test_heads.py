@@ -9,6 +9,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 _STATE_DIR = tempfile.mkdtemp(prefix="ta-heads-test-")
 os.environ["TA_STATE"] = _STATE_DIR
@@ -32,7 +33,9 @@ class RealRegistryTest(unittest.TestCase):
         self.assertEqual(set(self.reg.known()),
                          {"claude-default", "claude-sonnet", "claude-opus", "claude-fable",
                           "hermes", "codex", "codex-high", "codex-extra", "codex-reviewer",
-                          "codex-curator", "codex-steward", "codex-retro"})
+                          "codex-tui", "codex-high-tui", "codex-extra-tui",
+                          "codex-reviewer-tui", "codex-curator", "codex-steward",
+                          "codex-retro"})
 
     def test_claude_profiles_share_the_subscription_resource(self):
         for pid in ("claude-default", "claude-sonnet", "claude-opus", "claude-fable"):
@@ -54,11 +57,15 @@ class RealRegistryTest(unittest.TestCase):
         self.assertEqual(self.reg.profile("codex").get("fallback") or [], [])
         self.assertEqual(self.reg.profile("codex-high").get("fallback") or [], [])
         self.assertEqual(self.reg.profile("codex-extra").get("fallback") or [], [])
+        self.assertEqual(self.reg.profile("codex-tui").get("fallback") or [], [])
+        self.assertEqual(self.reg.profile("codex-high-tui").get("fallback") or [], [])
+        self.assertEqual(self.reg.profile("codex-extra-tui").get("fallback") or [], [])
 
     def test_codex_role_profiles_keep_claude_second_priority(self):
         self.assertEqual(self.reg.profile("codex-curator").get("fallback"), ["claude-default"])
         self.assertEqual(self.reg.profile("codex-steward").get("fallback"), ["claude-fable"])
         self.assertEqual(self.reg.profile("codex-reviewer").get("fallback"), ["claude-opus"])
+        self.assertEqual(self.reg.profile("codex-reviewer-tui").get("fallback"), ["claude-opus"])
 
     def test_hermes_is_on_its_own_resource(self):
         self.assertEqual(self.reg.profile("hermes")["resource"], "openrouter")
@@ -153,6 +160,32 @@ class RenderCodexTest(unittest.TestCase):
         cmd = heads._render_codex(prof, prompt="ping")
         self.assertIn("CODEX_HOME=/tmp/throwaway-home codex exec", cmd)
 
+    def test_render_launch_keeps_codex_exec_as_default(self):
+        launch = heads.render_launch("codex", role="worker", prompt="ping", registry=self.reg)
+        self.assertIn("codex exec", launch.command)
+        self.assertIsNone(launch.initial_prompt)
+        self.assertIsNone(launch.terminal_kind)
+
+    def test_render_launch_codex_tui_splits_command_from_prompt(self):
+        launch = heads.render_launch("codex-extra-tui", role="worker", prompt="ping",
+                                     registry=self.reg)
+        self.assertTrue(launch.command.startswith(f"BOARD_ROLE=worker CODEX_HOME={heads.CODEX_HOME} codex "))
+        self.assertNotIn("codex exec", launch.command)
+        self.assertNotIn(repr("ping"), launch.command)
+        self.assertIn("--dangerously-bypass-approvals-and-sandbox", launch.command)
+        self.assertNotIn("--skip-git-repo-check", launch.command)
+        self.assertIn("-m gpt-5.5", launch.command)
+        self.assertIn("model_reasoning_effort=\"xhigh\"", launch.command)
+        self.assertEqual(launch.initial_prompt, "ping")
+        self.assertEqual(launch.terminal_kind, "codex-tui")
+
+    def test_codex_tui_feature_flag_can_enable_existing_profile(self):
+        with mock.patch.dict(os.environ, {"TA_CODEX_MODE": "tui"}, clear=False):
+            launch = heads.render_launch("codex", role="worker", prompt="ping", registry=self.reg)
+        self.assertNotIn("codex exec", launch.command)
+        self.assertEqual(launch.initial_prompt, "ping")
+        self.assertEqual(launch.terminal_kind, "codex-tui")
+
 
 class RegistryValidationTest(unittest.TestCase):
     """Malformed heads.toml variants — each must fail to load with a message naming the bad
@@ -221,6 +254,22 @@ fallback = []
         with self.assertRaises(heads.HeadRegistryError) as ctx:
             heads.load_registry(path)
         self.assertIn("too-much", str(ctx.exception))
+
+    def test_codex_profile_with_unknown_launch_mode_raises(self):
+        path = self._write("""
+[resources.openai-sub]
+probe = "true"
+[profiles.p1]
+resource = "openai-sub"
+adapter = "codex"
+model = "gpt-5.5"
+effort = "default"
+codex_mode = "sideways"
+fallback = []
+""")
+        with self.assertRaises(heads.HeadRegistryError) as ctx:
+            heads.load_registry(path)
+        self.assertIn("sideways", str(ctx.exception))
 
 
 if __name__ == "__main__":
