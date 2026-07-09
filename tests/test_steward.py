@@ -133,6 +133,27 @@ class LogSignalsTest(StewardTestBase):
         self.assertEqual(len(batch["signals"]["log"]), 1)
         self.assertEqual(batch["signals"]["log"][0]["ts"], "t2")
 
+    def test_shrunken_file_rescans_from_zero_with_reset_warn(self):
+        """runs.jsonl shrinking below the cursor means it was truncated/replaced — the old
+        min(cursor, len) clamp skipped the whole new file, and advance() then made that gap
+        permanent (2026-07-09: a head-health flip in the fresh file went unreported)."""
+        self._write_pipeline_runs([{"ts": f"t{i}", "event": "dispatch"} for i in range(5)])
+        signals.STATE.save_watermark(signals.scan()["pending"])
+        self._write_pipeline_runs([
+            {"ts": "n1", "event": "dispatch"},
+            {"ts": "n2", "event": "head-health", "resource": "openai-sub", "from": "green", "to": "red"},
+        ])
+        batch = signals.scan()
+        events = {rec.get("event") for rec in batch["signals"]["log"]}
+        self.assertIn("pipeline-log-reset", events)   # the reset itself is visible, not silent
+        self.assertIn("head-health", events)          # and the new file is scanned from line 0
+        self.assertEqual(batch["pending"]["pipeline_log_lines"], 2)
+        self.assertTrue(signals.has_signal(batch))
+        own_runs = signals.STATE.dir / "runs.jsonl"
+        own_events = [json.loads(line) for line in own_runs.read_text(encoding="utf-8").splitlines()]
+        self.assertTrue(any(e.get("event") == "pipeline-log-reset" and e.get("level") == "warn"
+                             for e in own_events))
+
     def test_malformed_line_is_skipped_not_fatal(self):
         signals.PIPELINE_RUNS.parent.mkdir(parents=True, exist_ok=True)
         signals.PIPELINE_RUNS.write_text('not json\n{"ts": "t1", "event": "x", "level": "warn"}\n')

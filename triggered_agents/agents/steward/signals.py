@@ -98,8 +98,22 @@ def _log_signals(mark: dict) -> tuple[list[dict], int]:
         return ([{"event": "pipeline-log-missing", "level": "warn", "path": str(PIPELINE_RUNS)}],
                 mark["pipeline_log_lines"])
     lines = PIPELINE_RUNS.read_text(encoding="utf-8").splitlines()
-    start = min(mark["pipeline_log_lines"], len(lines))
-    hits = []
+    start = mark["pipeline_log_lines"]
+    if start > len(lines):
+        # The file SHRANK below the cursor: runs.jsonl was truncated/replaced (manual cleanup,
+        # rotation, a recreated worktree). The old `min(cursor, len)` clamp skipped the whole new
+        # file and the next advance() then baked that gap in permanently — the 2026-07-09 scan
+        # missed a head-health flip this way (only resource_flip saved the wake-up). A shrunken
+        # file is a NEW file: rescan it from line 0 and surface the reset as a warn hit so the
+        # skill knows the log's history restarted (same visibility reasoning as
+        # pipeline-log-missing above).
+        STATE.log_run("pipeline-log-reset", level="warn", path=str(PIPELINE_RUNS),
+                      cursor=start, lines=len(lines))
+        hits = [{"event": "pipeline-log-reset", "level": "warn", "path": str(PIPELINE_RUNS),
+                 "cursor": start, "lines": len(lines)}]
+        start = 0
+    else:
+        hits = []
     for line in lines[start:]:
         try:
             rec = json.loads(line)
