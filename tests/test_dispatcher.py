@@ -56,6 +56,8 @@ class FakeWorker:
         self.pr_bases = {}               # pr_url -> baseRefName pr_base_branch returns (default "main")
         self.pr_base_polled = []         # PR urls pr_base_branch was asked about
         self.notified = []               # (handle, text) nudges sent to worker terminals
+        self.dead_handles = set()         # handles terminal_live should report as gone
+        self.unique_launch_handles = False
         self.stand_config = None         # dict from read_stand_config, or None for no-stand project
         self.stand_branch = "pipeline/x"  # branch pr_branch returns (None -> gh can't answer)
         self.stand_result = None         # dict from run_stand, or None for unavailable
@@ -111,6 +113,8 @@ class FakeWorker:
 
     def launch_worker(self, workspace, head, worker_id, title):
         self.launched.append({"ws": workspace, "head": head, "worker": worker_id, "title": title})
+        if self.unique_launch_handles:
+            return f"handle-{worker_id}-{len(self.launched)}"
         return f"handle-{worker_id}"
 
     def workspace_exists(self, project, name):
@@ -142,6 +146,9 @@ class FakeWorker:
     def notify(self, handle, text):
         self.notified.append((handle, text))
         return bool(handle)
+
+    def terminal_live(self, handle, workspace=None):
+        return bool(handle) and handle not in self.dead_handles
 
     def read_stand_config(self, project):
         return self.stand_config
@@ -195,8 +202,9 @@ class _DispatcherBase(unittest.TestCase):
 
         self.worker = FakeWorker()
         for name in ("read_base_branch", "is_contrib", "create_workspace", "set_branch", "provision",
-                     "write_task", "launch_worker", "activity", "poll_pr", "notify", "teardown",
-                     "read_stand_config", "pr_branch", "run_stand", "spawn_reviewer",
+                     "write_task", "launch_worker", "activity", "poll_pr", "notify",
+                     "terminal_live", "teardown", "read_stand_config", "pr_branch", "run_stand",
+                     "spawn_reviewer",
                      "workspace_exists", "workspace_path", "rename_terminal", "merge_pr",
                      "pr_base_branch", "list_agent_worktrees", "ff_worktree", "remote_head_sha",
                      "stop_terminals", "pr_files", "apply_provision", "relaunch_reviewer"):
@@ -1898,6 +1906,31 @@ class ValidateReviewTest(_DispatcherBase):
         self.assertEqual(len(self.worker.notified), 1)          # live worker nudged
         self.assertEqual(len(self._rev_ws_torndown()), 1)       # reviewer worktree torn down
         self.assertTrue(any(r.get("reason") == "review-red" for r in self._runs()))
+
+    def test_red_verdict_relaunches_dead_worker_and_rewrites_task(self):
+        self.worker.unique_launch_handles = True
+        ref = self._spawned()
+        rec_before = dispatcher._load_cards()[ref]
+        old_handle = rec_before["handle"]
+        launched_before = len(self.worker.launched)
+        tasks_before = len(self.worker.tasks_written)
+        self.worker.dead_handles.add(old_handle)
+
+        ops.verdict(ref, "red", "блокер: TASK.md должен содержать свежую историю")
+        dispatcher.tick()
+
+        self.assertEqual(self._column(ref), model.IN_PROGRESS)
+        rec_after = dispatcher._load_cards()[ref]
+        self.assertNotEqual(rec_after["handle"], old_handle)
+        self.assertEqual(len(self.worker.launched), launched_before + 1)
+        self.assertEqual(self.worker.notified[-1][0], rec_after["handle"])
+        self.assertEqual(len(self.worker.tasks_written), tasks_before + 1)
+        task_workspace, task_md = self.worker.tasks_written[-1]
+        self.assertEqual(task_workspace, rec_before["workspace"])
+        self.assertIn(f"[{model.MARKER_REVIEW_RED}]", task_md)
+        self.assertIn("блокер: TASK.md должен содержать свежую историю", task_md)
+        self.assertIn(f"[{model.MARKER_REVIEW_RETURN}]", task_md)
+        self.assertGreaterEqual(rec_after["last_activity"], rec_before["last_activity"])
 
     def test_red_then_rework_reruns_review_and_ignores_stale_verdict(self):
         ref = self._spawned()
