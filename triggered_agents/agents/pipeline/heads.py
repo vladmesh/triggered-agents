@@ -100,7 +100,11 @@ def _render_codex(profile: dict, *, prompt: str) -> str:
 
 
 def _render_codex_tui(profile: dict) -> str:
-    """Interactive Codex TUI command. The prompt is sent after Orca reports `tui-idle`."""
+    """Interactive Codex TUI command. The prompt is sent after Orca reports `tui-idle`.
+
+    `--skip-git-repo-check` is an `exec`-only flag in Codex 0.143; the top-level TUI rejects it.
+    Pipeline worker/reviewer workspaces are git worktrees already, so the TUI path does not need it.
+    """
     home = profile.get("codex_home") or CODEX_HOME
     model = profile.get("model")
     model_flag = f" -m {model}" if model else ""
@@ -108,8 +112,8 @@ def _render_codex_tui(profile: dict) -> str:
     effort_flag = ""
     if effort:
         effort_flag = " -c " + shlex.quote(f'model_reasoning_effort="{effort}"')
-    return (f"CODEX_HOME={home} codex --dangerously-bypass-approvals-and-sandbox "
-            f"--skip-git-repo-check{model_flag}{effort_flag}")
+    return (f"CODEX_HOME={home} codex --dangerously-bypass-approvals-and-sandbox"
+            f"{model_flag}{effort_flag}")
 
 
 def _env_codex_mode() -> str | None:

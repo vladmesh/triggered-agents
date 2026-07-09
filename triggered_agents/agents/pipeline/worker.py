@@ -60,6 +60,10 @@ _SHELL_PROMPT_RE = re.compile(
     r"(?:^|\n)\s*(?:\([^)\n]+\)\s*)?(?:[\w.-]+@[\w.-]+:\s*)?"
     r"(?:~|/|[A-Za-z]:\\)[^\n]{0,240}[$#%]\s*$"
 )
+_CODEX_TUI_MODEL_RE = re.compile(
+    r"(?:gpt|o\d|codex)[A-Za-z0-9_.-]*(?:\s+(?:default|low|medium|high|xhigh))?"
+    r"\s+\u00b7\s+(?:~|/|[A-Za-z]:\\)"
+)
 
 
 def _is_git_sha(blob: str) -> bool:
@@ -400,6 +404,46 @@ def _terminal_entry_live(term: dict) -> bool:
     return _terminal_entry_dead_reason(term) is None
 
 
+def _terminal_entry_text(term: dict) -> str:
+    parts = []
+    for key in ("title", "preview"):
+        value = term.get(key)
+        if value:
+            parts.append(str(value))
+    return _ANSI_RE.sub("", "\n".join(parts))
+
+
+def _looks_like_codex_tui(text: str) -> bool:
+    text = _ANSI_RE.sub("", text or "")
+    if "OpenAI Codex" in text:
+        return True
+    if "permissions: YOLO mode" in text and "model:" in text:
+        return True
+    return bool("\u203a" in text and _CODEX_TUI_MODEL_RE.search(text))
+
+
+def _read_terminal_text(handle: str) -> str:
+    data = _orca_json(["terminal", "read", "--terminal", handle, "--limit", "120"])
+    term = data.get("terminal", data)
+    return _ANSI_RE.sub("", "\n".join(str(line) for line in (term.get("tail") or [])))
+
+
+def _terminal_expected_kind_dead_reason(term: dict, expected_kind: str | None, handle: str,
+                                        read_terminal_text=_read_terminal_text) -> str | None:
+    if not expected_kind:
+        return None
+    if expected_kind != "codex-tui":
+        return "unknown-terminal-kind"
+    if _looks_like_codex_tui(_terminal_entry_text(term)):
+        return None
+    try:
+        if handle and _looks_like_codex_tui(read_terminal_text(handle)):
+            return None
+    except (WorkspaceError, subprocess.TimeoutExpired):
+        pass
+    return "not-codex-tui"
+
+
 def terminal_status(handle: str, workspace: str | None = None,
                     expected_kind: str | None = None) -> dict:
     """Status for exactly `handle`, optionally scoped to `workspace`.
@@ -410,9 +454,10 @@ def terminal_status(handle: str, workspace: str | None = None,
     A writable terminal whose preview is back at a shell prompt is also treated as dead, so the
     caller can relaunch instead of probing by sending the rework prompt.
 
-    `expected_kind` carries the launch contract recorded in cards.json. Orca does not expose a
-    stable Codex-agent id in `terminal list` today, so the hard gate remains the tracked handle
-    scoped to the workspace plus shell-prompt rejection.
+    `expected_kind` carries the launch contract recorded in cards.json. For Codex TUI heads, Orca
+    does not expose a stable agent id, so the tracked handle must also look like the Codex TUI
+    screen. A plain shell or long-running shell command in the same worktree fails closed instead
+    of receiving a follow-up prompt.
 
     `known=false` means Orca itself could not be queried. Callers should keep their ordinary
     watchdog path for that case instead of treating a transport failure as proof that the tracked
@@ -432,6 +477,9 @@ def terminal_status(handle: str, workspace: str | None = None,
         if workspace and not _terminal_belongs_to_workspace(t, workspace):
             return {"known": True, "live": False, "reason": "wrong-workspace"}
         reason = _terminal_entry_dead_reason(t)
+        if reason:
+            return {"known": True, "live": False, "reason": reason}
+        reason = _terminal_expected_kind_dead_reason(t, expected_kind, handle)
         if reason:
             return {"known": True, "live": False, "reason": reason}
         last = t.get("lastOutputAt")

@@ -158,6 +158,9 @@ class FakeWorker:
         if handle in self.terminal_entries:
             entry = self.terminal_entries[handle]
             reason = worker._terminal_entry_dead_reason(entry)
+            if not reason:
+                reason = worker._terminal_expected_kind_dead_reason(
+                    entry, expected_kind, handle, read_terminal_text=lambda _handle: "")
             if reason:
                 return {"known": True, "live": False, "reason": reason}
             return {"known": True, "live": True, "reason": "live",
@@ -185,7 +188,11 @@ class FakeWorker:
         if not handle or handle in self.dead_handles:
             return False
         if handle in self.terminal_entries:
-            return worker._terminal_entry_live(self.terminal_entries[handle])
+            entry = self.terminal_entries[handle]
+            if not worker._terminal_entry_live(entry):
+                return False
+            return worker._terminal_expected_kind_dead_reason(
+                entry, expected_kind, handle, read_terminal_text=lambda _handle: "") is None
         return True
 
     def read_stand_config(self, project):
@@ -1441,10 +1448,10 @@ class ValidateTest(_DispatcherBase):
         tid = next(t["id"] for t in self.board.tasks.values() if t["reference"] == ref)
         return " ".join(c["comment"] for c in self.board.comments.get(tid, []))
 
-    def _to_validate(self, pr=PR, report="готово"):
+    def _to_validate(self, pr=PR, report="готово", head=None):
         """Claim a card, have the worker report done (with a PR link), land it in Validate with
         its record intact. poll_pr returns None for this landing tick so the card stays put."""
-        ref = self._claim_one()
+        ref = self._claim_one(head=head)
         ops.report(ref, "done", f"{report}\nPR: {pr}" if pr else report)
         self.worker.pr_status = None
         dispatcher.tick()
@@ -1535,6 +1542,31 @@ class ValidateTest(_DispatcherBase):
         self.assertEqual(self.worker.notified[-1][0], rec_after["handle"])
         self.assertNotEqual(self.worker.notified[-1][0], old_handle)
         self.assertIn("CI красный", self.worker.tasks_written[-1][1])
+
+    def test_red_ci_relaunches_codex_tui_non_agent_handle(self):
+        self.worker.unique_launch_handles = True
+        ref = self._to_validate(head="codex-tui")
+        rec_before = dispatcher._load_cards()[ref]
+        old_handle = rec_before["handle"]
+        self.assertEqual(rec_before["terminal_kind"], "codex-tui")
+        self.worker.terminal_entries[old_handle] = {
+            "handle": old_handle,
+            "connected": True,
+            "writable": True,
+            "preview": "python3 -m unittest discover",
+        }
+        self.worker.pr_status = {
+            "merged": False, "state": "OPEN", "rollup": "FAILURE",
+            "failed_job": "CI", "failed_log": "boom",
+        }
+
+        dispatcher.tick()
+
+        rec_after = dispatcher._load_cards()[ref]
+        self.assertEqual(rec_after["terminal_kind"], "codex-tui")
+        self.assertNotEqual(rec_after["handle"], old_handle)
+        self.assertEqual(self.worker.notified[-1][0], rec_after["handle"])
+        self.assertNotIn(old_handle, [handle for handle, _ in self.worker.notified])
 
     def test_red_ci_move_failure_does_not_nudge_live_worker(self):
         ref = self._to_validate()
@@ -2218,6 +2250,28 @@ class ValidateReviewTest(_DispatcherBase):
         }
 
         ops.verdict(ref, "red", "блокер: shell handle не должен получать follow-up")
+        dispatcher.tick()
+
+        rec_after = dispatcher._load_cards()[ref]
+        self.assertEqual(rec_after["terminal_kind"], "codex-tui")
+        self.assertNotEqual(rec_after["handle"], old_handle)
+        self.assertEqual(self.worker.notified[-1][0], rec_after["handle"])
+        self.assertNotIn(old_handle, [handle for handle, _ in self.worker.notified])
+
+    def test_red_verdict_relaunches_codex_tui_non_agent_handle_with_same_kind(self):
+        self.worker.unique_launch_handles = True
+        ref = self._spawned(head="codex-tui")
+        rec_before = dispatcher._load_cards()[ref]
+        old_handle = rec_before["handle"]
+        self.assertEqual(rec_before["terminal_kind"], "codex-tui")
+        self.worker.terminal_entries[old_handle] = {
+            "handle": old_handle,
+            "connected": True,
+            "writable": True,
+            "preview": "python3 -m unittest discover",
+        }
+
+        ops.verdict(ref, "red", "блокер: non-agent handle не должен получать follow-up")
         dispatcher.tick()
 
         rec_after = dispatcher._load_cards()[ref]
@@ -3508,6 +3562,8 @@ class WorkerHostCallsTest(unittest.TestCase):
         self.assertEqual(calls[send_i][calls[send_i].index("--terminal") + 1], "term-tui")
         self.assertIn("TASK.md", calls[send_i][calls[send_i].index("--text") + 1])
         self.assertNotIn("codex exec", calls[create_i][calls[create_i].index("--command") + 1])
+        self.assertNotIn("--skip-git-repo-check",
+                         calls[create_i][calls[create_i].index("--command") + 1])
 
     def test_launch_worker_codex_exec_does_not_send_post_start_prompt(self):
         self.worker.launch_worker("/ws/fresh", "codex", "worker-1", "worker A-1: title")

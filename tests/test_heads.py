@@ -173,7 +173,7 @@ class RenderCodexTest(unittest.TestCase):
         self.assertNotIn("codex exec", launch.command)
         self.assertNotIn(repr("ping"), launch.command)
         self.assertIn("--dangerously-bypass-approvals-and-sandbox", launch.command)
-        self.assertIn("--skip-git-repo-check", launch.command)
+        self.assertNotIn("--skip-git-repo-check", launch.command)
         self.assertIn("-m gpt-5.5", launch.command)
         self.assertIn("model_reasoning_effort=\"xhigh\"", launch.command)
         self.assertEqual(launch.initial_prompt, "ping")
