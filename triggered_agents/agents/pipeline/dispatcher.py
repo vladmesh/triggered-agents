@@ -561,14 +561,16 @@ def _format_comment_ts(ts) -> str:
 
 
 def _task_md_metadata(card: dict, base: str) -> list[str]:
-    """Metadata block: type, head, slug (always resolved — a card may rely on the fallback),
-    the resolved base branch (card override or manifest default — worker.resolve_base_branch already
-    picked it before this is rendered), blocked_by only when the card actually has a predecessor."""
+    """Metadata block: type, worker/reviewer heads, slug, the resolved base branch, blocked_by."""
+    worker_head = card.get("effective_head") or card.get("head") or heads.DEFAULT_PROFILE
+    review_head = (card.get("effective_review_head") or card.get("review_head")
+                   or worker.REVIEWER_HEAD)
     lines = [
         "## Метаданные",
         "",
         f"- тип: {card.get('task_type') or '?'}",
-        f"- голова: {card.get('head') or '(не задана — дефолт)'}",
+        f"- голова worker: {worker_head}",
+        f"- голова reviewer: {review_head}",
         f"- слаг: {naming.card_slug(card)}",
         f"- база: {base}",
     ]
@@ -977,8 +979,10 @@ def resume() -> dict:
                     continue
                 try:
                     rec["review_handle"] = worker.relaunch_reviewer(
-                        rec["review_ws"], rec.get("worker", ref), rec.get("review_title", ref))
-                    rec["review_terminal_kind"] = worker.reviewer_terminal_kind()
+                        rec["review_ws"], rec.get("worker", ref), rec.get("review_title", ref),
+                        rec.get("review_head"))
+                    rec["review_terminal_kind"] = worker.reviewer_terminal_kind(
+                        rec.get("review_head"))
                 except Exception as e:  # noqa: BLE001 — one bad relaunch must not lose the rest
                     skipped.append(f"{ref}:reviewer")
                     STATE.log_run("resume", reference=ref, result="relaunch-failed",

@@ -115,6 +115,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_create.add_argument("--column", default="Идеи")
     p_create.add_argument("--blocked-by", dest="blocked_by")
     p_create.add_argument("--head", dest="head")
+    p_create.add_argument("--review-head", dest="review_head")
     p_create.add_argument("--slug")
     p_create.add_argument("--base-branch", dest="base_branch")
     p_create.add_argument("--description")
@@ -125,6 +126,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_update.add_argument("--ref", required=True)
     p_update.add_argument("--blocked-by", dest="blocked_by")
     p_update.add_argument("--head", dest="head")
+    p_update.add_argument("--review-head", dest="review_head")
     p_update.add_argument("--slug")
     p_update.add_argument("--base-branch", dest="base_branch")
 
@@ -248,15 +250,15 @@ def main(argv=None) -> int:
             return _emit(ops.create_card(
                 project=args.project, task_type=args.task_type, title=args.title,
                 description=desc, ref=args.ref, column=args.column,
-                blocked_by=args.blocked_by, head=args.head, slug=args.slug,
-                base_branch=args.base_branch, role=role, own_ref=args.own_ref))
+                blocked_by=args.blocked_by, head=args.head, review_head=args.review_head,
+                slug=args.slug, base_branch=args.base_branch, role=role, own_ref=args.own_ref))
         if args.cmd == "update":
             if not _need_role(role, ROLES):
                 return 2
             return _emit(ops.update_card(
                 role, args.ref, slug=args.slug,
                 head=args.head, blocked_by=args.blocked_by,
-                base_branch=args.base_branch))
+                base_branch=args.base_branch, review_head=args.review_head))
         if args.cmd == "ready":
             if not _need_role(role, ROLES):
                 return 2

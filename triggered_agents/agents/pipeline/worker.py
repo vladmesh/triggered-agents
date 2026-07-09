@@ -599,21 +599,23 @@ def _reviewer_prompt() -> str:
     )
 
 
-def _reviewer_launch_spec() -> heads.LaunchSpec:
-    return heads.render_launch(REVIEWER_HEAD, role="reviewer", prompt=_reviewer_prompt())
+def _reviewer_launch_spec(head: str | None = None) -> heads.LaunchSpec:
+    return heads.render_launch(head or REVIEWER_HEAD, role="reviewer", prompt=_reviewer_prompt())
 
 
-def reviewer_terminal_kind() -> str | None:
-    return heads.terminal_kind(REVIEWER_HEAD)
+def reviewer_terminal_kind(head: str | None = None) -> str | None:
+    return heads.terminal_kind(head or REVIEWER_HEAD)
 
 
 def spawn_reviewer(project: str, worker_id: str, base_branch: str, review_md: str, title: str,
-                   pr_branch: str, review_branch: str, head_sha: str | None = None) -> tuple[str, str]:
+                   pr_branch: str, review_branch: str, head_sha: str | None = None,
+                   review_head: str | None = None) -> tuple[str, str]:
     """Bring up the layer-3 reviewer head: a fresh worktree off base_branch, landed on the PR's
     head content under its own `review_branch` (land_pr_head — fetch, not `gh pr checkout`, so the
     reviewer never touches the worker's own branch), the REVIEW.md prompt, then the head. No
     provisioning — the reviewer only reads code and drives gh/board-CLI, so it needs no app deps.
     Returns (workspace, terminal handle). `title` seeds the tab's display name (see launch_worker).
+    `review_head` is the reviewer profile chosen for this card; omitted means REVIEWER_HEAD.
 
     `head_sha`, given only for a contrib card (validate._spawn_reviewer), pins the reviewer's
     worktree to the exact sha the worker's report claimed rather than the branch's live tip — see
@@ -625,7 +627,7 @@ def spawn_reviewer(project: str, worker_id: str, base_branch: str, review_md: st
         _write_excluded(ws, "REVIEW.md", review_md)
         ensure_trust(ws)
         ensure_theme()
-        handle = _create_head_terminal(ws, title, _reviewer_launch_spec())
+        handle = _create_head_terminal(ws, title, _reviewer_launch_spec(review_head))
     except Exception as e:
         teardown(ws)   # the worktree already exists; don't leave an orphan on a failed launch
         # Normalize to WorkspaceError so every bring-up failure (orca error/timeout, an OSError from
@@ -636,7 +638,8 @@ def spawn_reviewer(project: str, worker_id: str, base_branch: str, review_md: st
     return ws, handle
 
 
-def relaunch_reviewer(workspace: str, worker_id: str, title: str) -> str:
+def relaunch_reviewer(workspace: str, worker_id: str, title: str,
+                      review_head: str | None = None) -> str:
     """Re-spawn just the reviewer head's terminal in an already-provisioned review workspace —
     used by dispatcher.resume() to continue a hard-paused reviewer: the worktree and REVIEW.md are
     exactly as spawn_reviewer left them (stop_terminals never touches either), so there is nothing
@@ -644,7 +647,7 @@ def relaunch_reviewer(workspace: str, worker_id: str, title: str) -> str:
     orphans) against the reviewer's own command instead of the worker's."""
     ensure_trust(workspace)
     ensure_theme()
-    return _create_head_terminal(workspace, title, _reviewer_launch_spec())
+    return _create_head_terminal(workspace, title, _reviewer_launch_spec(review_head))
 
 
 def activity(workspace: str) -> float | None:
