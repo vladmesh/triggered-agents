@@ -71,6 +71,8 @@ VALIDATE_STALL_ATTEMPTS = int(os.environ.get("TA_VALIDATE_STALL_ATTEMPTS", "5"))
 # arriving. Time-based rather than tick-count: a long-but-real CI run must not misfire, only a
 # rollup that never terminates at all should.
 CI_PENDING_STALL_SECONDS = int(os.environ.get("TA_CI_PENDING_STALL_SECONDS", str(6 * 3600)))
+REVIEW_WATCHDOG_TRIGGER_SILENCE = "silence-timeout"
+REVIEW_WATCHDOG_TRIGGER_DEAD_HANDLE = "dead-terminal-handle"
 
 
 def _automerge_enabled() -> bool:
@@ -759,7 +761,15 @@ def _review_watchdog(ref: str, rec: dict, records: dict, watchdog_seconds: int,
     ws = rec.get("review_ws")
     changed = False
     worker.rename_terminal(rec.get("review_handle", ""), rec.get("review_title", ""))
-    last = worker.terminal_activity(rec.get("review_handle", ""), ws) if ws else None
+    status = worker.terminal_status(rec.get("review_handle", ""), ws)
+    if status.get("known") and not status.get("live"):
+        elapsed = time.time() - rec.get("review_activity", time.time())
+        return _review_watchdog_block(
+            ref, rec, records, ws, elapsed, watchdog_seconds,
+            trigger=REVIEW_WATCHDOG_TRIGGER_DEAD_HANDLE,
+            handle_status=status.get("reason") or "dead",
+            handle=rec.get("review_handle", ""))
+    last = status.get("last_activity") if status.get("live") else None
     if last and last > rec.get("review_activity", 0):
         rec["review_activity"] = last
         changed = True
@@ -770,15 +780,35 @@ def _review_watchdog(ref: str, rec: dict, records: dict, watchdog_seconds: int,
     silent = time.time() - rec.get("review_activity", time.time())
     if silent <= watchdog_seconds:
         return changed
+    return _review_watchdog_block(
+        ref, rec, records, ws, silent, watchdog_seconds,
+        trigger=REVIEW_WATCHDOG_TRIGGER_SILENCE)
+
+
+def _review_watchdog_block(ref: str, rec: dict, records: dict, ws: str | None, elapsed: float,
+                           watchdog_seconds: int, *, trigger: str,
+                           handle_status: str | None = None,
+                           handle: str | None = None) -> bool:
     ws_note = (f"воркспейс ревьюера {ws} оставлен для разбора" if ws
                else "воркспейс ревьюера неизвестен")
+    if trigger == REVIEW_WATCHDOG_TRIGGER_DEAD_HANDLE:
+        shown = handle or "(empty)"
+        detail = f" ({handle_status})" if handle_status else ""
+        observation = f"tracked terminal handle ревьюера {shown} не живой{detail}"
+    else:
+        observation = (f"голова-ревьюер (слой 3) молчит {int(elapsed)}s без вердикта "
+                       f"(порог {watchdog_seconds}s)")
     ops.add_comment("dispatcher", ref,
-                    f"watchdog: голова-ревьюер (слой 3) молчит {int(silent)}s без вердикта "
-                    f"(порог {watchdog_seconds}s) — завис или умер. Карточка в Blocked до vladmesh, "
+                    f"watchdog: {observation}. Карточка в Blocked до vladmesh, "
                     f"{ws_note}.")
     ops.move_card("dispatcher", ref, "Blocked")
     records.pop(ref, None)   # record gone; the reviewer worktree is left alive for a human
-    STATE.log_run("review", reference=ref, to="Blocked", reason="review-watchdog", silent=int(silent))
+    fields = {"trigger": trigger, "silent": int(elapsed)}
+    if handle_status:
+        fields["handle_status"] = handle_status
+    if handle is not None:
+        fields["handle"] = handle
+    STATE.log_run("review", reference=ref, to="Blocked", reason="review-watchdog", **fields)
     return True
 
 

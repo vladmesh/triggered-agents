@@ -384,37 +384,64 @@ def workspace_exists(project: str, name: str) -> bool:
     return Path(workspace_path(project, name)).is_dir()
 
 
-def _terminal_entry_live(term: dict) -> bool:
-    if term.get("connected") is False or term.get("writable") is False:
-        return False
+def _terminal_entry_dead_reason(term: dict) -> str | None:
+    if term.get("connected") is False:
+        return "disconnected"
+    if term.get("writable") is False:
+        return "unwritable"
     preview = _ANSI_RE.sub("", str(term.get("preview") or "")).strip()
     if preview and _SHELL_PROMPT_RE.search(preview):
-        return False
-    return True
+        return "shell-prompt"
+    return None
 
 
-def terminal_live(handle: str, workspace: str | None = None) -> bool:
-    """Whether `handle` is a live Orca terminal, optionally scoped to `workspace`.
+def _terminal_entry_live(term: dict) -> bool:
+    return _terminal_entry_dead_reason(term) is None
+
+
+def terminal_status(handle: str, workspace: str | None = None) -> dict:
+    """Status for exactly `handle`, optionally scoped to `workspace`.
 
     `terminal send` has a dangerous degraded mode for this pipeline: an old handle that no longer
     names a live head can leave the nudge landing somewhere else in the worktree, commonly a
     plain shell. Listing live terminals first makes an exited/ghost/missing handle a clean false.
     A writable terminal whose preview is back at a shell prompt is also treated as dead, so the
-    caller can relaunch instead of probing by sending the rework prompt."""
+    caller can relaunch instead of probing by sending the rework prompt.
+
+    `known=false` means Orca itself could not be queried. Callers should keep their ordinary
+    watchdog path for that case instead of treating a transport failure as proof that the tracked
+    terminal died."""
     if not handle:
-        return False
+        return {"known": True, "live": False, "reason": "missing-handle"}
     args = ["terminal", "list", "--limit", "50"]
     if workspace:
         args.extend(["--worktree", f"path:{workspace}"])
     try:
         data = _orca_json(args)
     except (WorkspaceError, subprocess.TimeoutExpired):
-        return False
+        return {"known": False, "live": False, "reason": "terminal-list-unavailable"}
     for t in data.get("terminals") or []:
         if (t.get("handle") or t.get("id")) != handle:
             continue
-        return _terminal_entry_live(t)
-    return False
+        if workspace and not _terminal_belongs_to_workspace(t, workspace):
+            return {"known": True, "live": False, "reason": "wrong-workspace"}
+        reason = _terminal_entry_dead_reason(t)
+        if reason:
+            return {"known": True, "live": False, "reason": reason}
+        last = t.get("lastOutputAt")
+        last_activity = None
+        if last:
+            try:
+                last_activity = float(last) / 1000.0
+            except (TypeError, ValueError):
+                last_activity = None
+        return {"known": True, "live": True, "reason": "live", "last_activity": last_activity}
+    return {"known": True, "live": False, "reason": "missing-terminal"}
+
+
+def terminal_live(handle: str, workspace: str | None = None) -> bool:
+    """Whether `handle` is a live Orca terminal, optionally scoped to `workspace`."""
+    return bool(terminal_status(handle, workspace).get("live"))
 
 
 def _terminal_belongs_to_workspace(term: dict, workspace: str) -> bool:
@@ -469,25 +496,10 @@ def terminal_activity(handle: str, workspace: str) -> float | None:
     keep producing output after the worker/reviewer head is gone. This helper only accepts the
     saved terminal handle, scoped to the expected workspace, and only while the entry still looks
     like a live head instead of a shell prompt."""
-    if not handle or not workspace:
+    status = terminal_status(handle, workspace)
+    if not status.get("live"):
         return None
-    try:
-        data = _orca_json(["terminal", "list", "--worktree", f"path:{workspace}", "--limit", "50"])
-    except (WorkspaceError, subprocess.TimeoutExpired):
-        return None
-    for t in data.get("terminals") or []:
-        if (t.get("handle") or t.get("id")) != handle:
-            continue
-        if not _terminal_belongs_to_workspace(t, workspace) or not _terminal_entry_live(t):
-            return None
-        last = t.get("lastOutputAt")
-        if not last:
-            return None
-        try:
-            return float(last) / 1000.0
-        except (TypeError, ValueError):
-            return None
-    return None
+    return status.get("last_activity")
 
 
 def rename_terminal(handle: str, title: str) -> bool:

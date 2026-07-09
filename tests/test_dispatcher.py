@@ -60,6 +60,7 @@ class FakeWorker:
         self.notified = []               # (handle, text) nudges sent to worker terminals
         self.dead_handles = set()         # handles terminal_live should report as gone
         self.terminal_entries = {}        # handle -> Orca terminal-list entry for terminal_live
+        self.terminal_status_polled = []  # (handle, workspace) for tracked status polls
         self.unique_launch_handles = False
         self.stand_config = None         # dict from read_stand_config, or None for no-stand project
         self.stand_branch = "pipeline/x"  # branch pr_branch returns (None -> gh can't answer)
@@ -139,6 +140,25 @@ class FakeWorker:
         self.terminal_activity_polled.append((handle, workspace))
         return self.activity_by_handle.get(handle, self.activity_ts)
 
+    def terminal_status(self, handle, workspace=None):
+        if workspace:
+            self.activity_polled.append(workspace)
+        self.terminal_activity_polled.append((handle, workspace))
+        self.terminal_status_polled.append((handle, workspace))
+        if not handle:
+            return {"known": True, "live": False, "reason": "missing-handle"}
+        if handle in self.dead_handles:
+            return {"known": True, "live": False, "reason": "missing-terminal"}
+        if handle in self.terminal_entries:
+            entry = self.terminal_entries[handle]
+            reason = worker._terminal_entry_dead_reason(entry)
+            if reason:
+                return {"known": True, "live": False, "reason": reason}
+            return {"known": True, "live": True, "reason": "live",
+                    "last_activity": self.activity_by_handle.get(handle, self.activity_ts)}
+        return {"known": True, "live": True, "reason": "live",
+                "last_activity": self.activity_by_handle.get(handle, self.activity_ts)}
+
     def poll_pr(self, pr_url):
         self.polled.append(pr_url)
         return self.pr_status
@@ -215,7 +235,7 @@ class _DispatcherBase(unittest.TestCase):
         self.worker = FakeWorker()
         for name in ("read_base_branch", "is_contrib", "create_workspace", "set_branch", "provision",
                      "write_task", "launch_worker", "activity", "terminal_activity", "poll_pr", "notify",
-                     "terminal_live", "teardown", "read_stand_config", "pr_branch", "run_stand",
+                     "terminal_status", "terminal_live", "teardown", "read_stand_config", "pr_branch", "run_stand",
                      "spawn_reviewer",
                      "workspace_exists", "workspace_path", "rename_terminal", "merge_pr",
                      "pr_base_branch", "list_agent_worktrees", "ff_worktree", "remote_head_sha",
@@ -466,9 +486,22 @@ class DispatcherTest(_DispatcherBase):
         self.assertEqual(self._column(ref_a), model.IN_PROGRESS)
 
     def test_claim_stops_at_cap(self):
-        self.board.add_task("busy", "In progress", swimlane="other",
-                            meta={model.META_TASK_TYPE: "research", model.META_PROJECT: "other",
-                                  model.META_CLAIM: "w0"})
+        busy = self.board.add_task("busy", "In progress", swimlane="other",
+                                   meta={model.META_TASK_TYPE: "research", model.META_PROJECT: "other",
+                                         model.META_CLAIM: "w0"})
+        now = time.time()
+        dispatcher._save_cards({
+            busy: {
+                "workspace": "/ws/w0",
+                "worker": "w0",
+                "handle": "handle-w0",
+                "title": "worker busy",
+                "head": heads.DEFAULT_PROFILE,
+                "claimed_at": now,
+                "last_activity": now,
+                "comment_baseline": 0,
+            }
+        })
         ref = self._ready_card("A")
         with mock.patch.object(dispatcher, "WORKER_CAP", 1):
             dispatcher.tick()
@@ -752,6 +785,89 @@ class DispatcherTest(_DispatcherBase):
         self.assertIn(rec["workspace"], self.worker.torn_down)
         self.assertEqual(ops.show_card(ref)["metadata"][model.META_RETRY_SAME], "1")
 
+    def test_dead_worker_handle_retries_same_head_without_waiting_for_silence(self):
+        ref = self._claim_one()
+        rec = dispatcher._load_cards()[ref]
+        tracked = rec["handle"]
+        dispatcher.WATCHDOG_SECONDS = 3600
+        self.worker.terminal_entries[tracked] = {
+            "handle": tracked,
+            "connected": True,
+            "writable": False,
+            "preview": "still looks busy",
+        }
+
+        dispatcher.tick()
+
+        self.assertEqual(self._column(ref), model.IN_PROGRESS)
+        self.assertIn(rec["workspace"], self.worker.torn_down)
+        meta = ops.show_card(ref)["metadata"]
+        self.assertEqual(meta[model.META_RETRY_SAME], "1")
+        self.assertTrue(any(r.get("event") == "advance"
+                            and r.get("reason") == "watchdog-retry-same"
+                            and r.get("trigger") == dispatcher.WATCHDOG_TRIGGER_DEAD_HANDLE
+                            and r.get("handle_status") == "unwritable"
+                            for r in self._runs()))
+
+    def test_missing_worker_handle_retries_same_head_without_waiting_for_silence(self):
+        ref = self._claim_one()
+        records = dispatcher._load_cards()
+        rec = records[ref]
+        rec["handle"] = ""
+        rec["last_activity"] = time.time()
+        dispatcher._save_cards(records)
+        dispatcher.WATCHDOG_SECONDS = 3600
+
+        dispatcher.tick()
+
+        self.assertIn(("", rec["workspace"]), self.worker.terminal_status_polled)
+        self.assertEqual(self._column(ref), model.IN_PROGRESS)
+        self.assertIn(rec["workspace"], self.worker.torn_down)
+        meta = ops.show_card(ref)["metadata"]
+        self.assertEqual(meta[model.META_RETRY_SAME], "1")
+        self.assertTrue(any(r.get("event") == "advance"
+                            and r.get("reason") == "watchdog-retry-same"
+                            and r.get("trigger") == dispatcher.WATCHDOG_TRIGGER_DEAD_HANDLE
+                            and r.get("handle_status") == "missing-handle"
+                            and r.get("handle") == ""
+                            for r in self._runs()))
+
+    def test_dead_worker_handle_follows_same_switch_then_blocked_budget(self):
+        reg = heads.Registry(
+            resources={"res-a": {"probe": "true"}, "res-b": {"probe": "true"}},
+            profiles={
+                "primary": {"resource": "res-a", "adapter": "claude", "fallback": ["secondary"]},
+                "secondary": {"resource": "res-b", "adapter": "claude", "fallback": []},
+            },
+        )
+        self.statuses = {"res-a": "green", "res-b": "green"}
+        dispatcher.WATCHDOG_SECONDS = 3600
+        with mock.patch.object(heads, "load_registry", return_value=reg):
+            ref = self._claim_one(head="primary")
+            first_handle = dispatcher._load_cards()[ref]["handle"]
+            self.worker.dead_handles.add(first_handle)
+
+            dispatcher.tick()
+            self.assertEqual(self._column(ref), model.IN_PROGRESS)
+            self.assertEqual(self.worker.launched[-1]["head"], "primary")
+            self.assertEqual(ops.show_card(ref)["metadata"][model.META_RETRY_SAME], "1")
+
+            dispatcher.tick()
+            self.assertEqual(self._column(ref), model.IN_PROGRESS)
+            self.assertEqual(self.worker.launched[-1]["head"], "secondary")
+            meta = ops.show_card(ref)["metadata"]
+            self.assertEqual(meta[model.META_RETRY_SWITCH], "1")
+            self.assertEqual(meta[model.META_HEAD], "secondary")
+
+            dispatcher.tick()
+            self.assertEqual(self._column(ref), "Blocked")
+            self.assertNotIn(ref, dispatcher._load_cards())
+        self.assertTrue(any(r.get("event") == "advance"
+                            and r.get("reason") == "watchdog"
+                            and r.get("trigger") == dispatcher.WATCHDOG_TRIGGER_DEAD_HANDLE
+                            and r.get("handle_status") == "missing-terminal"
+                            for r in self._runs()))
+
     # bring-up failure after claim (review #1) --------------------------------
     def test_launch_worker_fail_blocks_not_hangs(self):
         ref = self._ready_card("A")
@@ -778,7 +894,9 @@ class DispatcherTest(_DispatcherBase):
         dispatcher.tick()
         records = dispatcher._load_cards()
         self.assertIn(ref, records)
-        self.assertEqual(records[ref]["worker"], "w-crash")
+        self.assertEqual(records[ref]["worker"], "1-a")
+        self.assertIn("/ws/w-crash", self.worker.torn_down)
+        self.assertEqual(ops.show_card(ref)["metadata"][model.META_RETRY_SAME], "1")
         self.assertTrue(any(r["event"] == "reconcile" for r in self._runs()))
         # From here the normal machinery applies: a report moves it to Validate.
         ops.report(ref, "done", "shipped after crash")
@@ -788,12 +906,16 @@ class DispatcherTest(_DispatcherBase):
     def test_reconciled_card_hits_watchdog_on_silence(self):
         ref = self._ready_card("A")
         ops.claim_card(ref, "w-crash")
-        dispatcher.tick()  # adopt
-        dispatcher.WATCHDOG_SECONDS = -1
-        dispatcher.tick()  # live budget -> same-head retry, not a terminal Blocked
+        dispatcher.WATCHDOG_SECONDS = 3600
+        dispatcher.tick()
         self.assertEqual(self._column(ref), model.IN_PROGRESS)
         self.assertIn("/ws/w-crash", self.worker.torn_down)
         self.assertEqual(ops.show_card(ref)["metadata"][model.META_RETRY_SAME], "1")
+        self.assertTrue(any(r.get("event") == "advance"
+                            and r.get("reason") == "watchdog-retry-same"
+                            and r.get("trigger") == dispatcher.WATCHDOG_TRIGGER_DEAD_HANDLE
+                            and r.get("handle_status") == "missing-handle"
+                            for r in self._runs()))
 
     def test_reconcile_restores_workspace_from_claim(self):
         # The claim IS the card's workspace base name (naming._worker_id) — reconcile must rebuild
@@ -801,12 +923,8 @@ class DispatcherTest(_DispatcherBase):
         ref = self._ready_card("A")
         ops.claim_card(ref, "w-crash")
         dispatcher.tick()
-        records = dispatcher._load_cards()
-        self.assertEqual(records[ref]["workspace"], "/ws/w-crash")
-        dispatcher.WATCHDOG_SECONDS = 600
-        self.worker.activity_ts = None
-        dispatcher.tick()  # advance polls activity for the watchdog clock
-        self.assertIn("/ws/w-crash", self.worker.activity_polled)
+        self.assertIn(("", "/ws/w-crash"), self.worker.terminal_status_polled)
+        self.assertIn("/ws/w-crash", self.worker.torn_down)
 
     def test_restore_workspace_warns_on_empty_claim(self):
         # Nothing to rebuild a workspace name from — an explicit warn, not a silent "" adoption.
@@ -2210,6 +2328,27 @@ class ValidateReviewTest(_DispatcherBase):
         self.assertNotIn((shell, rec["review_ws"]), self.worker.terminal_activity_polled)
         self.assertEqual(self._column(ref), "Blocked")
         self.assertTrue(any(r.get("reason") == "review-watchdog" for r in self._runs()))
+
+    def test_reviewer_dead_handle_blocks_without_waiting_for_silence(self):
+        ref = self._spawned()
+        rec = dispatcher._load_cards()[ref]
+        tracked = rec["review_handle"]
+        shell = "review-shell"
+        dispatcher.WATCHDOG_SECONDS = 3600
+        self.worker.dead_handles.add(tracked)
+        self.worker.activity_by_handle[shell] = time.time()
+
+        dispatcher.tick()
+
+        self.assertIn((tracked, rec["review_ws"]), self.worker.terminal_status_polled)
+        self.assertNotIn((shell, rec["review_ws"]), self.worker.terminal_status_polled)
+        self.assertEqual(self._column(ref), "Blocked")
+        self.assertIn("не живой", self._markers(ref))
+        self.assertTrue(any(r.get("event") == "review"
+                            and r.get("reason") == "review-watchdog"
+                            and r.get("trigger") == validate.REVIEW_WATCHDOG_TRIGGER_DEAD_HANDLE
+                            and r.get("handle_status") == "missing-terminal"
+                            for r in self._runs()))
 
     def test_review_watchdog_frozen_while_reviewer_resource_is_red(self):
         # triggered-agents-241: the reviewer head has its own resource; a subscription-limit red

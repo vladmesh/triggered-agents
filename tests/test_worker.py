@@ -546,6 +546,37 @@ class SpawnReviewerClosesOrphanTest(unittest.TestCase):
 
 
 class TerminalLiveTest(unittest.TestCase):
+    def test_terminal_status_reports_missing_handle_without_orca_call(self):
+        with mock.patch.object(worker, "_orca_json") as orca:
+            self.assertEqual(worker.terminal_status("", "/ws/fresh"),
+                             {"known": True, "live": False, "reason": "missing-handle"})
+        orca.assert_not_called()
+
+    def test_terminal_status_reports_unwritable_handle(self):
+        with mock.patch.object(worker, "_orca_json", return_value={"terminals": [{
+            "handle": "term-worker",
+            "connected": True,
+            "writable": False,
+            "preview": "running",
+        }]}):
+            self.assertEqual(worker.terminal_status("term-worker", "/ws/fresh"),
+                             {"known": True, "live": False, "reason": "unwritable"})
+
+    def test_terminal_status_reports_missing_terminal(self):
+        with mock.patch.object(worker, "_orca_json", return_value={"terminals": [{
+            "handle": "term-shell",
+            "connected": True,
+            "writable": True,
+            "preview": "running",
+        }]}):
+            self.assertEqual(worker.terminal_status("term-worker", "/ws/fresh"),
+                             {"known": True, "live": False, "reason": "missing-terminal"})
+
+    def test_terminal_status_keeps_orca_query_failure_unknown(self):
+        with mock.patch.object(worker, "_orca_json", side_effect=worker.WorkspaceError("orca down")):
+            self.assertEqual(worker.terminal_status("term-worker", "/ws/fresh"),
+                             {"known": False, "live": False, "reason": "terminal-list-unavailable"})
+
     def test_rejects_shell_prompt_preview(self):
         def fake_orca_json(args):
             self.assertEqual(args, ["terminal", "list", "--limit", "50",
@@ -577,8 +608,8 @@ class TerminalLiveTest(unittest.TestCase):
 class TerminalActivityTest(unittest.TestCase):
     def test_returns_tracked_handle_last_output(self):
         def fake_orca_json(args):
-            self.assertEqual(args, ["terminal", "list", "--worktree", "path:/ws/fresh",
-                                    "--limit", "50"])
+            self.assertEqual(args, ["terminal", "list", "--limit", "50",
+                                    "--worktree", "path:/ws/fresh"])
             return {"terminals": [{
                 "handle": "term-worker",
                 "connected": True,
