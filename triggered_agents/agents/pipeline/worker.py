@@ -417,6 +417,79 @@ def terminal_live(handle: str, workspace: str | None = None) -> bool:
     return False
 
 
+def _terminal_belongs_to_workspace(term: dict, workspace: str) -> bool:
+    """Best-effort guard for terminal entries that carry an explicit worktree path.
+
+    `terminal list --worktree path:<workspace>` is the primary scoping. Some Orca responses also
+    include the worktree in the entry; when they do, require it to match the workspace the
+    dispatcher is tracking. Older responses without that field are accepted because the list call
+    already scoped them."""
+    candidates = []
+
+    def add_candidate(value, explicit_path: bool = False) -> None:
+        if isinstance(value, dict):
+            candidates.extend(value.get(k) for k in ("path", "root", "worktreePath", "workspacePath"))
+            return
+        if not value:
+            return
+        text = str(value)
+        path_like = (
+            explicit_path
+            or text.startswith(("path:", "~", "/"))
+            or "::" in text
+            or bool(re.match(r"^[A-Za-z]:\\", text))
+        )
+        if path_like:
+            candidates.append(value)
+
+    for key in ("worktreePath", "workspacePath"):
+        add_candidate(term.get(key), explicit_path=True)
+    for key in ("worktree", "workspace"):
+        add_candidate(term.get(key))
+    candidates = [c for c in candidates if c]
+    if not candidates:
+        return True
+
+    def norm(value) -> str:
+        text = str(value)
+        if "::" in text:
+            text = text.split("::", 1)[-1]
+        if text.startswith("path:"):
+            text = text[len("path:"):]
+        return os.path.abspath(os.path.expanduser(text))
+
+    want = norm(workspace)
+    return any(norm(c) == want for c in candidates)
+
+
+def terminal_activity(handle: str, workspace: str) -> float | None:
+    """Latest output time for exactly `handle` in `workspace`, epoch seconds.
+
+    Workspace-level max activity is unsafe for the watchdog: a plain shell left in the worktree can
+    keep producing output after the worker/reviewer head is gone. This helper only accepts the
+    saved terminal handle, scoped to the expected workspace, and only while the entry still looks
+    like a live head instead of a shell prompt."""
+    if not handle or not workspace:
+        return None
+    try:
+        data = _orca_json(["terminal", "list", "--worktree", f"path:{workspace}", "--limit", "50"])
+    except (WorkspaceError, subprocess.TimeoutExpired):
+        return None
+    for t in data.get("terminals") or []:
+        if (t.get("handle") or t.get("id")) != handle:
+            continue
+        if not _terminal_belongs_to_workspace(t, workspace) or not _terminal_entry_live(t):
+            return None
+        last = t.get("lastOutputAt")
+        if not last:
+            return None
+        try:
+            return float(last) / 1000.0
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
 def rename_terminal(handle: str, title: str) -> bool:
     """Best-effort: (re)apply a human-readable title to `handle`'s tab. Claude Code's own
     session dynamically rewrites its tab title once it starts working (spinner + an inferred
@@ -568,7 +641,10 @@ def relaunch_reviewer(workspace: str, worker_id: str, title: str) -> str:
 
 
 def activity(workspace: str) -> float | None:
-    """Latest terminal output time in the workspace, epoch seconds, or None if unknown."""
+    """Latest terminal output time in the workspace, epoch seconds, or None if unknown.
+
+    Legacy helper for callers that truly need workspace-level activity. Pipeline watchdogs must
+    use terminal_activity(handle, workspace) so an unrelated shell cannot keep a card alive."""
     try:
         data = _orca_json(["terminal", "list", "--worktree", f"path:{workspace}", "--limit", "50"])
     except (WorkspaceError, subprocess.TimeoutExpired):

@@ -273,19 +273,18 @@ def _reconcile(records: dict) -> bool:
     cards.json was lost (a dispatcher redeploy). Without this such a card hangs forever: an
     In-progress one is invisible to _advance and the watchdog, and a Validate one would never get
     its layer-3 review while precheck keeps reporting work. The claim already names the card's
-    workspace (_restore_workspace), so activity polling keeps working right after adoption instead
-    of the watchdog firing on a workspace it can no longer see. Adopted with a fresh comment
-    baseline, so from here a report advances an In-progress card normally, a Validate card is
-    driven by validate.run (fresh review, lower layers re-checked past the new baseline), and pure
-    silence ends in the watchdog -> Blocked.
+    workspace (_restore_workspace), so a tracked handle can be polled once one exists. Adopted
+    with a fresh comment baseline, so from here a report advances an In-progress card normally, a
+    Validate card is driven by validate.run (fresh review, lower layers re-checked past the new
+    baseline), and pure silence ends in the watchdog -> Blocked.
 
     Never adopts the steward's own report card (c["steward_report"], triggered-agents-255): that
     card's claim names a slug, not a worker workspace (create_report_card sets META_CLAIM to its
     own slug so claim_card can never re-pick it up), so _restore_workspace would fabricate a path
-    that never existed, worker.activity() on it would sit permanently silent, and the watchdog
-    would eventually requeue it to Ready with its claim cleared — exactly the corruption the report
-    card's own docstring assumes can't happen. The steward owns that card's In progress -> Done/
-    Blocked lifecycle entirely by hand; the dispatcher must leave it alone."""
+    that never existed, the tracked handle would stay empty, and the watchdog would eventually
+    requeue it to Ready with its claim cleared — exactly the corruption the report card's own
+    docstring assumes can't happen. The steward owns that card's In progress -> Done/Blocked
+    lifecycle entirely by hand; the dispatcher must leave it alone."""
     changed = False
     for column in (model.IN_PROGRESS, "Validate"):
         for c in ops.list_cards(column=column):
@@ -371,7 +370,8 @@ def _advance(records: dict, statuses: dict[str, str]) -> bool:
             records.pop(ref)
             changed = True
         else:
-            last = worker.activity(rec["workspace"]) if rec.get("workspace") else None
+            last = (worker.terminal_activity(rec.get("handle", ""), rec["workspace"])
+                    if rec.get("workspace") else None)
             if last:
                 rec["last_activity"] = last
                 changed = True
