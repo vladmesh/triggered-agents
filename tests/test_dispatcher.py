@@ -283,7 +283,6 @@ class _DispatcherBase(unittest.TestCase):
             if f.exists():
                 f.unlink()
         self._orig_watchdog = dispatcher.WATCHDOG_SECONDS
-        self._orig_unpark_failure_cap = dispatcher.UNPARK_FAILURE_CAP
         self._orig_ci_pending_stall = validate.CI_PENDING_STALL_SECONDS
 
         # Resource health defaults to all-green (regular behavior, untouched by this card) unless
@@ -297,8 +296,6 @@ class _DispatcherBase(unittest.TestCase):
 
     def tearDown(self):
         dispatcher.WATCHDOG_SECONDS = self._orig_watchdog
-        if hasattr(self, "_orig_unpark_failure_cap"):
-            dispatcher.UNPARK_FAILURE_CAP = self._orig_unpark_failure_cap
         validate.CI_PENDING_STALL_SECONDS = self._orig_ci_pending_stall
 
     # helpers ---------------------------------------------------------------
@@ -3369,15 +3366,15 @@ class PipelinePauseTest(_DispatcherBase):
         runs = [r for r in self._runs() if r["event"] == "pause-flag"]
         self.assertTrue(runs and runs[-1]["result"] == "corrupt" and runs[-1]["level"] == "warn")
 
-    def test_unpark_failure_is_localized_not_a_crash(self):
+    def test_parked_worker_does_not_call_launch_worker(self):
         ref = self._claim_one(head="claude-opus")
         self._mark_worker_parked(ref)
         with mock.patch.object(worker, "launch_worker", side_effect=RuntimeError("orca timeout")):
-            dispatcher.tick()   # must not raise despite the unpark failing
+            dispatcher.tick()
         self.assertEqual(self._column(ref), model.IN_PROGRESS)
         self.assertTrue(dispatcher._load_cards()[ref].get("parked_worker"))
         runs = [r for r in self._runs()
-                if r["event"] == "unpark-worker" and r.get("result") == "failed"]
+                if r["event"] == "unpark-worker" and r.get("result") == "unavailable"]
         self.assertTrue(any(r.get("reference") == ref for r in runs))
 
     # --- soft: claims off, everything claimed rides its cycle -------------------------------
@@ -3539,22 +3536,17 @@ class PipelinePauseTest(_DispatcherBase):
         self.assertEqual(rc, PRECHECK_SKIP)
 
     # --- parked worker compatibility path -----------------------------------------------------
-    def test_parked_worker_tick_unparks_in_the_same_workspace(self):
+    def test_parked_worker_tick_stays_parked_without_fresh_launch(self):
         ref = self._claim_one(head="claude-opus")
-        rec_before = dispatcher._load_cards()[ref]
-        ws, head, worker_id = rec_before["workspace"], rec_before["head"], rec_before["worker"]
         self._mark_worker_parked(ref)
         self.worker.launched.clear()
         dispatcher.tick()
-        self.assertEqual(len(self.worker.launched), 1)
-        self.assertEqual(self.worker.launched[0]["ws"], ws)
-        self.assertEqual(self.worker.launched[0]["head"], head)
-        self.assertEqual(self.worker.launched[0]["worker"], worker_id)
-        rec_unparked = dispatcher._load_cards()[ref]
-        self.assertFalse(rec_unparked.get("parked_worker"))
-        self.assertNotEqual(rec_unparked["handle"], "")
+        self.assertEqual(self.worker.launched, [])
+        rec = dispatcher._load_cards()[ref]
+        self.assertTrue(rec.get("parked_worker"))
+        self.assertEqual(rec["handle"], "")
         runs = [r for r in self._runs() if r["event"] == "unpark-worker"]
-        self.assertTrue(any(r.get("reference") == ref and r.get("result") == "unparked"
+        self.assertTrue(any(r.get("reference") == ref and r.get("result") == "unavailable"
                             for r in runs))
 
     def test_parked_worker_report_done_moves_to_validate_without_unpark(self):
@@ -3585,23 +3577,18 @@ class PipelinePauseTest(_DispatcherBase):
         self.assertEqual(self.worker.launched, [])
         self.assertNotIn(ref, dispatcher._load_cards())
 
-    def test_persistent_unpark_failure_blocks_with_card_signal(self):
-        dispatcher.UNPARK_FAILURE_CAP = 2
+    def test_parked_worker_unavailable_notice_is_logged_once(self):
         ref = self._claim_one(head="claude-opus")
         self._mark_worker_parked(ref)
 
-        with mock.patch.object(worker, "launch_worker", side_effect=RuntimeError("orca timeout")):
-            dispatcher.tick()
-            self.assertEqual(self._column(ref), model.IN_PROGRESS)
-            self.assertTrue(dispatcher._load_cards()[ref].get("parked_worker"))
-            dispatcher.tick()
+        dispatcher.tick()
+        dispatcher.tick()
 
-        self.assertEqual(self._column(ref), "Blocked")
-        self.assertNotIn(ref, dispatcher._load_cards())
-        self.assertIn("Не удалось вернуть worker после hard resume", self._markers(ref))
-        self.assertTrue(any(r.get("event") == "unpark-worker"
-                            and r.get("reason") == "unpark-failed"
-                            and r.get("reference") == ref for r in self._runs()))
+        self.assertEqual(self._column(ref), model.IN_PROGRESS)
+        self.assertTrue(dispatcher._load_cards()[ref].get("parked_worker"))
+        runs = [r for r in self._runs()
+                if r.get("event") == "unpark-worker" and r.get("reference") == ref]
+        self.assertEqual(len(runs), 1)
 
     def test_hard_resume_gives_the_worker_watchdog_a_fresh_window(self):
         ref = self._claim_one(head="claude-opus")

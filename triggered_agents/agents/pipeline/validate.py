@@ -175,7 +175,7 @@ def _relaunch_worker_for_rework(ref: str, card: dict, rec: dict, records: dict, 
     rec["terminal_kind"] = worker.terminal_kind(rec.get("head"))
     rec["last_activity"] = time.time()
     rec.pop("parked_worker", None)
-    rec.pop("unpark_fails", None)
+    rec.pop("park_notice_logged", None)
     save_cards(records)
     STATE.log_run("rework-worker", reference=ref, result="relaunched", reason=reason,
                   old_handle=old_handle, new_handle=rec["handle"])

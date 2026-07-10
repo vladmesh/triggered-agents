@@ -61,7 +61,6 @@ WORKER_CAP = int(os.environ.get("TA_WORKER_CAP", "3"))
 # _bring_up's own smoke-fail path, still a straight Blocked, no retry.
 RETRY_SAME_BUDGET = int(os.environ.get("TA_RETRY_SAME_BUDGET", "1"))
 RETRY_SWITCH_BUDGET = int(os.environ.get("TA_RETRY_SWITCH_BUDGET", "1"))
-UNPARK_FAILURE_CAP = int(os.environ.get("TA_UNPARK_FAILURE_CAP", "3"))
 _LOG_TAIL_LINES = 40
 WATCHDOG_TRIGGER_SILENCE = "silence-timeout"
 WATCHDOG_TRIGGER_DEAD_HANDLE = "dead-terminal-handle"
@@ -406,10 +405,12 @@ def _advance(records: dict, statuses: dict[str, str]) -> bool:
         else:
             if was_parked:
                 changed = True
-                _unpark_worker_for_tick(ref, card, rec, records)
-                if rec.get("parked_worker") or ref not in records:
-                    continue
-                worker.rename_terminal(rec.get("handle", ""), rec.get("title", ""))
+                rec["last_activity"] = time.time()
+                if not rec.get("park_notice_logged"):
+                    rec["park_notice_logged"] = True
+                    STATE.log_run("unpark-worker", reference=ref, result="unavailable",
+                                  reason="no-lossless-terminal-unpark")
+                continue
             handle = rec.get("handle", "")
             current_head = _current_head(card, rec)
             status = worker.terminal_status(handle, rec.get("workspace"), rec.get("terminal_kind"))
@@ -609,41 +610,6 @@ def _refresh_worker_task(card: dict, rec: dict) -> None:
     worker.write_task(workspace, _task_md(card, ops.show_card(card["reference"]), base))
 
 
-def _unpark_worker_for_tick(ref: str, card: dict, rec: dict, records: dict) -> bool:
-    """Bring back a worker that hard resume left parked."""
-    if not rec.get("parked_worker"):
-        return False
-    try:
-        _refresh_worker_task(card, rec)
-        rec["handle"] = worker.launch_worker(rec["workspace"], rec.get("head"),
-                                             rec["worker"], rec.get("title", ref))
-        rec["terminal_kind"] = worker.terminal_kind(rec.get("head"))
-    except Exception as e:  # noqa: BLE001, one stuck unpark must not crash the whole tick
-        fails = int(rec.get("unpark_fails") or 0) + 1
-        rec["unpark_fails"] = fails
-        scrubbed = worker.scrub_secrets(str(e))
-        if fails >= UNPARK_FAILURE_CAP:
-            ws = rec.get("workspace") or "(неизвестен)"
-            ops.add_comment(
-                "dispatcher", ref,
-                f"Не удалось вернуть worker после hard resume {fails} раз подряд: {scrubbed}. "
-                f"Карточка в Blocked до vladmesh, воркспейс {ws} оставлен для разбора.")
-            ops.move_card("dispatcher", ref, "Blocked")
-            records.pop(ref, None)
-            STATE.log_run("unpark-worker", reference=ref, to="Blocked", reason="unpark-failed",
-                          fails=fails, error=scrubbed)
-            return False
-        STATE.log_run("unpark-worker", reference=ref, result="failed", level="warn",
-                      fails=fails, error=scrubbed)
-        return False
-    rec["last_activity"] = time.time()
-    rec.pop("parked_worker", None)
-    rec.pop("unpark_fails", None)
-    STATE.log_run("unpark-worker", reference=ref, result="unparked",
-                  workspace=rec.get("workspace"))
-    return True
-
-
 def _block(ref: str, reason: str, body: str, **log_fields) -> None:
     """Comment (scrubbed: provision logs / orca errors may echo env) + move to Blocked."""
     ops.add_comment("dispatcher", ref, worker.scrub_secrets(body))
@@ -760,7 +726,7 @@ def tick() -> int:
     """One dispatcher tick — see the module docstring for the per-tick order. A hard pause freezes
     this solid: reconcile/advance/validate/claim all touch a head or the board on the pipeline's
     behalf, and every head that would need touching was already stopped by pause() itself, so there
-    is nothing safe left to do until resume() parks them for lazy unpark or relaunches their
+    is nothing safe left to do until resume() marks stopped workers parked or relaunches their
     reviewer. Running any of these against a stopped head would either hang on a dead terminal or
     silently accumulate watchdog silence, exactly what resume()'s clock reset exists to avoid
     needing in the first place. A soft pause only turns off _claim_next: every claimed card keeps
@@ -813,8 +779,9 @@ def pause(requested_mode: str, *, reason: str = pause_flag.DEFAULT_REASON,
     on a head that was stopped on purpose, not one that died. The one exception is a narrow
     initiator exclude: backup create runs the CLI from its own worker workspace, so that workspace
     is left running for actor=secretary-backup; operators can pass explicit excluded workspaces.
-    resume() parks stopped workers for lazy unpark, relaunches reviewers, and gives every affected
-    watchdog a fresh window, so the paused stretch never reads as silence once ticking resumes.
+    resume() marks stopped workers parked without inventing a fresh worker launch, relaunches
+    reviewers, and gives every affected watchdog a fresh window, so the paused stretch never reads
+    as silence once ticking resumes.
 
     Idempotent: pausing again in the same mode is a no-op (still logged, so repeated calls are
     visible in runs.jsonl). Pausing in the other mode while already paused is a GuardError — resume
@@ -881,10 +848,10 @@ def resume() -> dict:
     """Undo pause(). Not paused at all is a no-op (still logged). A soft pause never stopped
     anything, so lifting it is just dropping the flag — the very next tick claims and ticks
     normally again. A hard pause no longer relaunches every stopped worker at resume time. It
-    clears the worker handle, marks the record parked and resets the watchdog clock; the next
-    normal tick unparks only an In-progress worker that still needs to run. Stopped reviewers are
-    relaunched immediately in their existing review workspaces, because Validate cannot finish
-    layer 3 without that independent head.
+    clears the worker handle, marks the record parked and resets the watchdog clock; ordinary ticks
+    keep an In-progress worker parked because Orca has no lossless terminal unpark primitive.
+    Stopped reviewers are relaunched immediately in their existing review workspaces, because
+    Validate cannot finish layer 3 without that independent head.
 
     A worker stopped while its card sat in Validate stays parked too: that worker is kept only for
     a CI-red or review-red nudge, and an independent reviewer may be reviewing this exact branch
