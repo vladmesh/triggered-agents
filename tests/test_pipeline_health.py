@@ -30,8 +30,20 @@ def _registry(resources, profiles=None):
     return heads.Registry(resources=resources, profiles=profiles or {})
 
 
+def _assert_isolated_state():
+    # setUp below unlinks runs.jsonl/resource_health.json in STATE.dir. If an earlier import
+    # bound the STATE singleton to the live dispatcher dir (module order without the tests
+    # package __init__), fail loudly instead of wiping real pipeline state (2026-07-10 incident,
+    # triggered-agents-330 class).
+    state_dir = str(health.STATE.dir)
+    if not state_dir.startswith(tempfile.gettempdir()):
+        raise AssertionError(
+            f"pipeline STATE bound to non-tempdir {state_dir!r}; refusing to delete live state")
+
+
 class RefreshTtlTest(unittest.TestCase):
     def setUp(self):
+        _assert_isolated_state()
         health.STATE.ensure_dir()
         for f in (health.STATE.dir / "runs.jsonl", health.HEALTH_FILE):
             if f.exists():
@@ -320,6 +332,7 @@ class ForceRedTest(unittest.TestCase):
     or touching the shared credential."""
 
     def setUp(self):
+        _assert_isolated_state()
         health.STATE.ensure_dir()
         for f in (health.STATE.dir / "runs.jsonl", health.HEALTH_FILE):
             if f.exists():

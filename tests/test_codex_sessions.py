@@ -1,13 +1,26 @@
 """Codex session rollout lookup: liveness signal parsing, scan policy, and the
-worker.terminal_status integration for terminal_kind=codex-tui."""
+worker.terminal_status integration for terminal_kind=codex-tui.
+
+TA_STATE / TA_PIPELINE_STATE_DIR pinned to tempdirs before the triggered_agents import: this
+module sorts before test_dispatcher, so when the suite runs without the tests package __init__
+(e.g. `cd tests && python3 -m unittest ...`) it is the first to bind the pipeline STATE
+singleton. Without the pin that binding lands on the live dispatcher state dir and
+test_pipeline_health's setUp then wipes the real runs.jsonl (2026-07-10 incident, same class
+as triggered-agents-330)."""
 import json
 import os
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
-from triggered_agents.agents.pipeline import codex_sessions, worker
+os.environ["TA_STATE"] = tempfile.mkdtemp(prefix="ta-codex-sessions-state-")
+os.environ["TA_PIPELINE_STATE_DIR"] = tempfile.mkdtemp(prefix="ta-codex-sessions-pipeline-state-")
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from triggered_agents.agents.pipeline import codex_sessions, worker  # noqa: E402
 
 
 def _write_session(path: Path, cwd: str, mtime: float) -> None:
