@@ -126,7 +126,11 @@ def _log_signals(mark: dict) -> tuple[list[dict], int]:
 
 def _blocked_signals(mark: dict) -> tuple[list[str], list[str]]:
     """(new Blocked refs since the watermark, every ref currently Blocked)."""
-    blocked = [c["reference"] for c in pipeline_ops.list_cards(column="Blocked")]
+    # A steward report card may intentionally end in Blocked when the run found items that need
+    # a human. That report is an accounting artifact, not a fresh anomaly for the next hourly
+    # sweep. Stale still catches report cards left in In progress after a dead head.
+    blocked = [c["reference"] for c in pipeline_ops.list_cards(column="Blocked")
+               if c.get("steward_report") != "1"]
     seen = set(mark["notified_blocked"])
     new = [r for r in blocked if r not in seen]
     return new, blocked

@@ -168,6 +168,16 @@ class BlockedSignalsTest(StewardTestBase):
         self.assertEqual(batch["signals"]["new_blocked"], [ref])
         self.assertTrue(signals.has_signal(batch))
 
+    def test_blocked_steward_report_card_is_not_a_signal(self):
+        ref = self.board.add_task("steward: deep-sweep", "Blocked", swimlane="triggered-agents",
+                                  meta={"task_type": "research", "project": "triggered-agents",
+                                        "slug": "steward-sweep-1", "claim": "steward-sweep-1",
+                                        "steward_report": "1"})
+        batch = signals.scan()
+        self.assertEqual(batch["signals"]["new_blocked"], [])
+        self.assertFalse(signals.has_signal(batch))
+        self.assertNotIn(ref, batch["pending"]["notified_blocked"])
+
     def test_already_notified_blocked_card_does_not_refire(self):
         ref = self.board.add_task("A", "Blocked", meta={"project": "personal_site"})
         signals.STATE.save_watermark(signals.scan()["pending"])
