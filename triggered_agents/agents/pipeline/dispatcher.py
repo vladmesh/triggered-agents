@@ -133,6 +133,32 @@ def _load_cards() -> dict:
         return {}
 
 
+def _auto_resume_stale_hard_pause(state: dict, *, source: str) -> dict:
+    decision = pause_flag.hard_pause_auto_resume_status(state)
+    if not decision.get("eligible"):
+        return state
+    try:
+        resume()
+    except Exception as e:  # noqa: BLE001, failed recovery must be visible without crashing the gate
+        STATE.log_run(
+            "pause-ttl",
+            result="auto-resume-failed",
+            source=source,
+            level="warn",
+            error=worker.scrub_secrets(str(e)),
+        )
+        return state
+    STATE.log_run(
+        "pause-ttl",
+        result="auto-resume",
+        source=source,
+        actor=decision.get("actor") or "",
+        age_seconds=decision.get("age_seconds"),
+        ttl_seconds=decision.get("ttl_seconds"),
+    )
+    return pause_flag.load()
+
+
 def _save_cards(records: dict) -> None:
     STATE.ensure_dir()
     tmp = CARDS_FILE.with_suffix(".json.tmp")
@@ -215,7 +241,7 @@ def precheck() -> int:
         health.refresh()
     except Exception as e:  # noqa: BLE001 — must never break precheck's own board check
         STATE.log_run("head-health", result="error", level="warn", error=worker.scrub_secrets(str(e)))
-    paused = pause_flag.load()
+    paused = _auto_resume_stale_hard_pause(pause_flag.load(), source="precheck")
     if paused and paused.get("mode") == "hard":
         STATE.log_run("precheck", result="paused", mode="hard")
         print("pipeline: hard-paused — SKIP", file=sys.stderr)
@@ -678,6 +704,7 @@ def tick() -> int:
     exactly what resume()'s clock reset exists to avoid needing in the first place. A soft pause
     only turns off _claim_next: every claimed card keeps riding its normal cycle (advance, CI/stand,
     layer-3 review, automerge) untouched, so Ready cards are the only thing that doesn't move."""
+    _auto_resume_stale_hard_pause(pause_flag.load(), source="tick")
     with _tick_lock():
         paused = pause_flag.load()
         if paused and paused.get("mode") == "hard":
