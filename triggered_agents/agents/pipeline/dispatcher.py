@@ -382,7 +382,7 @@ def _advance(records: dict, statuses: dict[str, str]) -> bool:
             changed = True
             continue
         worker.rename_terminal(rec.get("handle", ""), rec.get("title", ""))
-        if _try_claim_started_comment(ref, rec, advance_baseline=False):
+        if _try_claim_started_comment(ref, rec):
             changed = True
         verdict = _report_verdict(ref, int(rec.get("comment_baseline", 0)))
         if verdict == "done":
@@ -615,24 +615,25 @@ def _claim_started_comment_body(worker_id: str, ws: str, now: float) -> str:
     return f"Взята в работу {ts}, воркер {worker_id}, воркспейс {ws}."
 
 
-def _has_claim_started_comment(ref: str, worker_id: str, ws: str) -> bool:
+def _has_claim_started_comment(ref: str, worker_id: str, ws: str, baseline: int) -> bool:
     marker = f"[{model.MARKER_CLAIM_STARTED}]"
-    for comment in ops.show_card(ref)["comments"]:
+    for comment in ops.show_card(ref)["comments"][baseline:]:
         text = comment.get("text", "")
         if marker in text and f"воркер {worker_id}" in text and f"воркспейс {ws}" in text:
             return True
     return False
 
 
-def _try_claim_started_comment(ref: str, rec: dict, *, advance_baseline: bool) -> bool:
+def _try_claim_started_comment(ref: str, rec: dict) -> bool:
     if rec.get("claim_started_comment"):
         return False
     worker_id = rec.get("worker") or ""
     ws = rec.get("workspace") or ""
     if not worker_id or not ws:
         return False
+    baseline = int(rec.get("comment_baseline", 0))
     try:
-        if _has_claim_started_comment(ref, worker_id, ws):
+        if _has_claim_started_comment(ref, worker_id, ws, baseline):
             rec["claim_started_comment"] = True
             return True
         ops.add_comment(
@@ -640,8 +641,6 @@ def _try_claim_started_comment(ref: str, rec: dict, *, advance_baseline: bool) -
             _claim_started_comment_body(worker_id, ws, float(rec.get("claimed_at") or time.time())),
             marker=model.MARKER_CLAIM_STARTED)
         rec["claim_started_comment"] = True
-        if advance_baseline:
-            rec["comment_baseline"] = int(rec.get("comment_baseline", 0)) + 1
         return True
     except Exception as e:  # noqa: BLE001, marker retry must not lose a live worker record
         STATE.log_run("bringup", reference=ref, result="claim-comment-failed", level="warn",
@@ -713,7 +712,7 @@ def _bring_up(card: dict, worker_id: str, records: dict, head: str) -> None:
         "claim_started_comment": False,
     }
     _save_cards(records)
-    if _try_claim_started_comment(ref, records[ref], advance_baseline=True):
+    if _try_claim_started_comment(ref, records[ref]):
         _save_cards(records)
     STATE.log_run("bringup", reference=ref, to="In progress", workspace=ws, head=head)
 
