@@ -750,6 +750,42 @@ class TerminalLiveTest(unittest.TestCase):
                 status = worker.terminal_status("term-tui", "/ws/fresh", "codex-tui")
             self.assertEqual(status["last_activity"], 1234.5)
 
+    def test_codex_tui_activity_recovers_not_codex_tui_preview(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sessions = Path(tmp) / "sessions" / "2026" / "07" / "10"
+            sessions.mkdir(parents=True)
+            path = sessions / "rollout-live.jsonl"
+            path.write_text(json.dumps({
+                "type": "session_meta",
+                "payload": {"cwd": "/ws/fresh", "session_id": "live"},
+            }) + "\n", encoding="utf-8")
+            os.utime(path, (1234.5, 1234.5))
+
+            def fake_orca_json(args):
+                if args[:2] == ["terminal", "list"]:
+                    return {"terminals": [{
+                        "handle": "term-tui",
+                        "connected": True,
+                        "writable": True,
+                        "preview": "thinking",
+                        "lastOutputAt": 1000,
+                    }]}
+                if args[:2] == ["terminal", "read"]:
+                    return {"terminal": {"tail": ["thinking"]}}
+                return {}
+
+            with mock.patch.object(worker, "CODEX_SESSIONS", Path(tmp) / "sessions"), \
+                    mock.patch.object(worker, "_orca_json", fake_orca_json):
+                status = worker.terminal_status("term-tui", "/ws/fresh", "codex-tui")
+                live = worker.terminal_live("term-tui", "/ws/fresh", "codex-tui")
+            self.assertEqual(status, {
+                "known": True,
+                "live": True,
+                "reason": "live",
+                "last_activity": 1234.5,
+            })
+            self.assertTrue(live)
+
     def test_codex_tui_session_mtime_does_not_revive_dead_handle(self):
         with tempfile.TemporaryDirectory() as tmp:
             sessions = Path(tmp) / "sessions"

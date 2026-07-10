@@ -437,23 +437,20 @@ def terminal_status(handle: str, workspace: str | None = None,
         orca_json=_orca_json,
         unavailable_errors=(WorkspaceError, subprocess.TimeoutExpired),
     )
-    if status.get("live") and expected_kind == "codex-tui" and workspace:
+    if expected_kind == "codex-tui" and workspace:
         activity = _codex_tui_session_activity(workspace)
-        if activity and activity > (status.get("last_activity") or 0):
-            status = {**status, "last_activity": activity}
+        if activity:
+            if status.get("live") and activity > (status.get("last_activity") or 0):
+                status = {**status, "last_activity": activity}
+            elif status.get("known") and status.get("reason") == "not-codex-tui":
+                status = {"known": True, "live": True, "reason": "live", "last_activity": activity}
     return status
 
 
 def terminal_live(handle: str, workspace: str | None = None,
                   expected_kind: str | None = None) -> bool:
     """Whether `handle` is a live Orca terminal, optionally scoped to `workspace`."""
-    return terminal_session.terminal_live(
-        handle,
-        workspace,
-        expected_kind,
-        orca_json=_orca_json,
-        unavailable_errors=(WorkspaceError, subprocess.TimeoutExpired),
-    )
+    return bool(terminal_status(handle, workspace, expected_kind).get("live"))
 
 
 def _terminal_belongs_to_workspace(term: dict, workspace: str) -> bool:
@@ -485,7 +482,8 @@ def _codex_tui_session_activity(workspace: str) -> float | None:
 
     Codex TUI paints in an alternate screen, so Orca's terminal lastOutputAt can stay stale while
     the head is reasoning and writing rollout JSONL. The session file is only used as an activity
-    supplement after the tracked terminal handle has already been proven live and Codex-shaped.
+    supplement after the tracked terminal handle has been found, scoped to this workspace, and not
+    rejected as a dead shell or missing terminal.
     """
     sessions = CODEX_SESSIONS
     if not sessions.is_dir():
