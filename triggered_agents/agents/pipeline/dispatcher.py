@@ -61,6 +61,7 @@ WORKER_CAP = int(os.environ.get("TA_WORKER_CAP", "3"))
 # _bring_up's own smoke-fail path, still a straight Blocked, no retry.
 RETRY_SAME_BUDGET = int(os.environ.get("TA_RETRY_SAME_BUDGET", "1"))
 RETRY_SWITCH_BUDGET = int(os.environ.get("TA_RETRY_SWITCH_BUDGET", "1"))
+UNPARK_FAILURE_CAP = int(os.environ.get("TA_UNPARK_FAILURE_CAP", "3"))
 _LOG_TAIL_LINES = 40
 WATCHDOG_TRIGGER_SILENCE = "silence-timeout"
 WATCHDOG_TRIGGER_DEAD_HANDLE = "dead-terminal-handle"
@@ -380,12 +381,9 @@ def _advance(records: dict, statuses: dict[str, str]) -> bool:
             records.pop(ref)
             changed = True
             continue
-        if rec.get("parked_worker"):
-            changed = True
-            _unpark_worker_for_tick(ref, card, rec)
-            if rec.get("parked_worker"):
-                continue
-        worker.rename_terminal(rec.get("handle", ""), rec.get("title", ""))
+        was_parked = bool(rec.get("parked_worker"))
+        if not was_parked:
+            worker.rename_terminal(rec.get("handle", ""), rec.get("title", ""))
         verdict = _report_verdict(ref, int(rec.get("comment_baseline", 0)))
         if verdict == "done":
             ops.move_card("dispatcher", ref, "Validate")
@@ -406,6 +404,12 @@ def _advance(records: dict, statuses: dict[str, str]) -> bool:
             records.pop(ref)
             changed = True
         else:
+            if was_parked:
+                changed = True
+                _unpark_worker_for_tick(ref, card, rec, records)
+                if rec.get("parked_worker") or ref not in records:
+                    continue
+                worker.rename_terminal(rec.get("handle", ""), rec.get("title", ""))
             handle = rec.get("handle", "")
             current_head = _current_head(card, rec)
             status = worker.terminal_status(handle, rec.get("workspace"), rec.get("terminal_kind"))
@@ -605,7 +609,7 @@ def _refresh_worker_task(card: dict, rec: dict) -> None:
     worker.write_task(workspace, _task_md(card, ops.show_card(card["reference"]), base))
 
 
-def _unpark_worker_for_tick(ref: str, card: dict, rec: dict) -> bool:
+def _unpark_worker_for_tick(ref: str, card: dict, rec: dict, records: dict) -> bool:
     """Bring back a worker that hard resume left parked."""
     if not rec.get("parked_worker"):
         return False
@@ -615,11 +619,26 @@ def _unpark_worker_for_tick(ref: str, card: dict, rec: dict) -> bool:
                                              rec["worker"], rec.get("title", ref))
         rec["terminal_kind"] = worker.terminal_kind(rec.get("head"))
     except Exception as e:  # noqa: BLE001, one stuck unpark must not crash the whole tick
+        fails = int(rec.get("unpark_fails") or 0) + 1
+        rec["unpark_fails"] = fails
+        scrubbed = worker.scrub_secrets(str(e))
+        if fails >= UNPARK_FAILURE_CAP:
+            ws = rec.get("workspace") or "(неизвестен)"
+            ops.add_comment(
+                "dispatcher", ref,
+                f"Не удалось вернуть worker после hard resume {fails} раз подряд: {scrubbed}. "
+                f"Карточка в Blocked до vladmesh, воркспейс {ws} оставлен для разбора.")
+            ops.move_card("dispatcher", ref, "Blocked")
+            records.pop(ref, None)
+            STATE.log_run("unpark-worker", reference=ref, to="Blocked", reason="unpark-failed",
+                          fails=fails, error=scrubbed)
+            return False
         STATE.log_run("unpark-worker", reference=ref, result="failed", level="warn",
-                      error=worker.scrub_secrets(str(e)))
+                      fails=fails, error=scrubbed)
         return False
     rec["last_activity"] = time.time()
     rec.pop("parked_worker", None)
+    rec.pop("unpark_fails", None)
     STATE.log_run("unpark-worker", reference=ref, result="unparked",
                   workspace=rec.get("workspace"))
     return True
@@ -780,12 +799,14 @@ def pause(requested_mode: str, *, reason: str = pause_flag.DEFAULT_REASON,
     by hand. `soft` stops new worker claims and steward/curator/retro dispatch (runtime/dispatch.py
     checks the same flag), but every card already In progress or in Validate keeps riding its
     normal cycle untouched — advance, CI/stand, layer-3 review, automerge, all of it. `hard` also
-    stops every live worker/reviewer terminal right now (worker.stop_terminals only — it never
-    removes a worktree, so the branch/uncommitted work stays exactly as the head left it) and
-    freezes the whole tick (see tick()): nothing advances, nothing is claimed, no watchdog can fire
-    on a head that was stopped on purpose, not one that died. resume() parks workers for lazy
-    unpark, relaunches reviewers, and gives every affected watchdog a fresh window, so the paused
-    stretch never reads as silence once ticking resumes.
+    excludes In-progress worker terminals from host stop because Orca has no lossless park API;
+    stopping them would turn resume into a restart wave. Validate workers and reviewers are still
+    stopped with worker.stop_terminals only — it never removes a worktree, so the
+    branch/uncommitted work stays exactly as the head left it — and the whole dispatcher tick
+    freezes (see tick()): nothing advances, nothing is claimed, no watchdog can fire on a head that
+    was stopped on purpose, not one that died. resume() parks stopped workers for lazy unpark,
+    relaunches reviewers, and gives every affected watchdog a fresh window, so the paused stretch
+    never reads as silence once ticking resumes.
 
     Idempotent: pausing again in the same mode is a no-op (still logged, so repeated calls are
     visible in runs.jsonl). Pausing in the other mode while already paused is a GuardError — resume
@@ -814,6 +835,7 @@ def pause(requested_mode: str, *, reason: str = pause_flag.DEFAULT_REASON,
                 f"{requested_mode!r}")
         stopped_worker: list[str] = []
         stopped_reviewer: list[str] = []
+        excluded_worker: list[str] = []
         if mode == "hard":
             records = _load_cards()
             by_ref = {c["reference"]: c for c in ops.list_cards()}
@@ -821,17 +843,21 @@ def pause(requested_mode: str, *, reason: str = pause_flag.DEFAULT_REASON,
                 card = by_ref.get(ref)
                 if card is None:
                     continue
-                if card["column"] in (model.IN_PROGRESS, "Validate") and rec.get("workspace"):
+                if card["column"] == model.IN_PROGRESS and rec.get("workspace"):
+                    excluded_worker.append(ref)
+                elif card["column"] == "Validate" and rec.get("workspace"):
                     worker.stop_terminals(rec["workspace"])
                     stopped_worker.append(ref)
                 if card["column"] == "Validate" and rec.get("review_ws"):
                     worker.stop_terminals(rec["review_ws"])
                     stopped_reviewer.append(ref)
         pause_flag.save(mode, stopped_worker=stopped_worker,
-                        stopped_reviewer=stopped_reviewer, reason=reason, actor=actor)
+                        stopped_reviewer=stopped_reviewer, excluded_worker=excluded_worker,
+                        reason=reason, actor=actor)
         STATE.log_run("pause", mode=mode, display_mode=pause_flag.display_mode(mode),
                       action="paused", actor=actor, reason=worker.scrub_secrets(reason),
-                      stopped_worker=len(stopped_worker), stopped_reviewer=len(stopped_reviewer))
+                      stopped_worker=len(stopped_worker), stopped_reviewer=len(stopped_reviewer),
+                      excluded_worker=len(excluded_worker))
         return pause_flag.status()
 
 
@@ -862,7 +888,16 @@ def resume() -> dict:
             by_ref = {c["reference"]: c for c in ops.list_cards()}
             relaunched: list[str] = []
             parked: list[str] = []
+            excluded: list[str] = []
             skipped: list[str] = []
+            for ref in state.get("excluded_worker") or []:
+                rec = records.get(ref)
+                card = by_ref.get(ref)
+                if rec is None or card is None or card["column"] != model.IN_PROGRESS:
+                    skipped.append(f"{ref}:worker")
+                    continue
+                rec["last_activity"] = time.time()
+                excluded.append(f"{ref}:worker")
             for ref in state.get("stopped_worker") or []:
                 rec = records.get(ref)
                 card = by_ref.get(ref)
@@ -916,7 +951,7 @@ def resume() -> dict:
                 relaunched.append(f"{ref}:reviewer")
             _save_cards(records)
             STATE.log_run("resume", mode="hard", relaunched=relaunched, parked=parked,
-                          skipped=skipped)
+                          excluded=excluded, skipped=skipped)
         else:
             STATE.log_run("resume", mode="soft")
         pause_flag.clear()

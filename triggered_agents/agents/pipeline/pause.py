@@ -4,10 +4,12 @@ Absent (no file) = running. Present = paused, with internal `mode` stored as `"s
 plus the public reason/actor and the refs stopped by a hard pause. The two `stopped_*` lists are
 only ever populated by a hard pause (dispatcher.pause) and name exactly the cards whose live
 terminal it stopped, so dispatcher.resume() knows what to park or relaunch without re-deriving it
-from cards.json. A card's column/record shape alone can't tell "a terminal was actually running
-here when pause hit" from "this Validate card just hasn't spawned a reviewer yet". A single
-Validate card can appear in both lists at once: its original worker terminal is parked for CI
-rework, and its live layer-3 reviewer is relaunched to finish the review.
+from cards.json. `excluded_worker` names In-progress workers deliberately left running because
+there is no lossless Orca park API: stopping them would create the restart collateral hard resume
+is supposed to avoid. A card's column/record shape alone can't tell "a terminal was actually
+running here when pause hit" from "this Validate card just hasn't spawned a reviewer yet". A
+single Validate card can appear in both stopped lists at once: its original worker terminal is
+parked for CI rework, and its live layer-3 reviewer is relaunched to finish the review.
 
 Automation-owned hard pauses are not allowed to freeze the queue forever. A hard pause whose
 actor is in HARD_PAUSE_AUTO_RESUME_ACTORS auto-resumes after
@@ -104,14 +106,17 @@ def shadow_pause_files() -> list[str]:
     return out
 
 
-def _on_resume(mode: str | None, stopped_worker: list[str], stopped_reviewer: list[str]) -> str:
+def _on_resume(mode: str | None, stopped_worker: list[str], stopped_reviewer: list[str],
+               excluded_worker: list[str] | None = None) -> str:
     if mode == "hard":
         workers = len(stopped_worker)
         reviewers = len(stopped_reviewer)
+        excluded = len(excluded_worker or [])
         return (
             f"resume clears freeze, parks {workers} stopped worker head(s), relaunches "
             f"{reviewers} stopped reviewer head(s) in existing workspaces, and resets watchdog "
-            "clocks; workers unpark lazily on the next tick that needs them"
+            f"clocks; {excluded} In-progress worker head(s) were excluded from stop and keep "
+            "their existing terminal"
         )
     if mode == "soft":
         return (
@@ -192,8 +197,8 @@ def load() -> dict:
 
 
 def save(mode: str, stopped_worker: list[str] | None = None,
-        stopped_reviewer: list[str] | None = None, reason: str = DEFAULT_REASON,
-        actor: str = DEFAULT_ACTOR) -> None:
+        stopped_reviewer: list[str] | None = None, excluded_worker: list[str] | None = None,
+        reason: str = DEFAULT_REASON, actor: str = DEFAULT_ACTOR) -> None:
     STATE.ensure_dir()
     state = {
         "mode": mode,
@@ -202,6 +207,7 @@ def save(mode: str, stopped_worker: list[str] | None = None,
         "actor": actor,
         "stopped_worker": stopped_worker or [],
         "stopped_reviewer": stopped_reviewer or [],
+        "excluded_worker": excluded_worker or [],
     }
     tmp = PAUSE_FILE.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -235,6 +241,7 @@ def status() -> dict:
         return {"paused": False, **base}
     stopped_worker = state.get("stopped_worker") or []
     stopped_reviewer = state.get("stopped_reviewer") or []
+    excluded_worker = state.get("excluded_worker") or []
     mode = state.get("mode")
     return {
         "paused": True,
@@ -245,7 +252,8 @@ def status() -> dict:
         "actor": state.get("actor") or "",
         "stopped_worker": stopped_worker,
         "stopped_reviewer": stopped_reviewer,
-        "on_resume": _on_resume(mode, stopped_worker, stopped_reviewer),
+        "excluded_worker": excluded_worker,
+        "on_resume": _on_resume(mode, stopped_worker, stopped_reviewer, excluded_worker),
         "auto_resume": hard_pause_auto_resume_status(state),
         **base,
     }
