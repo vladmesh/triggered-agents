@@ -3,17 +3,17 @@
 Absent (no file) = running. Present = paused, with internal `mode` stored as `"soft"` or `"hard"`,
 plus the public reason/actor and the refs stopped by a hard pause. The two `stopped_*` lists are
 only ever populated by a hard pause (dispatcher.pause) and name exactly the cards whose live
-terminal it stopped, so dispatcher.resume() knows precisely what to relaunch without re-deriving
-it from cards.json. A card's column/record shape alone can't tell "a terminal was actually
-running here when pause hit" from "this Validate card just hasn't spawned a reviewer yet". A
-single Validate card can appear in both lists at once (its original worker terminal parked for CI
-rework, and a live layer-3 reviewer), each is stopped and relaunched independently.
+terminal it stopped, so dispatcher.resume() knows what to park or relaunch without re-deriving it
+from cards.json. A card's column/record shape alone can't tell "a terminal was actually running
+here when pause hit" from "this Validate card just hasn't spawned a reviewer yet". A single
+Validate card can appear in both lists at once: its original worker terminal is parked for CI
+rework, and its live layer-3 reviewer is relaunched to finish the review.
 
 Automation-owned hard pauses are not allowed to freeze the queue forever. A hard pause whose
 actor is in HARD_PAUSE_AUTO_RESUME_ACTORS auto-resumes after
 HARD_PAUSE_AUTO_RESUME_TTL_SECONDS, default 45 minutes, through dispatcher.resume(), so stopped
-heads relaunch on the same path as a manual resume. Human or unknown actors are treated as manual
-maintenance windows and never auto-resume.
+heads follow the same park/relaunch path as a manual resume. Human or unknown actors are treated
+as manual maintenance windows and never auto-resume.
 
 Read from two places outside dispatcher.py itself: runtime/dispatch.py (steward/curator/retro
 dispatch) and cli.py (pause-status) — both only ever call is_paused()/load()/status(), never
@@ -106,11 +106,12 @@ def shadow_pause_files() -> list[str]:
 
 def _on_resume(mode: str | None, stopped_worker: list[str], stopped_reviewer: list[str]) -> str:
     if mode == "hard":
-        stopped = len(stopped_worker) + len(stopped_reviewer)
+        workers = len(stopped_worker)
+        reviewers = len(stopped_reviewer)
         return (
-            f"resume clears freeze, relaunches {stopped} stopped worker/reviewer head(s) in "
-            "their existing workspaces, and resets watchdog clocks; Validate workers stay parked "
-            "until rework is needed"
+            f"resume clears freeze, parks {workers} stopped worker head(s), relaunches "
+            f"{reviewers} stopped reviewer head(s) in existing workspaces, and resets watchdog "
+            "clocks; workers unpark lazily on the next tick that needs them"
         )
     if mode == "soft":
         return (
@@ -141,7 +142,8 @@ def hard_pause_auto_resume_status(state: dict, *, now: datetime | None = None) -
     Only automation-owned freeze pauses auto-resume. Human or unknown actors may hold a freeze for
     as long as needed, so a long maintenance window does not get lifted without the person who set
     it noticing. The dispatcher calls this from precheck and tick before the ordinary hard-paused
-    skip, then uses its normal resume() path to relaunch stopped heads and reset watchdog clocks.
+    skip, then uses its normal resume() path to park workers, relaunch reviewers and reset
+    watchdog clocks.
     """
     ttl = max(0, int(HARD_PAUSE_AUTO_RESUME_TTL_SECONDS))
     out = {

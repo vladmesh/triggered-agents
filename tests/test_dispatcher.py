@@ -1407,6 +1407,22 @@ class TaskMdHistoryTest(_DispatcherBase):
         self.assertIn(f"[{model.MARKER_REVIEW_RED}]", content)
         self.assertIn("1970-01-01", content)  # rendered date, not the raw unix int
 
+    def test_operator_context_highlights_recent_po_and_secretary_comments(self):
+        ref = self._ready_card("A")
+        self._seed_comment(ref, "[worker]\nшум от воркера", 100)
+        self._seed_comment(ref, "[po]\nне запускай backup create повторно", 200)
+        self._seed_comment(ref, "[secretary]\nпункт acceptance про флаг отменён", 300)
+        dispatcher.tick()
+        (_, content), = self.worker.tasks_written
+        self.assertIn("## Операторский контекст", content)
+        operator_pos = content.index("## Операторский контекст")
+        history_pos = content.index("## История")
+        self.assertLess(operator_pos, history_pos)
+        block = content[operator_pos:history_pos]
+        self.assertIn("не запускай backup create повторно", block)
+        self.assertIn("пункт acceptance про флаг отменён", block)
+        self.assertNotIn("шум от воркера", block)
+
 
 class WorkspaceNamingTest(_DispatcherBase):
     """Slug -> workspace name, fallback for cards without one, collision suffix, human-readable
@@ -3224,8 +3240,8 @@ class AutomergeTest(_DispatcherBase):
 class PipelinePauseTest(_DispatcherBase):
     """triggered-agents-281: the pause/resume API. Soft only turns off new claims — everything
     already claimed rides its normal cycle. Hard also stops every live worker/reviewer terminal and
-    freezes the whole tick, so resume() has to relaunch each stopped head and reset its watchdog
-    clock, never letting the paused stretch itself read as silence."""
+    freezes the whole tick, so resume() parks workers, relaunches reviewers and resets watchdog
+    clocks, never letting the paused stretch itself read as silence."""
 
     PR = "https://github.com/vladmesh/personal_site/pull/9"
 
@@ -3343,13 +3359,17 @@ class PipelinePauseTest(_DispatcherBase):
         runs = [r for r in self._runs() if r["event"] == "pause-flag"]
         self.assertTrue(runs and runs[-1]["result"] == "corrupt" and runs[-1]["level"] == "warn")
 
-    def test_resume_relaunch_failure_is_localized_not_a_crash(self):
+    def test_unpark_failure_is_localized_not_a_crash(self):
         ref = self._claim_one(head="claude-opus")
         self._pause("hard")
+        dispatcher.resume()
         with mock.patch.object(worker, "launch_worker", side_effect=RuntimeError("orca timeout")):
-            result = dispatcher.resume()   # must not raise despite the relaunch failing
-        self._assert_not_paused(result)   # still cleared, not stuck paused forever
-        runs = [r for r in self._runs() if r["event"] == "resume" and r.get("result") == "relaunch-failed"]
+            dispatcher.tick()   # must not raise despite the unpark failing
+        self._assert_not_paused(dispatcher.pause_status())   # still cleared, not stuck paused forever
+        self.assertEqual(self._column(ref), model.IN_PROGRESS)
+        self.assertTrue(dispatcher._load_cards()[ref].get("parked_worker"))
+        runs = [r for r in self._runs()
+                if r["event"] == "unpark-worker" and r.get("result") == "failed"]
         self.assertTrue(any(r.get("reference") == ref for r in runs))
 
     # --- soft: claims off, everything claimed rides its cycle -------------------------------
@@ -3432,11 +3452,10 @@ class PipelinePauseTest(_DispatcherBase):
 
         self.assertEqual(rc, 0)
         self._assert_not_paused(dispatcher.pause_status())
-        self.assertEqual(len(self.worker.launched), 1)
-        self.assertEqual(self.worker.launched[0]["ws"], rec_before["workspace"])
-        self.assertEqual(self.worker.launched[0]["worker"], rec_before["worker"])
         rec_after = dispatcher._load_cards()[ref]
         self.assertGreaterEqual(rec_after["last_activity"], rec_before["last_activity"])
+        self.assertTrue(rec_after.get("parked_worker"))
+        self.assertEqual(self.worker.launched, [])
         ttl_runs = [r for r in self._runs() if r["event"] == "pause-ttl"]
         self.assertTrue(any(r.get("result") == "auto-resume"
                             and r.get("actor") == "secretary-backup" for r in ttl_runs))
@@ -3487,18 +3506,31 @@ class PipelinePauseTest(_DispatcherBase):
         rc = dispatcher.precheck()
         self.assertEqual(rc, PRECHECK_SKIP)
 
-    # --- hard resume: relaunch + fresh watchdog clock ----------------------------------------
-    def test_hard_resume_relaunches_the_worker_in_the_same_workspace(self):
+    # --- hard resume: park + lazy unpark ------------------------------------------------------
+    def test_hard_resume_parks_worker_then_tick_unparks_in_the_same_workspace(self):
         ref = self._claim_one(head="claude-opus")
         rec_before = dispatcher._load_cards()[ref]
         ws, head, worker_id = rec_before["workspace"], rec_before["head"], rec_before["worker"]
         self._pause("hard")
         self.worker.launched.clear()
         dispatcher.resume()
+        self.assertEqual(self.worker.launched, [])
+        rec_parked = dispatcher._load_cards()[ref]
+        self.assertEqual(rec_parked["handle"], "")
+        self.assertTrue(rec_parked.get("parked_worker"))
+        runs = [r for r in self._runs() if r["event"] == "resume"]
+        self.assertIn(f"{ref}:worker", runs[-1]["parked"])
+        dispatcher.tick()
         self.assertEqual(len(self.worker.launched), 1)
         self.assertEqual(self.worker.launched[0]["ws"], ws)
         self.assertEqual(self.worker.launched[0]["head"], head)
         self.assertEqual(self.worker.launched[0]["worker"], worker_id)
+        rec_unparked = dispatcher._load_cards()[ref]
+        self.assertFalse(rec_unparked.get("parked_worker"))
+        self.assertNotEqual(rec_unparked["handle"], "")
+        runs = [r for r in self._runs() if r["event"] == "unpark-worker"]
+        self.assertTrue(any(r.get("reference") == ref and r.get("result") == "unparked"
+                            for r in runs))
         self._assert_not_paused(dispatcher.pause_status())
 
     def test_hard_resume_gives_the_worker_watchdog_a_fresh_window(self):
