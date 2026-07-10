@@ -699,7 +699,7 @@ def _review_gate(ref: str, pr: str | None, card: dict, records: dict, view: dict
         STATE.log_run("review", reference=ref, result="untracked", level="warn", pr=pr)
         return False
     if "review_baseline" not in rec:
-        return _spawn_reviewer(ref, pr, card, rec, records, save_cards, contrib)
+        return _spawn_reviewer(ref, pr, card, rec, records, save_cards, statuses, contrib)
     verdict = _review_verdict(view, int(rec["review_baseline"]))
     if verdict is None:
         return _review_watchdog(ref, rec, records, watchdog_seconds, statuses)
@@ -709,15 +709,24 @@ def _review_gate(ref: str, pr: str | None, card: dict, records: dict, view: dict
 
 
 def _spawn_reviewer(ref: str, pr: str | None, card: dict, rec: dict, records: dict, save_cards,
-                    contrib: tuple[str, str] | None = None) -> bool:
+                    statuses: dict[str, str], contrib: tuple[str, str] | None = None) -> bool:
     """Bring up the reviewer head for the current code state. On an orca failure, nothing is posted
     and the baseline stays unset, so the spawn is retried next tick (a transient, not a verdict).
     The record is saved as soon as the head is up (like dispatcher._bring_up), so a crash before
-    the end-of-tick save can't lose the baseline and spawn a second reviewer on the next tick."""
+    the end-of-tick save can't lose the baseline and spawn a second reviewer on the next tick.
+
+    The head is resolved through health.resolve_head against this tick's `statuses`, same as
+    _claim_next does for workers (2026-07-10, secretary-355: a codex-reviewer spawned on a red
+    openai-sub died at the shell prompt within a minute and the dead-handle watchdog blocked the
+    card — twice). Whole chain red -> no spawn this tick, the card waits in Validate."""
     project = card.get("project") or ""
     spec = ops.show_card(ref).get("description", "")
     review_title = naming.reviewer_title(naming.card_id(ref), card.get("title") or ref)
-    review_head = _card_review_head(card)
+    preferred = _card_review_head(card)
+    review_head = health.resolve_head(preferred, statuses)
+    if review_head is None:
+        STATE.log_run("review", reference=ref, result="skip-red", pr=pr, review_head=preferred)
+        return False
     label = pr if pr else f"ветке `{contrib[0]}` @ `{contrib[1]}`"
     note = f"PR: {pr}" if pr else f"Ветка: `{contrib[0]}` @ `{contrib[1]}`"
     try:
@@ -787,6 +796,17 @@ def _review_watchdog(ref: str, rec: dict, records: dict, watchdog_seconds: int,
     status = worker.terminal_status(rec.get("review_handle", ""), ws,
                                     rec.get("review_terminal_kind"))
     if status.get("known") and not status.get("live"):
+        dead_head = rec.get("review_head") or worker.REVIEWER_HEAD
+        dead_resource = health.resource_of(dead_head)
+        if dead_resource and statuses.get(dead_resource) == health.RED:
+            # The head died while its own resource is red (a usage limit kills the CLI right at
+            # startup) — that's the resource's outage, not a reviewer verdict and not a case for a
+            # human. Drop the reviewer bookkeeping so the next tick respawns through
+            # _spawn_reviewer's health-aware resolve (fallback head, or wait for green).
+            clear_review(rec)
+            STATE.log_run("review", reference=ref, result="dead-on-red", review_head=dead_head,
+                          handle_status=status.get("reason") or "dead")
+            return True
         elapsed = time.time() - rec.get("review_activity", time.time())
         return _review_watchdog_block(
             ref, rec, records, ws, elapsed, watchdog_seconds,

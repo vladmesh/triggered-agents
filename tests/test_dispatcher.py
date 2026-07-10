@@ -2550,6 +2550,60 @@ class ValidateReviewTest(_DispatcherBase):
                             and r.get("handle_status") == "missing-terminal"
                             for r in self._runs()))
 
+    def test_spawn_resolves_reviewer_head_via_fallback_when_resource_red(self):
+        # secretary-355 (2026-07-10): the reviewer spawn must walk the same health fallback as the
+        # worker claim — a red openai-sub sends codex-reviewer's card to its claude-opus fallback
+        # instead of spawning a head that dies at the shell prompt on the usage limit.
+        ref = self._to_validate()
+        self.statuses["openai-sub"] = "red"
+        self._ci_green()
+        dispatcher.tick()
+        self.assertEqual(self.worker.reviewer_heads, ["claude-opus"])
+        self.assertEqual(dispatcher._load_cards()[ref]["review_head"], "claude-opus")
+        self.assertEqual(self._column(ref), "Validate")
+
+    def test_spawn_waits_when_reviewer_chain_all_red(self):
+        ref = self._to_validate()
+        self.statuses["openai-sub"] = "red"
+        self.statuses["claude-sub"] = "red"
+        self._ci_green()
+        dispatcher.tick()
+        self.assertEqual(self.worker.reviewer_spawns, [])
+        self.assertNotIn("review_baseline", dispatcher._load_cards()[ref])
+        self.assertEqual(self._column(ref), "Validate")
+        self.assertTrue(any(r["event"] == "review" and r.get("result") == "skip-red"
+                            for r in self._runs()))
+        self.statuses["claude-sub"] = "green"
+        dispatcher.tick()                                 # a resource recovered -> spawn resumes
+        self.assertEqual(self.worker.reviewer_heads, ["claude-opus"])
+
+    def test_dead_reviewer_handle_on_red_resource_respawns_not_blocks(self):
+        # secretary-355 (2026-07-10), second half: a reviewer whose terminal died while its own
+        # resource is red is the resource's outage, not a case for a human — clear the review
+        # bookkeeping and let the next tick respawn through the health-aware path.
+        ref = self._spawned()
+        rec = dispatcher._load_cards()[ref]
+        self.worker.dead_handles.add(rec["review_handle"])
+        self.statuses["openai-sub"] = "red"
+        dispatcher.tick()
+        self.assertEqual(self._column(ref), "Validate")          # not Blocked
+        self.assertEqual(len(self._rev_ws_torndown()), 1)        # dead reviewer's worktree cleaned
+        self.assertNotIn("review_baseline", dispatcher._load_cards()[ref])
+        self.assertTrue(any(r["event"] == "review" and r.get("result") == "dead-on-red"
+                            for r in self._runs()))
+        dispatcher.tick()                                        # respawn lands on the fallback
+        self.assertEqual(self.worker.reviewer_heads[-1], "claude-opus")
+        self.assertEqual(self._column(ref), "Validate")
+
+    def test_dead_reviewer_handle_on_green_resource_still_blocks(self):
+        ref = self._spawned()
+        rec = dispatcher._load_cards()[ref]
+        self.worker.dead_handles.add(rec["review_handle"])
+        dispatcher.tick()
+        self.assertEqual(self._column(ref), "Blocked")
+        self.assertTrue(any(r.get("trigger") == validate.REVIEW_WATCHDOG_TRIGGER_DEAD_HANDLE
+                            for r in self._runs()))
+
     def test_review_watchdog_frozen_while_reviewer_resource_is_red(self):
         # triggered-agents-241: the reviewer head has its own resource; a subscription-limit red
         # must freeze this clock too, not just dispatcher._advance's worker-side one (#31).
