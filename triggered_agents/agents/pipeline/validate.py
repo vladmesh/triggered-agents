@@ -49,7 +49,7 @@ import re
 import time
 from collections.abc import Callable
 
-from . import health, model, naming, ops, reviewer, worker
+from . import health, model, naming, ops, review_spawn, reviewer, worker
 from .state import STATE
 
 RefreshWorkerTask = Callable[[dict, dict], None]
@@ -734,10 +734,13 @@ def _spawn_reviewer(ref: str, pr: str | None, card: dict, rec: dict, records: di
         review_md = reviewer.build_task(card, ref, pr, spec, base,
                                         branch=contrib[0] if contrib else None,
                                         head_sha=contrib[1] if contrib else None)
-        ws, handle = worker.spawn_reviewer(project, _review_id(card), base, review_md, review_title,
-                                           naming.worker_branch(ref), naming.reviewer_branch(ref),
-                                           head_sha=contrib[1] if contrib else None,
-                                           review_head=review_head)
+        ws, handle = worker.spawn_reviewer(
+            project, _review_id(card), base, review_md, review_title,
+            naming.worker_branch(ref), naming.reviewer_branch(ref),
+            head_sha=contrib[1] if contrib else None, review_head=review_head)
+    except worker.InjectDeliveryError as e:
+        return review_spawn.block_inject_delivery(ref, clear_review, rec, records, pr,
+                                                  review_head, note, e)
     except worker.WorkspaceError as e:
         # spawn_reviewer already tore down any half-created worktree. Retry a few ticks (transient
         # orca), then escalate to Blocked — a persistent failure must not retry forever with no
@@ -775,7 +778,6 @@ def _spawn_reviewer(ref: str, pr: str | None, card: dict, rec: dict, records: di
     STATE.log_run("review", reference=ref, result="spawned", workspace=ws, pr=pr,
                   review_head=review_head)
     return True
-
 
 def _review_watchdog(ref: str, rec: dict, records: dict, watchdog_seconds: int,
                      statuses: dict[str, str]) -> bool:
