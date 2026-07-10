@@ -475,6 +475,22 @@ class DispatcherTest(_DispatcherBase):
         self.assertEqual(len(markers), 2)
         self.assertEqual(self._column(ref), model.IN_PROGRESS)
 
+    def test_reconcile_without_handle_does_not_post_claim_comment(self):
+        ref = self._ready_card("A")
+        ops.claim_card(ref, "1-a")
+
+        dispatcher.tick()
+
+        tid = next(t["id"] for t in self.board.tasks.values() if t["reference"] == ref)
+        markers = [c["comment"] for c in self.board.comments.get(tid, [])
+                   if f"[{model.MARKER_CLAIM_STARTED}]" in c["comment"]]
+        retries = [c["comment"] for c in self.board.comments.get(tid, [])
+                   if f"[{model.MARKER_WATCHDOG_RETRY}]" in c["comment"]]
+        self.assertEqual(len(markers), 1)
+        self.assertEqual(len(retries), 1)
+        self.assertEqual(len(self.worker.launched), 1)
+        self.assertEqual(self._column(ref), model.IN_PROGRESS)
+
     def test_fast_report_between_launch_and_claim_comment_is_not_hidden(self):
         ref = self._ready_card("A")
         original_save = dispatcher._save_cards

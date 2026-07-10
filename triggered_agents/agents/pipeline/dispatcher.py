@@ -629,7 +629,7 @@ def _try_claim_started_comment(ref: str, rec: dict) -> bool:
         return False
     worker_id = rec.get("worker") or ""
     ws = rec.get("workspace") or ""
-    if not worker_id or not ws:
+    if not worker_id or not ws or not rec.get("handle"):
         return False
     baseline = int(rec.get("comment_baseline", 0))
     try:
