@@ -3735,6 +3735,13 @@ class WorkerHostCallsTest(unittest.TestCase):
         self.worker = worker
         self.calls = []
         self.git_calls = []
+        # Ассерты exec-дефолта не должны зависеть от env хоста: smoke гоняет юниты
+        # в окружении диспетчера, где прод-флаг TA_CODEX_MODE=tui может быть включён.
+        env_guard = mock.patch.dict("os.environ")
+        env_guard.start()
+        self.addCleanup(env_guard.stop)
+        os.environ.pop("TA_CODEX_MODE", None)
+        os.environ.pop("TA_CODEX_TUI", None)
 
         def fake_orca_json(args):
             self.calls.append(args)
