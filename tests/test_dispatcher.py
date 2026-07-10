@@ -424,7 +424,21 @@ class DispatcherTest(_DispatcherBase):
         self.assertEqual(len(self.worker.tasks_written), 1)
         records = dispatcher._load_cards()
         self.assertIn(ref, records)
-        self.assertEqual(records[ref]["comment_baseline"], 0)
+        self.assertEqual(records[ref]["comment_baseline"], 1)
+
+    def test_successful_claim_posts_start_comment(self):
+        ref = self._ready_card("A")
+        with mock.patch.object(dispatcher.time, "time", return_value=1714824240):
+            dispatcher.tick()
+
+        tid = next(t["id"] for t in self.board.tasks.values() if t["reference"] == ref)
+        comments = [c["comment"] for c in self.board.comments.get(tid, [])]
+        self.assertEqual(len(comments), 1)
+        self.assertIn(f"[{model.MARKER_CLAIM_STARTED}]", comments[0])
+        self.assertIn("Взята в работу 2024-05-04 12:04 UTC", comments[0])
+        self.assertIn("воркер 1-a", comments[0])
+        self.assertIn("воркспейс /ws/1-a", comments[0])
+        self.assertEqual(dispatcher._load_cards()[ref]["comment_baseline"], 1)
 
     def test_tick_renames_branch_before_launching_the_head(self):
         # bring-up must land the worktree on its own pipeline/<ref> branch before the worker head

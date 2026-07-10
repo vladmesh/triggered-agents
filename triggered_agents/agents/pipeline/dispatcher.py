@@ -41,6 +41,7 @@ import os
 import sys
 import time
 from contextlib import contextmanager
+from datetime import datetime, timezone
 
 from ...runtime.state import PRECHECK_SKIP
 from . import health, heads, model, naming, ops, pause as pause_flag, taskdoc, validate, worker
@@ -607,6 +608,14 @@ def _block(ref: str, reason: str, body: str, **log_fields) -> None:
     STATE.log_run("bringup", reference=ref, to="Blocked", reason=reason, **log_fields)
 
 
+def _claim_started_comment(ref: str, worker_id: str, ws: str, now: float) -> None:
+    ts = datetime.fromtimestamp(now, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    ops.add_comment(
+        "dispatcher", ref,
+        f"Взята в работу {ts}, воркер {worker_id}, воркспейс {ws}.",
+        marker=model.MARKER_CLAIM_STARTED)
+
+
 def _bring_up(card: dict, worker_id: str, records: dict, head: str) -> None:
     """After a successful claim: worktree, setup+smoke, then the worker head — or Blocked on any
     failure. The claim already persists on the board, so nothing here may escape as a traceback:
@@ -658,6 +667,7 @@ def _bring_up(card: dict, worker_id: str, records: dict, head: str) -> None:
                error=worker.scrub_secrets(str(e)))
         return
     now = time.time()
+    _claim_started_comment(ref, worker_id, ws, now)
     records[ref] = {
         "workspace": ws,
         "worker": worker_id,
@@ -667,7 +677,7 @@ def _bring_up(card: dict, worker_id: str, records: dict, head: str) -> None:
         "terminal_kind": worker.terminal_kind(head),
         "claimed_at": now,
         "last_activity": now,
-        "comment_baseline": len(view["comments"]),
+        "comment_baseline": len(ops.show_card(ref)["comments"]),
     }
     _save_cards(records)
     STATE.log_run("bringup", reference=ref, to="In progress", workspace=ws, head=head)
