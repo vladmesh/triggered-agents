@@ -12,6 +12,7 @@ and can move the card to Blocked before a head is spawned. Orca still owns workt
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
@@ -20,7 +21,7 @@ import tomllib
 from pathlib import Path
 
 from ...runtime import claude_env, redact
-from . import heads, stand, terminal_session
+from . import codex_sessions, heads, stand, terminal_session
 from .state import STATE
 
 ORCA = os.environ.get("ORCA_BIN") or shutil.which("orca") or str(Path.home() / ".local/bin/orca")
@@ -428,25 +429,27 @@ def terminal_status(handle: str, workspace: str | None = None,
     `known=false` means Orca itself could not be queried. Callers should keep their ordinary
     watchdog path for that case instead of treating a transport failure as proof that the tracked
     terminal died."""
-    return terminal_session.terminal_status(
+    status = terminal_session.terminal_status(
         handle,
         workspace,
         expected_kind,
         orca_json=_orca_json,
         unavailable_errors=(WorkspaceError, subprocess.TimeoutExpired),
     )
+    if expected_kind == "codex-tui" and workspace:
+        activity = codex_sessions.latest_activity_for(workspace)
+        if activity:
+            if status.get("live") and activity > (status.get("last_activity") or 0):
+                status = {**status, "last_activity": activity}
+            elif status.get("known") and status.get("reason") == "not-codex-tui":
+                status = {"known": True, "live": True, "reason": "live", "last_activity": activity}
+    return status
 
 
 def terminal_live(handle: str, workspace: str | None = None,
                   expected_kind: str | None = None) -> bool:
     """Whether `handle` is a live Orca terminal, optionally scoped to `workspace`."""
-    return terminal_session.terminal_live(
-        handle,
-        workspace,
-        expected_kind,
-        orca_json=_orca_json,
-        unavailable_errors=(WorkspaceError, subprocess.TimeoutExpired),
-    )
+    return bool(terminal_status(handle, workspace, expected_kind).get("live"))
 
 
 def _terminal_belongs_to_workspace(term: dict, workspace: str) -> bool:
