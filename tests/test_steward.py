@@ -449,6 +449,17 @@ class CliTest(StewardTestBase):
         self.assertIn(ref, mark["notified_blocked"])
         self.assertEqual(cli.cmd_precheck(), runtime_state.PRECHECK_SKIP)  # no fresh wake-up next hour
 
+    def test_advance_does_not_fold_in_blocked_steward_report_card(self):
+        self.assertEqual(cli.cmd_scan(as_json=True), 0)
+        ref = self.board.add_task("steward: deep-sweep", "Blocked", swimlane="triggered-agents",
+                                  meta={"task_type": "research", "project": "triggered-agents",
+                                        "slug": "steward-sweep-1", "claim": "steward-sweep-1",
+                                        "steward_report": "1"})
+        self.assertEqual(cli.cmd_advance(), 0)
+        mark = signals.load_watermark()
+        self.assertNotIn(ref, mark["notified_blocked"])
+        self.assertEqual(cli.cmd_precheck(), runtime_state.PRECHECK_SKIP)
+
 
 class DeepSweepWatermarkTest(StewardTestBase):
     """cli.py's deep-sweep-since/deep-sweep-advance (triggered-agents-254) — a separate

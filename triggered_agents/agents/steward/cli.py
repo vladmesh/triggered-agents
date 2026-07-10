@@ -69,7 +69,8 @@ def cmd_advance() -> int:
         # Blocked — without this it would look "new" again on the very next hour's scan, one
         # wasted wake-up for a card this same run just put there (2026-07-04 review,
         # triggered-agents-244 note Z2).
-        current_blocked = {c["reference"] for c in signals.pipeline_ops.list_cards(column="Blocked")}
+        current_blocked = {c["reference"] for c in signals.pipeline_ops.list_cards(column="Blocked")
+                           if c.get("steward_report") != "1"}
         pending["notified_blocked"] = sorted(set(pending["notified_blocked"]) | current_blocked)
         STATE.save_watermark(pending)
         STATE.pending_file.unlink()
