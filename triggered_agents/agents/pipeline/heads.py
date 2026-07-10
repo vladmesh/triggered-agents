@@ -119,11 +119,11 @@ def _render_codex_tui(profile: dict, *, workspace: str | None = None) -> str:
     effort_flag = ""
     if effort:
         effort_flag = " -c " + shlex.quote(f'model_reasoning_effort="{effort}"')
-    trust_flag = ""
-    if workspace:
-        workspace_path = str(Path(workspace).resolve(strict=False))
-        key = f"projects.{_toml_basic_string(workspace_path)}.trust_level=\"trusted\""
-        trust_flag = " -c " + shlex.quote(key)
+    if not workspace:
+        raise HeadRegistryError("codex TUI launch requires workspace for directory trust override")
+    workspace_path = str(Path(workspace).resolve(strict=False))
+    key = f"projects.{_toml_basic_string(workspace_path)}.trust_level=\"trusted\""
+    trust_flag = " -c " + shlex.quote(key)
     return (f"CODEX_HOME={home} codex --dangerously-bypass-approvals-and-sandbox"
             f"{model_flag}{effort_flag}{trust_flag}")
 

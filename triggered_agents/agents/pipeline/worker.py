@@ -649,7 +649,7 @@ def relaunch_reviewer(workspace: str, worker_id: str, title: str,
     orphans) against the reviewer's own command instead of the worker's."""
     ensure_trust(workspace)
     ensure_theme()
-    return _create_head_terminal(workspace, title, _reviewer_launch_spec(review_head))
+    return _create_head_terminal(workspace, title, _reviewer_launch_spec(review_head, workspace))
 
 
 def activity(workspace: str) -> float | None:

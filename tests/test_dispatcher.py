@@ -3693,6 +3693,29 @@ class WorkerHostCallsTest(unittest.TestCase):
         create = next(c for c in self.calls if c[:2] == ["terminal", "create"])
         self.assertIn("codex exec", create[create.index("--command") + 1])
 
+    def test_relaunch_reviewer_codex_tui_uses_review_workspace_trust_override(self):
+        calls = []
+
+        def fake_orca_json(args):
+            calls.append(args)
+            if args[:2] == ["terminal", "create"]:
+                return {"terminal": {"handle": "term-tui"}}
+            if args[:2] == ["terminal", "list"]:
+                return {"terminals": [{"handle": "term-tui"}]}
+            return {}
+
+        with mock.patch.object(self.worker, "_orca_json", fake_orca_json):
+            handle = self.worker.relaunch_reviewer("/ws/rev", "rev-1", "review A-1: title",
+                                                   "codex-reviewer-tui")
+
+        self.assertEqual(handle, "term-tui")
+        create = next(c for c in calls if c[:2] == ["terminal", "create"])
+        command = create[create.index("--command") + 1]
+        self.assertNotIn("codex exec", command)
+        self.assertIn("'projects.\"/ws/rev\".trust_level=\"trusted\"'", command)
+        send = next(c for c in calls if c[:2] == ["terminal", "send"])
+        self.assertIn("REVIEW.md", send[send.index("--text") + 1])
+
     def test_spawn_reviewer_tears_down_worktree_on_launch_failure(self):
         # The worktree is created first; if the head fails to launch after that, the worktree must
         # not be left orphaned on disk.

@@ -192,6 +192,10 @@ class RenderCodexTest(unittest.TestCase):
         self.assertEqual(conf,
                          "projects.\"/tmp/work dir/that's \\\"quoted\\\"\".trust_level=\"trusted\"")
 
+    def test_render_launch_codex_tui_requires_workspace(self):
+        with self.assertRaisesRegex(heads.HeadRegistryError, "requires workspace"):
+            heads.render_launch("codex-tui", role="worker", prompt="ping", registry=self.reg)
+
     def test_codex_tui_feature_flag_can_enable_existing_profile(self):
         with mock.patch.dict(os.environ, {"TA_CODEX_MODE": "tui"}, clear=False):
             launch = heads.render_launch("codex", role="worker", prompt="ping",
