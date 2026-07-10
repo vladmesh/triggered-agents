@@ -792,21 +792,29 @@ def tick() -> int:
     return 0
 
 
+def _pause_excluded_workspaces(actor: str, exclude_workspaces: list[str] | None) -> set[str]:
+    out = {os.path.abspath(p) for p in (exclude_workspaces or []) if p}
+    if actor == "secretary-backup":
+        out.add(os.path.abspath(os.getcwd()))
+    return out
+
+
 def pause(requested_mode: str, *, reason: str = pause_flag.DEFAULT_REASON,
-          actor: str = pause_flag.DEFAULT_ACTOR) -> dict:
+          actor: str = pause_flag.DEFAULT_ACTOR,
+          exclude_workspaces: list[str] | None = None) -> dict:
     """Pause the pipeline (triggered-agents-281) — the built-in replacement for the 2026-07-04
     workaround: hand-moving Ready cards to Blocked, disabling ta-pipeline.timer, killing terminals
     by hand. `soft` stops new worker claims and steward/curator/retro dispatch (runtime/dispatch.py
     checks the same flag), but every card already In progress or in Validate keeps riding its
     normal cycle untouched — advance, CI/stand, layer-3 review, automerge, all of it. `hard` also
-    excludes In-progress worker terminals from host stop because Orca has no lossless park API;
-    stopping them would turn resume into a restart wave. Validate workers and reviewers are still
-    stopped with worker.stop_terminals only — it never removes a worktree, so the
-    branch/uncommitted work stays exactly as the head left it — and the whole dispatcher tick
-    freezes (see tick()): nothing advances, nothing is claimed, no watchdog can fire on a head that
-    was stopped on purpose, not one that died. resume() parks stopped workers for lazy unpark,
-    relaunches reviewers, and gives every affected watchdog a fresh window, so the paused stretch
-    never reads as silence once ticking resumes.
+    stops live worker/reviewer terminals with worker.stop_terminals only — it never removes a
+    worktree, so the branch/uncommitted work stays exactly as the head left it — and freezes the
+    whole dispatcher tick (see tick()): nothing advances, nothing is claimed, no watchdog can fire
+    on a head that was stopped on purpose, not one that died. The one exception is a narrow
+    initiator exclude: backup create runs the CLI from its own worker workspace, so that workspace
+    is left running for actor=secretary-backup; operators can pass explicit excluded workspaces.
+    resume() parks stopped workers for lazy unpark, relaunches reviewers, and gives every affected
+    watchdog a fresh window, so the paused stretch never reads as silence once ticking resumes.
 
     Idempotent: pausing again in the same mode is a no-op (still logged, so repeated calls are
     visible in runs.jsonl). Pausing in the other mode while already paused is a GuardError — resume
@@ -839,14 +847,22 @@ def pause(requested_mode: str, *, reason: str = pause_flag.DEFAULT_REASON,
         if mode == "hard":
             records = _load_cards()
             by_ref = {c["reference"]: c for c in ops.list_cards()}
+            excluded_paths = _pause_excluded_workspaces(actor, exclude_workspaces)
             for ref, rec in records.items():
                 card = by_ref.get(ref)
                 if card is None:
                     continue
-                if card["column"] == model.IN_PROGRESS and rec.get("workspace"):
-                    excluded_worker.append(ref)
-                elif card["column"] == "Validate" and rec.get("workspace"):
-                    worker.stop_terminals(rec["workspace"])
+                workspace = rec.get("workspace")
+                if card["column"] == model.IN_PROGRESS and workspace:
+                    if os.path.abspath(workspace) in excluded_paths:
+                        excluded_worker.append(ref)
+                        continue
+                    worker.stop_terminals(workspace)
+                    stopped_worker.append(ref)
+                elif card["column"] == "Validate" and workspace:
+                    # Validate workers are parked for future rework. They are not active writers
+                    # while the independent reviewer or CI polling owns the card.
+                    worker.stop_terminals(workspace)
                     stopped_worker.append(ref)
                 if card["column"] == "Validate" and rec.get("review_ws"):
                     worker.stop_terminals(rec["review_ws"])

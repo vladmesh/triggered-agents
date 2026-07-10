@@ -4,12 +4,12 @@ Absent (no file) = running. Present = paused, with internal `mode` stored as `"s
 plus the public reason/actor and the refs stopped by a hard pause. The two `stopped_*` lists are
 only ever populated by a hard pause (dispatcher.pause) and name exactly the cards whose live
 terminal it stopped, so dispatcher.resume() knows what to park or relaunch without re-deriving it
-from cards.json. `excluded_worker` names In-progress workers deliberately left running because
-there is no lossless Orca park API: stopping them would create the restart collateral hard resume
-is supposed to avoid. A card's column/record shape alone can't tell "a terminal was actually
-running here when pause hit" from "this Validate card just hasn't spawned a reviewer yet". A
-single Validate card can appear in both stopped lists at once: its original worker terminal is
-parked for CI rework, and its live layer-3 reviewer is relaunched to finish the review.
+from cards.json. `excluded_worker` names a narrow initiator/operator exception: a worker workspace
+deliberately left running while every other In-progress worker is stopped. A card's column/record
+shape alone can't tell "a terminal was actually running here when pause hit" from "this Validate
+card just hasn't spawned a reviewer yet". A single Validate card can appear in both stopped lists
+at once: its original worker terminal is parked for CI rework, and its live layer-3 reviewer is
+relaunched to finish the review.
 
 Automation-owned hard pauses are not allowed to freeze the queue forever. A hard pause whose
 actor is in HARD_PAUSE_AUTO_RESUME_ACTORS auto-resumes after
@@ -115,8 +115,8 @@ def _on_resume(mode: str | None, stopped_worker: list[str], stopped_reviewer: li
         return (
             f"resume clears freeze, parks {workers} stopped worker head(s), relaunches "
             f"{reviewers} stopped reviewer head(s) in existing workspaces, and resets watchdog "
-            f"clocks; {excluded} In-progress worker head(s) were excluded from stop and keep "
-            "their existing terminal"
+            f"clocks; {excluded} explicitly excluded In-progress worker head(s) keep their "
+            "existing terminal"
         )
     if mode == "soft":
         return (

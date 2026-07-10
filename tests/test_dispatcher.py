@@ -3307,11 +3307,11 @@ class PipelinePauseTest(_DispatcherBase):
         self.assertEqual(result["internal_mode"], "hard")
         self.assertEqual(result["reason"], "deploy window")
         self.assertEqual(result["actor"], "vladmesh")
-        self.assertEqual(result["stopped_worker"], [])
-        self.assertEqual(result["excluded_worker"], [ref])
+        self.assertEqual(result["stopped_worker"], [ref])
+        self.assertEqual(result["excluded_worker"], [])
         self.assertEqual(result["live_state_path"], str(pause.PAUSE_FILE.resolve()))
         self.assertIn("resume", result["on_resume"])
-        self.assertIn("existing terminal", result["on_resume"])
+        self.assertIn("workspaces", result["on_resume"])
 
     def test_pause_status_warns_about_other_pause_json_files(self):
         shadow = Path(os.environ["TA_STATE"]) / "pipeline" / "pause.json"
@@ -3410,14 +3410,36 @@ class PipelinePauseTest(_DispatcherBase):
         self.assertEqual(self.worker.stopped_terminals, [])
         self.assertEqual(dispatcher._load_cards()[ref]["handle"], f"handle-{self.worker.launched[0]['worker']}")
 
-    # --- hard: In-progress workers are excluded, dispatcher tick freezes solid ----------------
-    def test_hard_pause_excludes_the_in_progress_worker_terminal(self):
+    # --- hard: workers stop, explicit initiator exclusions stay running, tick freezes solid ----
+    def test_hard_pause_stops_the_in_progress_worker_terminal(self):
         ref = self._claim_one()
         ws = dispatcher._load_cards()[ref]["workspace"]
         self._pause("hard")
+        self.assertIn(ws, self.worker.stopped_terminals)
+        self.assertEqual(dispatcher.pause_status()["stopped_worker"], [ref])
+        self.assertEqual(dispatcher.pause_status()["excluded_worker"], [])
+
+    def test_hard_pause_excludes_explicit_workspace(self):
+        ref = self._claim_one()
+        ws = dispatcher._load_cards()[ref]["workspace"]
+        dispatcher.pause("hard", reason="maintenance", actor="vladmesh",
+                         exclude_workspaces=[ws])
         self.assertNotIn(ws, self.worker.stopped_terminals)
         self.assertEqual(dispatcher.pause_status()["stopped_worker"], [])
         self.assertEqual(dispatcher.pause_status()["excluded_worker"], [ref])
+
+    def test_secretary_backup_pause_excludes_only_current_workspace(self):
+        ref_self = self._claim_one("backup", project="triggered-agents")
+        ws_self = dispatcher._load_cards()[ref_self]["workspace"]
+        ref_other = self._claim_one("other", project="other")
+        ws_other = dispatcher._load_cards()[ref_other]["workspace"]
+        with mock.patch("os.getcwd", return_value=ws_self):
+            dispatcher.pause("hard", reason="secretary backup create", actor="secretary-backup")
+        self.assertNotIn(ws_self, self.worker.stopped_terminals)
+        self.assertIn(ws_other, self.worker.stopped_terminals)
+        status = dispatcher.pause_status()
+        self.assertEqual(status["excluded_worker"], [ref_self])
+        self.assertEqual(status["stopped_worker"], [ref_other])
 
     def test_hard_pause_stops_the_live_reviewer_terminal_too(self):
         ref = self._to_validate_with_reviewer()
@@ -3463,8 +3485,8 @@ class PipelinePauseTest(_DispatcherBase):
         self._assert_not_paused(dispatcher.pause_status())
         rec_after = dispatcher._load_cards()[ref]
         self.assertGreaterEqual(rec_after["last_activity"], rec_before["last_activity"])
-        self.assertFalse(rec_after.get("parked_worker"))
-        self.assertEqual(rec_after["handle"], rec_before["handle"])
+        self.assertTrue(rec_after.get("parked_worker"))
+        self.assertEqual(rec_after["handle"], "")
         self.assertEqual(self.worker.launched, [])
         ttl_runs = [r for r in self._runs() if r["event"] == "pause-ttl"]
         self.assertTrue(any(r.get("result") == "auto-resume"
@@ -3720,6 +3742,18 @@ class PipelinePauseTest(_DispatcherBase):
         status = dispatcher.pause_status()
         self.assertEqual(status["mode"], "drain")
         self.assertEqual(status["actor"], "po")
+
+    def test_cli_pause_freeze_accepts_explicit_excluded_workspace(self):
+        from triggered_agents.agents.pipeline import cli
+        ref = self._claim_one()
+        ws = dispatcher._load_cards()[ref]["workspace"]
+        rc = cli.main(["--role", "po", "pause", "freeze", "--reason", "operator snapshot",
+                       "--exclude-workspace", ws])
+        self.assertEqual(rc, 0)
+        status = dispatcher.pause_status()
+        self.assertEqual(status["excluded_worker"], [ref])
+        self.assertEqual(status["stopped_worker"], [])
+        self.assertNotIn(ws, self.worker.stopped_terminals)
 
     def test_cli_resume_needs_po_or_steward_role(self):
         self._pause("hard")
