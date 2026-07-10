@@ -9,6 +9,12 @@ running here when pause hit" from "this Validate card just hasn't spawned a revi
 single Validate card can appear in both lists at once (its original worker terminal parked for CI
 rework, and a live layer-3 reviewer), each is stopped and relaunched independently.
 
+Automation-owned hard pauses are not allowed to freeze the queue forever. A hard pause whose
+actor is in HARD_PAUSE_AUTO_RESUME_ACTORS auto-resumes after
+HARD_PAUSE_AUTO_RESUME_TTL_SECONDS, default 45 minutes, through dispatcher.resume(), so stopped
+heads relaunch on the same path as a manual resume. Human or unknown actors are treated as manual
+maintenance windows and never auto-resume.
+
 Read from two places outside dispatcher.py itself: runtime/dispatch.py (steward/curator/retro
 dispatch) and cli.py (pause-status) — both only ever call is_paused()/load()/status(), never
 write. Kept in its own tiny module (state.py primitives only, no ops/worker/dispatcher import) so
@@ -39,6 +45,15 @@ DISPLAY_MODES = {
 }
 DEFAULT_REASON = "admin pause"
 DEFAULT_ACTOR = "pipeline"
+HARD_PAUSE_AUTO_RESUME_TTL_SECONDS = int(os.environ.get("TA_HARD_PAUSE_AUTO_RESUME_TTL_S", "2700"))
+HARD_PAUSE_AUTO_RESUME_ACTORS = tuple(
+    actor.strip()
+    for actor in os.environ.get(
+        "TA_HARD_PAUSE_AUTO_RESUME_ACTORS",
+        "pipeline,secretary-backup,secretary,steward,curator,retro",
+    ).split(",")
+    if actor.strip()
+)
 
 
 def normalize_mode(mode: str | None) -> str | None:
@@ -103,6 +118,60 @@ def _on_resume(mode: str | None, stopped_worker: list[str], stopped_reviewer: li
             "cards already in progress kept running during the pause"
         )
     return "resume clears the pause flag"
+
+
+def _parse_since(value: object) -> datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def hard_pause_auto_resume_status(state: dict, *, now: datetime | None = None) -> dict:
+    """Decision data for stale hard-pause recovery.
+
+    Only automation-owned freeze pauses auto-resume. Human or unknown actors may hold a freeze for
+    as long as needed, so a long maintenance window does not get lifted without the person who set
+    it noticing. The dispatcher calls this from precheck and tick before the ordinary hard-paused
+    skip, then uses its normal resume() path to relaunch stopped heads and reset watchdog clocks.
+    """
+    ttl = max(0, int(HARD_PAUSE_AUTO_RESUME_TTL_SECONDS))
+    out = {
+        "eligible": False,
+        "ttl_seconds": ttl,
+        "reason": "not-hard-pause",
+    }
+    if state.get("mode") != "hard":
+        return out
+    if ttl <= 0:
+        out["reason"] = "disabled"
+        return out
+    actor = (state.get("actor") or "").strip()
+    out["actor"] = actor
+    if actor not in HARD_PAUSE_AUTO_RESUME_ACTORS:
+        out["reason"] = "manual-or-unknown-actor"
+        return out
+    since = _parse_since(state.get("since"))
+    if since is None:
+        out["reason"] = "missing-or-invalid-since"
+        return out
+    current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    age = max(0, int((current - since).total_seconds()))
+    out["age_seconds"] = age
+    if age < ttl:
+        out["reason"] = "fresh"
+        return out
+    out["eligible"] = True
+    out["reason"] = "stale-automation-hard-pause"
+    return out
 
 
 def load() -> dict:
@@ -175,5 +244,6 @@ def status() -> dict:
         "stopped_worker": stopped_worker,
         "stopped_reviewer": stopped_reviewer,
         "on_resume": _on_resume(mode, stopped_worker, stopped_reviewer),
+        "auto_resume": hard_pause_auto_resume_status(state),
         **base,
     }

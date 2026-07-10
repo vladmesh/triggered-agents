@@ -8,6 +8,7 @@ the process.
 from __future__ import annotations
 
 import fcntl
+import json
 import os
 import subprocess
 import sys
@@ -15,6 +16,7 @@ import tempfile
 import threading
 import time
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -1239,6 +1241,31 @@ class HeadHealthTest(_DispatcherBase):
         dispatcher.tick()
         self.assertEqual(self._column(ref), model.IN_PROGRESS)   # frozen, not Blocked
         self.assertEqual(self.worker.torn_down, [])
+
+    def test_dead_worker_handle_frozen_while_head_resource_is_red(self):
+        ref = self._claim_one(head="claude-opus")   # real registry: resource claude-sub
+        rec = dispatcher._load_cards()[ref]
+        ops.set_retry_state(ref, retry_same=1, retry_switch=1, retry_heads="claude-opus")
+        self.worker.dead_handles.add(rec["handle"])
+        self.statuses["claude-sub"] = "red"
+        before = rec["last_activity"]
+
+        dispatcher.tick()
+
+        rec_after = dispatcher._load_cards()[ref]
+        self.assertEqual(self._column(ref), model.IN_PROGRESS)
+        self.assertEqual(self.worker.torn_down, [])
+        self.assertEqual(ops.show_card(ref)["metadata"][model.META_RETRY_SAME], "1")
+        self.assertGreaterEqual(rec_after["last_activity"], before)
+        self.assertFalse(any(r.get("reference") == ref and r.get("reason") == "watchdog"
+                             for r in self._runs()))
+
+        self.statuses["claude-sub"] = "green"
+        dispatcher.tick()
+        self.assertEqual(self._column(ref), "Blocked")
+        self.assertTrue(any(r.get("reference") == ref and r.get("reason") == "watchdog"
+                            and r.get("trigger") == dispatcher.WATCHDOG_TRIGGER_DEAD_HANDLE
+                            for r in self._runs()))
 
     def test_watchdog_resumes_once_resource_goes_green_again(self):
         ref = self._claim_one(head="claude-opus")
@@ -3171,6 +3198,11 @@ class PipelinePauseTest(_DispatcherBase):
     def _pause(self, mode="soft", reason="maintenance", actor="test"):
         return dispatcher.pause(mode, reason=reason, actor=actor)
 
+    def _age_pause_flag(self, seconds: int) -> None:
+        state = pause.load()
+        state["since"] = (datetime.now(timezone.utc) - timedelta(seconds=seconds)).isoformat()
+        pause.PAUSE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+
     def _assert_not_paused(self, status):
         self.assertFalse(status["paused"])
         self.assertEqual(status["live_state_path"], str(pause.PAUSE_FILE.resolve()))
@@ -3354,6 +3386,51 @@ class PipelinePauseTest(_DispatcherBase):
         runs = [r for r in self._runs() if r["event"] == "precheck"]
         self.assertEqual(runs[-1]["result"], "paused")
         self.assertEqual(runs[-1]["mode"], "hard")
+
+    def test_stale_automation_hard_pause_auto_resumes_on_precheck(self):
+        ref = self._claim_one(head="claude-opus")
+        rec_before = dispatcher._load_cards()[ref]
+        self._pause("hard", reason="secretary backup create", actor="secretary-backup")
+        self._age_pause_flag(pause.HARD_PAUSE_AUTO_RESUME_TTL_SECONDS + 1)
+        self.worker.launched.clear()
+
+        rc = dispatcher.precheck()
+
+        self.assertEqual(rc, 0)
+        self._assert_not_paused(dispatcher.pause_status())
+        self.assertEqual(len(self.worker.launched), 1)
+        self.assertEqual(self.worker.launched[0]["ws"], rec_before["workspace"])
+        self.assertEqual(self.worker.launched[0]["worker"], rec_before["worker"])
+        rec_after = dispatcher._load_cards()[ref]
+        self.assertGreaterEqual(rec_after["last_activity"], rec_before["last_activity"])
+        ttl_runs = [r for r in self._runs() if r["event"] == "pause-ttl"]
+        self.assertTrue(any(r.get("result") == "auto-resume"
+                            and r.get("actor") == "secretary-backup" for r in ttl_runs))
+
+    def test_stale_human_hard_pause_is_not_auto_resumed(self):
+        self._claim_one()
+        self._pause("hard", reason="long maintenance window", actor="vladmesh")
+        self._age_pause_flag(pause.HARD_PAUSE_AUTO_RESUME_TTL_SECONDS + 1)
+        self.worker.launched.clear()
+
+        rc = dispatcher.precheck()
+
+        self.assertEqual(rc, PRECHECK_SKIP)
+        self.assertEqual(dispatcher.pause_status()["mode"], "freeze")
+        self.assertEqual(self.worker.launched, [])
+        runs = [r for r in self._runs() if r["event"] == "precheck"]
+        self.assertEqual(runs[-1]["result"], "paused")
+
+    def test_fresh_automation_hard_pause_waits_for_resume_or_ttl(self):
+        self._claim_one()
+        self._pause("hard", reason="secretary backup create", actor="secretary-backup")
+        self.worker.launched.clear()
+
+        rc = dispatcher.precheck()
+
+        self.assertEqual(rc, PRECHECK_SKIP)
+        self.assertEqual(dispatcher.pause_status()["mode"], "freeze")
+        self.assertEqual(self.worker.launched, [])
 
     def test_precheck_soft_paused_with_inflight_card_still_dispatches(self):
         self._claim_one()

@@ -133,6 +133,36 @@ def _load_cards() -> dict:
         return {}
 
 
+def _current_head(card: dict, rec: dict) -> str:
+    return rec.get("head") or card.get("head") or heads.DEFAULT_PROFILE
+
+
+def _auto_resume_stale_hard_pause(state: dict, *, source: str) -> dict:
+    decision = pause_flag.hard_pause_auto_resume_status(state)
+    if not decision.get("eligible"):
+        return state
+    try:
+        resume()
+    except Exception as e:  # noqa: BLE001, failed recovery must be visible without crashing the gate
+        STATE.log_run(
+            "pause-ttl",
+            result="auto-resume-failed",
+            source=source,
+            level="warn",
+            error=worker.scrub_secrets(str(e)),
+        )
+        return state
+    STATE.log_run(
+        "pause-ttl",
+        result="auto-resume",
+        source=source,
+        actor=decision.get("actor") or "",
+        age_seconds=decision.get("age_seconds"),
+        ttl_seconds=decision.get("ttl_seconds"),
+    )
+    return pause_flag.load()
+
+
 def _save_cards(records: dict) -> None:
     STATE.ensure_dir()
     tmp = CARDS_FILE.with_suffix(".json.tmp")
@@ -215,7 +245,7 @@ def precheck() -> int:
         health.refresh()
     except Exception as e:  # noqa: BLE001 — must never break precheck's own board check
         STATE.log_run("head-health", result="error", level="warn", error=worker.scrub_secrets(str(e)))
-    paused = pause_flag.load()
+    paused = _auto_resume_stale_hard_pause(pause_flag.load(), source="precheck")
     if paused and paused.get("mode") == "hard":
         STATE.log_run("precheck", result="paused", mode="hard")
         print("pipeline: hard-paused — SKIP", file=sys.stderr)
@@ -372,8 +402,14 @@ def _advance(records: dict, statuses: dict[str, str]) -> bool:
             changed = True
         else:
             handle = rec.get("handle", "")
+            current_head = _current_head(card, rec)
             status = worker.terminal_status(handle, rec.get("workspace"), rec.get("terminal_kind"))
             if status.get("known") and not status.get("live"):
+                resource = health.resource_of(current_head)
+                if resource and statuses.get(resource) == health.RED:
+                    rec["last_activity"] = time.time()
+                    changed = True
+                    continue
                 elapsed = time.time() - rec.get("last_activity", rec.get("claimed_at", time.time()))
                 _watchdog_retry(ref, card, rec, statuses, elapsed,
                                 trigger=WATCHDOG_TRIGGER_DEAD_HANDLE,
@@ -386,7 +422,7 @@ def _advance(records: dict, statuses: dict[str, str]) -> bool:
             if last:
                 rec["last_activity"] = last
                 changed = True
-            resource = health.resource_of(rec["head"]) if rec.get("head") else None
+            resource = health.resource_of(current_head)
             if resource and statuses.get(resource) == health.RED:
                 rec["last_activity"] = time.time()
                 changed = True
@@ -475,7 +511,7 @@ def _watchdog_retry(ref: str, card: dict, rec: dict, statuses: dict[str, str], s
     # record adopted by _reconcile after a lost cards.json has no such key; the card's own board
     # metadata (kept current by every switch via set_retry_state) is the next best source, so a
     # redeploy losing local state still resumes on the right head instead of silently defaulting.
-    current_head = rec.get("head") or card.get("head") or heads.DEFAULT_PROFILE
+    current_head = _current_head(card, rec)
     meta = ops.get_metadata(ref)
     retry_same = int(meta.get(model.META_RETRY_SAME) or 0)
     retry_switch = int(meta.get(model.META_RETRY_SWITCH) or 0)
@@ -678,6 +714,7 @@ def tick() -> int:
     exactly what resume()'s clock reset exists to avoid needing in the first place. A soft pause
     only turns off _claim_next: every claimed card keeps riding its normal cycle (advance, CI/stand,
     layer-3 review, automerge) untouched, so Ready cards are the only thing that doesn't move."""
+    _auto_resume_stale_hard_pause(pause_flag.load(), source="tick")
     with _tick_lock():
         paused = pause_flag.load()
         if paused and paused.get("mode") == "hard":
