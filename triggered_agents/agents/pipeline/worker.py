@@ -17,6 +17,7 @@ import os
 import re
 import shutil
 import subprocess
+import time
 import tomllib
 from pathlib import Path
 
@@ -39,6 +40,8 @@ PROVISION_TIMEOUT_S = int(os.environ.get("TA_PROVISION_TIMEOUT_S", "900"))
 GH_TIMEOUT_S = 60          # a gh call may hit the network; bounded so a tick never hangs on it
 _GH_LOG_TAIL_LINES = 40
 TUI_IDLE_TIMEOUT_MS = int(os.environ.get("TA_TUI_IDLE_TIMEOUT_MS", "60000"))
+TUI_DELIVERY_RETRIES = int(os.environ.get("TA_TUI_DELIVERY_RETRIES", "2"))
+TUI_DELIVERY_CHECK_DELAY_S = float(os.environ.get("TA_TUI_DELIVERY_CHECK_DELAY_S", "0.5"))
 # Head profile for the layer-3 reviewer. A plain config knob (not a per-card choice): the reviewer
 # is independent of the worker, so the card's `head` field is not reused here — this names a
 # profile in heads.toml, same registry every worker head resolves against.
@@ -47,6 +50,10 @@ REVIEWER_HEAD = os.environ.get("TA_REVIEWER_HEAD", "codex-reviewer")
 
 class WorkspaceError(RuntimeError):
     """A host-side workspace step failed (orca, git, provision transport)."""
+
+
+class InjectDeliveryError(WorkspaceError):
+    """The TUI prompt stayed in the composer after delivery retries."""
 
 
 # Board comments are the card's public journal, so provision logs / error texts get scrubbed
@@ -569,6 +576,46 @@ def _deliver_initial_prompt(handle: str, launch: heads.LaunchSpec) -> None:
                 "--timeout-ms", str(TUI_IDLE_TIMEOUT_MS)])
     _orca_json(["terminal", "send", "--terminal", handle, "--text", launch.initial_prompt,
                 "--enter"])
+    _confirm_initial_prompt_delivered(handle, launch.initial_prompt)
+
+
+def _prompt_signature(prompt: str) -> str:
+    for token in ("TASK.md", "REVIEW.md"):
+        if token in prompt:
+            return token
+    words = re.findall(r"\S+", prompt)
+    return " ".join(words[:6])
+
+
+def _prompt_still_in_codex_composer(screen: str, prompt: str) -> bool:
+    """Best-effort Codex TUI delivery check.
+
+    The lost-Enter failure leaves the initial prompt in the bottom composer, whose screen line is
+    marked by Codex' `›` prompt glyph. A submitted user message may still be visible in scrollback,
+    so only text after the last composer marker counts as undelivered.
+    """
+    screen = terminal_session.strip_ansi(screen)
+    marker = screen.rfind("\u203a")
+    if marker < 0:
+        return False
+    composer = screen[marker:]
+    signature = _prompt_signature(prompt)
+    return bool(signature and signature in composer)
+
+
+def _confirm_initial_prompt_delivered(handle: str, prompt: str) -> None:
+    for attempt in range(TUI_DELIVERY_RETRIES + 1):
+        if TUI_DELIVERY_CHECK_DELAY_S > 0:
+            time.sleep(TUI_DELIVERY_CHECK_DELAY_S)
+        screen = _read_terminal_text(handle)
+        if not _prompt_still_in_codex_composer(screen, prompt):
+            return
+        if attempt < TUI_DELIVERY_RETRIES:
+            _orca_json(["terminal", "send", "--terminal", handle, "--text", "", "--enter"])
+            continue
+    raise InjectDeliveryError(
+        f"inject не доставлен: prompt остался в composer после "
+        f"{TUI_DELIVERY_RETRIES + 1} проверок")
 
 
 def _create_head_terminal(workspace: str, title: str, launch: heads.LaunchSpec) -> str:

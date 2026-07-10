@@ -738,6 +738,18 @@ def _spawn_reviewer(ref: str, pr: str | None, card: dict, rec: dict, records: di
                                            naming.worker_branch(ref), naming.reviewer_branch(ref),
                                            head_sha=contrib[1] if contrib else None,
                                            review_head=review_head)
+    except worker.InjectDeliveryError as e:
+        clear_review(rec)
+        scrubbed = worker.scrub_secrets(str(e))
+        ops.add_comment("dispatcher", ref,
+                        f"Не удалось поднять голову-ревьюера (слой 3): inject не доставлен "
+                        f"в TUI, prompt остался в composer после ретраев. Карточка в Blocked "
+                        f"до vladmesh. {note}")
+        ops.move_card("dispatcher", ref, "Blocked")
+        records.pop(ref, None)
+        STATE.log_run("review", reference=ref, to="Blocked", reason="inject-delivery",
+                      error=scrubbed, pr=pr, review_head=review_head)
+        return True
     except worker.WorkspaceError as e:
         # spawn_reviewer already tore down any half-created worktree. Retry a few ticks (transient
         # orca), then escalate to Blocked — a persistent failure must not retry forever with no

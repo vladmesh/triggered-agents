@@ -46,6 +46,7 @@ class FakeWorker:
         self.provision_ok = True
         self.provision_log = "[provision] done\n"
         self.create_raises = None
+        self.launch_raises = None
         self.activity_ts = None          # default tracked-terminal activity
         self.activity_by_handle = {}     # handle -> activity timestamp, overriding activity_ts
         self.activity_polled = []        # every workspace activity helper was asked about
@@ -124,6 +125,8 @@ class FakeWorker:
 
     def launch_worker(self, workspace, head, worker_id, title):
         self.launched.append({"ws": workspace, "head": head, "worker": worker_id, "title": title})
+        if self.launch_raises:
+            raise self.launch_raises
         if self.unique_launch_handles:
             return f"handle-{worker_id}-{len(self.launched)}"
         return f"handle-{worker_id}"
@@ -906,6 +909,21 @@ class DispatcherTest(_DispatcherBase):
         self.assertNotIn(ref, dispatcher._load_cards())
         posted = " ".join(c["comment"] for cl in self.board.comments.values() for c in cl)
         self.assertIn("bring-up", posted)
+
+    def test_launch_worker_inject_delivery_failure_is_explicit(self):
+        ref = self._ready_card("A")
+        self.worker.launch_raises = worker.InjectDeliveryError("inject не доставлен: TASK.md")
+
+        dispatcher.tick()
+
+        self.assertEqual(self._column(ref), "Blocked")
+        self.assertNotIn(ref, dispatcher._load_cards())
+        posted = " ".join(c["comment"] for cl in self.board.comments.values() for c in cl)
+        self.assertIn("inject не доставлен", posted)
+        self.assertTrue(any(r.get("event") == "bringup"
+                            and r.get("reason") == "inject-delivery"
+                            and r.get("reference") == ref
+                            for r in self._runs()))
 
     def test_show_card_fail_after_claim_blocks(self):
         ref = self._ready_card("A")
@@ -2689,6 +2707,22 @@ class ValidateReviewTest(_DispatcherBase):
         self.assertEqual(len(self.worker.reviewer_spawns), 1)
         self.assertIn("review_baseline", dispatcher._load_cards()[ref])
 
+    def test_reviewer_inject_delivery_failure_is_explicit(self):
+        ref = self._to_validate()
+        self._ci_green()
+        self.worker.reviewer_raises = worker.InjectDeliveryError("inject не доставлен: REVIEW.md")
+
+        dispatcher.tick()
+
+        self.assertEqual(self._column(ref), "Blocked")
+        self.assertNotIn(ref, dispatcher._load_cards())
+        posted = " ".join(c["comment"] for cl in self.board.comments.values() for c in cl)
+        self.assertIn("inject не доставлен", posted)
+        self.assertTrue(any(r.get("event") == "review"
+                            and r.get("reason") == "inject-delivery"
+                            and r.get("reference") == ref
+                            for r in self._runs()))
+
     def test_red_return_note_uses_dedicated_marker_not_review_red(self):
         # The dispatcher's own return note must not carry [review:red] — only the reviewer's verdict
         # does, else a baseline shift would re-read the note as a fresh red and loop.
@@ -3766,6 +3800,9 @@ class WorkerHostCallsTest(unittest.TestCase):
             wp = mock.patch.object(worker, name, lambda *a, n=name: self.ensured.append(n))
             wp.start()
             self.addCleanup(wp.stop)
+        delay = mock.patch.object(worker, "TUI_DELIVERY_CHECK_DELAY_S", 0)
+        delay.start()
+        self.addCleanup(delay.stop)
 
     def test_create_workspace_activates_the_worktree(self):
         self.worker.create_workspace("proj", "worker-1", "main")
@@ -3823,6 +3860,58 @@ class WorkerHostCallsTest(unittest.TestCase):
                          calls[create_i][calls[create_i].index("--command") + 1])
         self.assertIn("'projects.\"/ws/fresh\".trust_level=\"trusted\"'",
                       calls[create_i][calls[create_i].index("--command") + 1])
+
+    def test_launch_worker_codex_tui_resends_enter_when_prompt_stays_in_composer(self):
+        calls = []
+        reads = iter([
+            {"terminal": {"tail": ["│ >_ OpenAI Codex │",
+                                   "› Ты — воркер task-пайплайна. TASK.md gpt-5.5 · /ws/fresh"]}},
+            {"terminal": {"tail": ["thinking"]}},
+        ])
+
+        def fake_orca_json(args):
+            calls.append(args)
+            if args[:2] == ["terminal", "create"]:
+                return {"terminal": {"handle": "term-tui"}}
+            if args[:2] == ["terminal", "read"]:
+                return next(reads)
+            if args[:2] == ["terminal", "list"]:
+                return {"terminals": [{"handle": "term-tui"}]}
+            return {}
+
+        with mock.patch.object(self.worker, "_orca_json", fake_orca_json):
+            handle = self.worker.launch_worker("/ws/fresh", "codex-tui", "worker-1",
+                                               "worker A-1: title")
+
+        self.assertEqual(handle, "term-tui")
+        sends = [c for c in calls if c[:2] == ["terminal", "send"]]
+        self.assertEqual(len(sends), 2)
+        self.assertIn("TASK.md", sends[0][sends[0].index("--text") + 1])
+        self.assertEqual(sends[1][sends[1].index("--text") + 1], "")
+
+    def test_launch_worker_codex_tui_raises_when_prompt_stays_in_composer(self):
+        calls = []
+
+        def fake_orca_json(args):
+            calls.append(args)
+            if args[:2] == ["terminal", "create"]:
+                return {"terminal": {"handle": "term-tui"}}
+            if args[:2] == ["terminal", "read"]:
+                return {"terminal": {"tail": [
+                    "› Ты — воркер task-пайплайна. TASK.md gpt-5.5 · /ws/fresh",
+                ]}}
+            if args[:2] == ["terminal", "list"]:
+                return {"terminals": [{"handle": "term-tui"}]}
+            return {}
+
+        with mock.patch.object(self.worker, "_orca_json", fake_orca_json), \
+             self.assertRaises(self.worker.InjectDeliveryError):
+            self.worker.launch_worker("/ws/fresh", "codex-tui", "worker-1",
+                                      "worker A-1: title")
+
+        sends = [c for c in calls if c[:2] == ["terminal", "send"]]
+        self.assertEqual(len(sends), self.worker.TUI_DELIVERY_RETRIES + 1)
+        self.assertEqual(sends[-1][sends[-1].index("--text") + 1], "")
 
     def test_launch_worker_codex_exec_does_not_send_post_start_prompt(self):
         self.worker.launch_worker("/ws/fresh", "codex", "worker-1", "worker A-1: title")
