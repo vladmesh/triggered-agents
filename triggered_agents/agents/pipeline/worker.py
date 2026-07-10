@@ -12,6 +12,7 @@ and can move the card to Blocked before a head is spawned. Orca still owns workt
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
@@ -42,6 +43,7 @@ TUI_IDLE_TIMEOUT_MS = int(os.environ.get("TA_TUI_IDLE_TIMEOUT_MS", "60000"))
 # is independent of the worker, so the card's `head` field is not reused here — this names a
 # profile in heads.toml, same registry every worker head resolves against.
 REVIEWER_HEAD = os.environ.get("TA_REVIEWER_HEAD", "codex-reviewer")
+CODEX_SESSIONS = Path(os.environ.get("TA_CODEX_SESSIONS", str(Path(heads.CODEX_HOME) / "sessions")))
 
 
 class WorkspaceError(RuntimeError):
@@ -428,13 +430,18 @@ def terminal_status(handle: str, workspace: str | None = None,
     `known=false` means Orca itself could not be queried. Callers should keep their ordinary
     watchdog path for that case instead of treating a transport failure as proof that the tracked
     terminal died."""
-    return terminal_session.terminal_status(
+    status = terminal_session.terminal_status(
         handle,
         workspace,
         expected_kind,
         orca_json=_orca_json,
         unavailable_errors=(WorkspaceError, subprocess.TimeoutExpired),
     )
+    if status.get("live") and expected_kind == "codex-tui" and workspace:
+        activity = _codex_tui_session_activity(workspace)
+        if activity and activity > (status.get("last_activity") or 0):
+            status = {**status, "last_activity": activity}
+    return status
 
 
 def terminal_live(handle: str, workspace: str | None = None,
@@ -451,6 +458,54 @@ def terminal_live(handle: str, workspace: str | None = None,
 
 def _terminal_belongs_to_workspace(term: dict, workspace: str) -> bool:
     return terminal_session.belongs_to_workspace(term, workspace)
+
+
+def _codex_session_cwd(path: Path) -> str | None:
+    """Cwd from a Codex session jsonl's session_meta line, or None when unreadable."""
+    try:
+        with path.open(encoding="utf-8") as f:
+            for i, line in enumerate(f):
+                if i >= 20:
+                    return None
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if rec.get("type") != "session_meta":
+                    continue
+                payload = rec.get("payload") or {}
+                return payload.get("cwd") or rec.get("cwd")
+    except OSError:
+        return None
+    return None
+
+
+def _codex_tui_session_activity(workspace: str) -> float | None:
+    """Latest mtime for a Codex session whose metadata points at `workspace`.
+
+    Codex TUI paints in an alternate screen, so Orca's terminal lastOutputAt can stay stale while
+    the head is reasoning and writing rollout JSONL. The session file is only used as an activity
+    supplement after the tracked terminal handle has already been proven live and Codex-shaped.
+    """
+    sessions = CODEX_SESSIONS
+    if not sessions.is_dir():
+        return None
+    want = str(Path(workspace).resolve(strict=False))
+    latest = None
+    try:
+        files = sessions.rglob("*.jsonl")
+        for path in files:
+            if _codex_session_cwd(path) != want:
+                continue
+            try:
+                mtime = path.stat().st_mtime
+            except OSError:
+                continue
+            if latest is None or mtime > latest:
+                latest = mtime
+    except OSError:
+        return latest
+    return latest
 
 
 def terminal_activity(handle: str, workspace: str) -> float | None:
