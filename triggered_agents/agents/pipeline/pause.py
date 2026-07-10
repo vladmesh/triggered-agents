@@ -113,9 +113,10 @@ def _on_resume(mode: str | None, stopped_worker: list[str], stopped_reviewer: li
         reviewers = len(stopped_reviewer)
         excluded = len(excluded_worker or [])
         return (
-            f"resume clears freeze, parks {workers} stopped worker head(s), relaunches "
-            f"{reviewers} stopped reviewer head(s) in existing workspaces, and resets watchdog "
-            f"clocks; {excluded} explicitly excluded In-progress worker head(s) keep their "
+            f"resume clears freeze, relaunches {workers} stopped worker head(s) and "
+            f"{reviewers} stopped reviewer head(s) in existing workspaces, parks Validate-only "
+            f"workers for rework return, and resets watchdog clocks; {excluded} explicitly "
+            "excluded In-progress worker head(s) keep their "
             "existing terminal"
         )
     if mode == "soft":
@@ -147,8 +148,8 @@ def hard_pause_auto_resume_status(state: dict, *, now: datetime | None = None) -
     Only automation-owned freeze pauses auto-resume. Human or unknown actors may hold a freeze for
     as long as needed, so a long maintenance window does not get lifted without the person who set
     it noticing. The dispatcher calls this from precheck and tick before the ordinary hard-paused
-    skip, then uses its normal resume() path to park workers, relaunch reviewers and reset
-    watchdog clocks.
+    skip, then uses its normal resume() path to relaunch stopped In-progress workers, relaunch
+    reviewers, park Validate-only workers for future rework return and reset watchdog clocks.
     """
     ttl = max(0, int(HARD_PAUSE_AUTO_RESUME_TTL_SECONDS))
     out = {
