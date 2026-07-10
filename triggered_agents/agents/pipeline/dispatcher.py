@@ -133,6 +133,10 @@ def _load_cards() -> dict:
         return {}
 
 
+def _current_head(card: dict, rec: dict) -> str:
+    return rec.get("head") or card.get("head") or heads.DEFAULT_PROFILE
+
+
 def _auto_resume_stale_hard_pause(state: dict, *, source: str) -> dict:
     decision = pause_flag.hard_pause_auto_resume_status(state)
     if not decision.get("eligible"):
@@ -398,8 +402,14 @@ def _advance(records: dict, statuses: dict[str, str]) -> bool:
             changed = True
         else:
             handle = rec.get("handle", "")
+            current_head = _current_head(card, rec)
             status = worker.terminal_status(handle, rec.get("workspace"), rec.get("terminal_kind"))
             if status.get("known") and not status.get("live"):
+                resource = health.resource_of(current_head)
+                if resource and statuses.get(resource) == health.RED:
+                    rec["last_activity"] = time.time()
+                    changed = True
+                    continue
                 elapsed = time.time() - rec.get("last_activity", rec.get("claimed_at", time.time()))
                 _watchdog_retry(ref, card, rec, statuses, elapsed,
                                 trigger=WATCHDOG_TRIGGER_DEAD_HANDLE,
@@ -412,7 +422,7 @@ def _advance(records: dict, statuses: dict[str, str]) -> bool:
             if last:
                 rec["last_activity"] = last
                 changed = True
-            resource = health.resource_of(rec["head"]) if rec.get("head") else None
+            resource = health.resource_of(current_head)
             if resource and statuses.get(resource) == health.RED:
                 rec["last_activity"] = time.time()
                 changed = True
@@ -501,7 +511,7 @@ def _watchdog_retry(ref: str, card: dict, rec: dict, statuses: dict[str, str], s
     # record adopted by _reconcile after a lost cards.json has no such key; the card's own board
     # metadata (kept current by every switch via set_retry_state) is the next best source, so a
     # redeploy losing local state still resumes on the right head instead of silently defaulting.
-    current_head = rec.get("head") or card.get("head") or heads.DEFAULT_PROFILE
+    current_head = _current_head(card, rec)
     meta = ops.get_metadata(ref)
     retry_same = int(meta.get(model.META_RETRY_SAME) or 0)
     retry_switch = int(meta.get(model.META_RETRY_SWITCH) or 0)

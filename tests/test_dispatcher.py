@@ -1242,6 +1242,31 @@ class HeadHealthTest(_DispatcherBase):
         self.assertEqual(self._column(ref), model.IN_PROGRESS)   # frozen, not Blocked
         self.assertEqual(self.worker.torn_down, [])
 
+    def test_dead_worker_handle_frozen_while_head_resource_is_red(self):
+        ref = self._claim_one(head="claude-opus")   # real registry: resource claude-sub
+        rec = dispatcher._load_cards()[ref]
+        ops.set_retry_state(ref, retry_same=1, retry_switch=1, retry_heads="claude-opus")
+        self.worker.dead_handles.add(rec["handle"])
+        self.statuses["claude-sub"] = "red"
+        before = rec["last_activity"]
+
+        dispatcher.tick()
+
+        rec_after = dispatcher._load_cards()[ref]
+        self.assertEqual(self._column(ref), model.IN_PROGRESS)
+        self.assertEqual(self.worker.torn_down, [])
+        self.assertEqual(ops.show_card(ref)["metadata"][model.META_RETRY_SAME], "1")
+        self.assertGreaterEqual(rec_after["last_activity"], before)
+        self.assertFalse(any(r.get("reference") == ref and r.get("reason") == "watchdog"
+                             for r in self._runs()))
+
+        self.statuses["claude-sub"] = "green"
+        dispatcher.tick()
+        self.assertEqual(self._column(ref), "Blocked")
+        self.assertTrue(any(r.get("reference") == ref and r.get("reason") == "watchdog"
+                            and r.get("trigger") == dispatcher.WATCHDOG_TRIGGER_DEAD_HANDLE
+                            for r in self._runs()))
+
     def test_watchdog_resumes_once_resource_goes_green_again(self):
         ref = self._claim_one(head="claude-opus")
         dispatcher.WATCHDOG_SECONDS = -1
