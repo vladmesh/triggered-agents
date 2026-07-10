@@ -5,6 +5,7 @@ registry cases), no orca, no network.
 from __future__ import annotations
 
 import os
+import shlex
 import sys
 import tempfile
 import unittest
@@ -161,14 +162,16 @@ class RenderCodexTest(unittest.TestCase):
         self.assertIn("CODEX_HOME=/tmp/throwaway-home codex exec", cmd)
 
     def test_render_launch_keeps_codex_exec_as_default(self):
-        launch = heads.render_launch("codex", role="worker", prompt="ping", registry=self.reg)
+        launch = heads.render_launch("codex", role="worker", prompt="ping",
+                                     workspace="/ws/fresh", registry=self.reg)
         self.assertIn("codex exec", launch.command)
+        self.assertNotIn("trust_level", launch.command)
         self.assertIsNone(launch.initial_prompt)
         self.assertIsNone(launch.terminal_kind)
 
     def test_render_launch_codex_tui_splits_command_from_prompt(self):
         launch = heads.render_launch("codex-extra-tui", role="worker", prompt="ping",
-                                     registry=self.reg)
+                                     workspace="/ws/fresh", registry=self.reg)
         self.assertTrue(launch.command.startswith(f"BOARD_ROLE=worker CODEX_HOME={heads.CODEX_HOME} codex "))
         self.assertNotIn("codex exec", launch.command)
         self.assertNotIn(repr("ping"), launch.command)
@@ -176,13 +179,25 @@ class RenderCodexTest(unittest.TestCase):
         self.assertNotIn("--skip-git-repo-check", launch.command)
         self.assertIn("-m gpt-5.5", launch.command)
         self.assertIn("model_reasoning_effort=\"xhigh\"", launch.command)
+        self.assertIn("'projects.\"/ws/fresh\".trust_level=\"trusted\"'", launch.command)
         self.assertEqual(launch.initial_prompt, "ping")
         self.assertEqual(launch.terminal_kind, "codex-tui")
 
+    def test_render_launch_codex_tui_quotes_workspace_trust_override(self):
+        launch = heads.render_launch("codex-tui", role="worker", prompt="ping",
+                                     workspace="/tmp/work dir/that's \"quoted\"",
+                                     registry=self.reg)
+        parts = shlex.split(launch.command)
+        conf = parts[parts.index("-c") + 1]
+        self.assertEqual(conf,
+                         "projects.\"/tmp/work dir/that's \\\"quoted\\\"\".trust_level=\"trusted\"")
+
     def test_codex_tui_feature_flag_can_enable_existing_profile(self):
         with mock.patch.dict(os.environ, {"TA_CODEX_MODE": "tui"}, clear=False):
-            launch = heads.render_launch("codex", role="worker", prompt="ping", registry=self.reg)
+            launch = heads.render_launch("codex", role="worker", prompt="ping",
+                                         workspace="/ws/fresh", registry=self.reg)
         self.assertNotIn("codex exec", launch.command)
+        self.assertIn("'projects.\"/ws/fresh\".trust_level=\"trusted\"'", launch.command)
         self.assertEqual(launch.initial_prompt, "ping")
         self.assertEqual(launch.terminal_kind, "codex-tui")
 

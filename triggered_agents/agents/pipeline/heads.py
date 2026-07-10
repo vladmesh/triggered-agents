@@ -12,6 +12,7 @@ Kanboard, no orca, no subprocess.
 """
 from __future__ import annotations
 
+import json
 import os
 import shlex
 import tomllib
@@ -99,11 +100,17 @@ def _render_codex(profile: dict, *, prompt: str) -> str:
             f"--skip-git-repo-check{model_flag}{effort_flag} {prompt!r}")
 
 
-def _render_codex_tui(profile: dict) -> str:
+def _toml_basic_string(value: str) -> str:
+    return json.dumps(value)
+
+
+def _render_codex_tui(profile: dict, *, workspace: str | None = None) -> str:
     """Interactive Codex TUI command. The prompt is sent after Orca reports `tui-idle`.
 
     `--skip-git-repo-check` is an `exec`-only flag in Codex 0.143; the top-level TUI rejects it.
     Pipeline worker/reviewer workspaces are git worktrees already, so the TUI path does not need it.
+    The per-workspace trust override only skips Codex' directory-trust dialog. The head already
+    runs with `--dangerously-bypass-approvals-and-sandbox`, so this does not grant extra rights.
     """
     home = profile.get("codex_home") or CODEX_HOME
     model = profile.get("model")
@@ -112,8 +119,13 @@ def _render_codex_tui(profile: dict) -> str:
     effort_flag = ""
     if effort:
         effort_flag = " -c " + shlex.quote(f'model_reasoning_effort="{effort}"')
+    trust_flag = ""
+    if workspace:
+        workspace_path = str(Path(workspace).resolve(strict=False))
+        key = f"projects.{_toml_basic_string(workspace_path)}.trust_level=\"trusted\""
+        trust_flag = " -c " + shlex.quote(key)
     return (f"CODEX_HOME={home} codex --dangerously-bypass-approvals-and-sandbox"
-            f"{model_flag}{effort_flag}")
+            f"{model_flag}{effort_flag}{trust_flag}")
 
 
 def _env_codex_mode() -> str | None:
@@ -221,7 +233,7 @@ def render_command(profile_id: str, *, role: str, prompt: str, registry: Registr
     return f"BOARD_ROLE={role} {render(profile, prompt=prompt)}"
 
 
-def render_launch(profile_id: str, *, role: str, prompt: str,
+def render_launch(profile_id: str, *, role: str, prompt: str, workspace: str | None = None,
                   registry: Registry | None = None) -> LaunchSpec:
     """Launch contract for worker/reviewer terminals.
 
@@ -233,7 +245,7 @@ def render_launch(profile_id: str, *, role: str, prompt: str,
     profile = reg.profile(profile_id)
     if profile["adapter"] == "codex" and _codex_launch_mode(profile) == "tui":
         return LaunchSpec(
-            command=f"BOARD_ROLE={role} {_render_codex_tui(profile)}",
+            command=f"BOARD_ROLE={role} {_render_codex_tui(profile, workspace=workspace)}",
             initial_prompt=prompt,
             terminal_kind="codex-tui",
         )

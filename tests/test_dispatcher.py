@@ -3683,6 +3683,8 @@ class WorkerHostCallsTest(unittest.TestCase):
         self.assertNotIn("codex exec", calls[create_i][calls[create_i].index("--command") + 1])
         self.assertNotIn("--skip-git-repo-check",
                          calls[create_i][calls[create_i].index("--command") + 1])
+        self.assertIn("'projects.\"/ws/fresh\".trust_level=\"trusted\"'",
+                      calls[create_i][calls[create_i].index("--command") + 1])
 
     def test_launch_worker_codex_exec_does_not_send_post_start_prompt(self):
         self.worker.launch_worker("/ws/fresh", "codex", "worker-1", "worker A-1: title")

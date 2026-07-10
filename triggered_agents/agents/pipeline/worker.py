@@ -489,8 +489,9 @@ def _worker_prompt() -> str:
     )
 
 
-def _launch_spec(head: str | None) -> heads.LaunchSpec:
-    return heads.render_launch(head or heads.DEFAULT_PROFILE, role="worker", prompt=_worker_prompt())
+def _launch_spec(head: str | None, workspace: str) -> heads.LaunchSpec:
+    return heads.render_launch(head or heads.DEFAULT_PROFILE, role="worker", prompt=_worker_prompt(),
+                               workspace=workspace)
 
 
 def terminal_kind(head: str | None) -> str | None:
@@ -587,7 +588,7 @@ def launch_worker(workspace: str, head: str | None, worker_id: str, title: str) 
     Claude Code overwrites it once the head starts working."""
     ensure_trust(workspace)
     ensure_theme()
-    return _create_head_terminal(workspace, title, _launch_spec(head))
+    return _create_head_terminal(workspace, title, _launch_spec(head, workspace))
 
 
 def _reviewer_prompt() -> str:
@@ -599,8 +600,9 @@ def _reviewer_prompt() -> str:
     )
 
 
-def _reviewer_launch_spec(head: str | None = None) -> heads.LaunchSpec:
-    return heads.render_launch(head or REVIEWER_HEAD, role="reviewer", prompt=_reviewer_prompt())
+def _reviewer_launch_spec(head: str | None = None, workspace: str | None = None) -> heads.LaunchSpec:
+    return heads.render_launch(head or REVIEWER_HEAD, role="reviewer", prompt=_reviewer_prompt(),
+                               workspace=workspace)
 
 
 def reviewer_terminal_kind(head: str | None = None) -> str | None:
@@ -627,7 +629,7 @@ def spawn_reviewer(project: str, worker_id: str, base_branch: str, review_md: st
         _write_excluded(ws, "REVIEW.md", review_md)
         ensure_trust(ws)
         ensure_theme()
-        handle = _create_head_terminal(ws, title, _reviewer_launch_spec(review_head))
+        handle = _create_head_terminal(ws, title, _reviewer_launch_spec(review_head, ws))
     except Exception as e:
         teardown(ws)   # the worktree already exists; don't leave an orphan on a failed launch
         # Normalize to WorkspaceError so every bring-up failure (orca error/timeout, an OSError from
