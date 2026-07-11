@@ -47,6 +47,51 @@ model = "gpt-5.5"
 effort = "default"
 fallback = []
 
+# Explicit model profiles mirror the visible catalog returned by
+# `CODEX_HOME=/home/dev/.codex-pipeline codex debug models` (2026-07-12). Keep `codex` above as
+# the stable default/compatibility id for GPT-5.5; these entries only add per-card choices.
+[profiles.codex-sol]
+resource = "openai-sub"
+adapter = "codex"
+model = "gpt-5.6-sol"
+effort = "default"
+fallback = []
+
+[profiles.codex-terra]
+resource = "openai-sub"
+adapter = "codex"
+model = "gpt-5.6-terra"
+effort = "default"
+fallback = []
+
+[profiles.codex-luna]
+resource = "openai-sub"
+adapter = "codex"
+model = "gpt-5.6-luna"
+effort = "default"
+fallback = []
+
+[profiles.codex-5-4]
+resource = "openai-sub"
+adapter = "codex"
+model = "gpt-5.4"
+effort = "default"
+fallback = []
+
+[profiles.codex-mini]
+resource = "openai-sub"
+adapter = "codex"
+model = "gpt-5.4-mini"
+effort = "default"
+fallback = []
+
+[profiles.codex-spark]
+resource = "openai-sub"
+adapter = "codex"
+model = "gpt-5.3-codex-spark"
+effort = "default"
+fallback = []
+
 [profiles.codex-high]
 # Same model, explicit high reasoning for harder implementation/debug cards.
 resource = "openai-sub"
