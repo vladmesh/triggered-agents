@@ -74,7 +74,14 @@ def relaunch_worker_after_resume(ref: str, card: dict, rec: dict, refresh_worker
                                  reason: str) -> str:
     """Start a fresh worker terminal in the existing workspace after a freeze stopped the old one.
     TASK.md is rewritten from the card's current journal first, so a verdict or operator comment
-    posted during the pause is part of the prompt the relaunched worker reads."""
+    posted during the pause is part of the prompt the relaunched worker reads.
+
+    Only the launch itself may raise "relaunch failed" out of here. The moment worker.launch_worker
+    returns a handle, that terminal is live, so the handle and reset state are recorded before any
+    board write, and the courtesy card comment plus the success log are best-effort — a Kanboard
+    hiccup there must never propagate as a failure, or the caller's failure branch would wipe the
+    handle of an already-running head and let the next tick's dead-handle watchdog tear down a
+    workspace that has a fresh worker in it (PR #85 review B1)."""
     workspace = rec.get("workspace")
     if not workspace:
         raise RuntimeError("worker workspace is missing")
@@ -92,11 +99,17 @@ def relaunch_worker_after_resume(ref: str, card: dict, rec: dict, refresh_worker
     rec.pop("parked_worker", None)
     rec.pop("park_notice_logged", None)
     rec.pop("unpark_fails", None)
-    ops.add_comment(
-        "dispatcher", ref,
-        f"терминал остановлен паузой, перезапущен. Воркспейс {workspace}, причина: {reason}.")
-    STATE.log_run("relaunch-after-resume", reference=ref, result="relaunched",
-                  reason=reason, workspace=workspace, handle=handle)
+    try:
+        ops.add_comment(
+            "dispatcher", ref,
+            f"терминал остановлен паузой, перезапущен. Воркспейс {workspace}, причина: {reason}.")
+        STATE.log_run("relaunch-after-resume", reference=ref, result="relaunched",
+                      reason=reason, workspace=workspace, handle=handle)
+    except Exception as e:  # noqa: BLE001 — head is already live and recorded; a failed courtesy
+        # comment/log must not roll the relaunch back into a lost-handle watchdog teardown.
+        STATE.log_run("relaunch-after-resume", reference=ref, result="relaunched-comment-failed",
+                      reason=reason, workspace=workspace, handle=handle, level="warn",
+                      error=worker.scrub_secrets(str(e)))
     return handle
 
 

@@ -3753,6 +3753,41 @@ class PipelinePauseTest(_DispatcherBase):
         runs = [r for r in self._runs() if r["event"] == "resume"]
         self.assertIn(f"{ref}:worker:blocked", runs[-1]["moved"])
 
+    def test_hard_resume_keeps_the_handle_when_the_relaunch_comment_fails(self):
+        # review blocker B1 (round 2): a Kanboard failure on the "перезапущен" comment lands AFTER
+        # launch_worker already started a fresh head. It must not be misread as a launch failure and
+        # wipe the handle — otherwise the next tick's dead-handle watchdog tears down a workspace
+        # that has a live worker in it.
+        ref = self._claim_one(head="claude-opus")
+        ws = dispatcher._load_cards()[ref]["workspace"]
+        self._pause("hard")
+        launched_before = len(self.worker.launched)
+
+        real_add_comment = ops.add_comment
+
+        def flaky_add_comment(role, reference, text, **kw):
+            if "перезапущен" in text:
+                raise RuntimeError("kanboard comment down after launch")
+            return real_add_comment(role, reference, text, **kw)
+
+        with mock.patch.object(ops, "add_comment", flaky_add_comment):
+            dispatcher.resume()
+
+        rec = dispatcher._load_cards()[ref]
+        self.assertEqual(len(self.worker.launched[launched_before:]), 1)   # head did start
+        self.assertNotEqual(rec["handle"], "")                             # and its handle survived
+        self.assertFalse(rec.get("parked_worker"))
+        self.assertEqual(self._column(ref), model.IN_PROGRESS)
+        runs = [r for r in self._runs() if r["event"] == "relaunch-after-resume"]
+        self.assertTrue(any(r.get("reference") == ref
+                            and r.get("result") == "relaunched-comment-failed" for r in runs))
+
+        # The next tick must NOT tear the fresh worker's workspace down as a dead handle.
+        self.worker.torn_down.clear()
+        dispatcher.tick()
+        self.assertEqual(self._column(ref), model.IN_PROGRESS)
+        self.assertNotIn(ws, self.worker.torn_down)
+
     def test_hard_resume_relaunches_the_reviewer_in_the_same_workspace(self):
         ref = self._to_validate_with_reviewer()
         review_ws = dispatcher._load_cards()[ref]["review_ws"]
