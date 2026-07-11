@@ -289,6 +289,11 @@ class TestCreate(PatchedBoardTest):
         out = ops.create_card("personal_site", "code", "T", review_head="claude-opus")
         self.assertEqual(board.metadata[out["id"]][model.META_REVIEW_HEAD], "claude-opus")
 
+    def test_review_head_none_is_stored_in_metadata(self):
+        board = self.make_board()
+        out = ops.create_card("personal_site", "code", "T", review_head=model.NO_REVIEW_HEAD)
+        self.assertEqual(board.metadata[out["id"]][model.META_REVIEW_HEAD], model.NO_REVIEW_HEAD)
+
     def test_unknown_head_raises_and_creates_nothing(self):
         board = self.make_board()
         with self.assertRaises(model.GuardError):
@@ -457,6 +462,20 @@ class TestUpdate(PatchedBoardTest):
         self.assertEqual(out["review_head"], "")
         self.assertEqual(board.metadata[tid][model.META_REVIEW_HEAD], "")
 
+    def test_review_head_none_is_stored_and_clearable(self):
+        board = self.make_board()
+        ref = board.add_task("A", "Ready", meta={model.META_TASK_TYPE: "code",
+                                                 model.META_PROJECT: "personal_site"})
+        out = ops.update_card("po", ref, review_head=model.NO_REVIEW_HEAD)
+        self.assertEqual(out["review_head"], model.NO_REVIEW_HEAD)
+        self.assertEqual(out["base_branch"], "")
+        tid = next(t["id"] for t in board.tasks.values() if t["reference"] == ref)
+        self.assertEqual(board.metadata[tid][model.META_REVIEW_HEAD], model.NO_REVIEW_HEAD)
+        out = ops.update_card("po", ref, review_head="")
+        self.assertEqual(out["review_head"], "")
+        self.assertEqual(board.metadata[tid][model.META_REVIEW_HEAD], "")
+
+
     def test_unknown_review_head_raises_and_writes_nothing(self):
         board = self.make_board()
         ref = board.add_task("A", "Ready", meta={model.META_TASK_TYPE: "code",
@@ -554,6 +573,16 @@ class TestCliUpdate(PatchedBoardTest):
         self.assertEqual(rc, 3)
         self.assertEqual(board.method_calls("saveTaskMetadata"), [])
 
+    def test_worker_and_reviewer_cannot_set_no_review(self):
+        for role in ("worker", "reviewer"):
+            board = self.make_board()
+            ref = board.add_task("A", "Ready", meta={model.META_TASK_TYPE: "code",
+                                                     model.META_PROJECT: "personal_site"})
+            rc = self.cli.main(["--role", role, "update", "--ref", ref,
+                               "--review-head", model.NO_REVIEW_HEAD])
+            self.assertEqual(rc, 3)
+            self.assertEqual(board.method_calls("saveTaskMetadata"), [])
+
     def test_po_update_base_branch_ok(self):
         board = self.make_board()
         ref = board.add_task("A", "Ready", meta={model.META_TASK_TYPE: "code",
@@ -573,6 +602,16 @@ class TestCliUpdate(PatchedBoardTest):
         self.assertEqual(rc, 0)
         tid = next(t["id"] for t in board.tasks.values() if t["reference"] == ref)
         self.assertEqual(board.metadata[tid][model.META_REVIEW_HEAD], "claude-opus")
+
+    def test_po_update_review_head_none_ok(self):
+        board = self.make_board()
+        ref = board.add_task("A", "Ready", meta={model.META_TASK_TYPE: "code",
+                                                 model.META_PROJECT: "personal_site"})
+        rc = self.cli.main(["--role", "po", "update", "--ref", ref,
+                           "--review-head", model.NO_REVIEW_HEAD])
+        self.assertEqual(rc, 0)
+        tid = next(t["id"] for t in board.tasks.values() if t["reference"] == ref)
+        self.assertEqual(board.metadata[tid][model.META_REVIEW_HEAD], model.NO_REVIEW_HEAD)
 
 
 class TestCliCreateBaseBranch(PatchedBoardTest):
@@ -604,6 +643,15 @@ class TestCliCreateReviewHead(PatchedBoardTest):
         tid = next(iter(board.tasks))
         self.assertEqual(board.metadata[tid][model.META_REVIEW_HEAD], "claude-opus")
 
+    def test_po_create_with_review_head_none_ok(self):
+        board = self.make_board()
+        rc = self.cli.main(["--role", "po", "create", "--project", "personal_site",
+                           "--type", "code", "--title", "T",
+                           "--review-head", model.NO_REVIEW_HEAD])
+        self.assertEqual(rc, 0)
+        tid = next(iter(board.tasks))
+        self.assertEqual(board.metadata[tid][model.META_REVIEW_HEAD], model.NO_REVIEW_HEAD)
+
 
 class TestListShowHeads(PatchedBoardTest):
     def test_list_includes_review_head_and_defaults(self):
@@ -628,6 +676,18 @@ class TestListShowHeads(PatchedBoardTest):
         self.assertEqual(card["effective_head"], "codex")
         self.assertEqual(card["review_head"], "")
         self.assertEqual(card["effective_review_head"], worker.REVIEWER_HEAD)
+
+    def test_list_show_expose_no_review_as_effective_value(self):
+        board = self.make_board()
+        ref = board.add_task("A", "Ready", meta={model.META_TASK_TYPE: "code",
+                                                 model.META_PROJECT: "personal_site",
+                                                 model.META_REVIEW_HEAD: model.NO_REVIEW_HEAD})
+        listed = ops.list_cards(column="Ready")[0]
+        shown = ops.show_card(ref)
+        self.assertEqual(listed["review_head"], model.NO_REVIEW_HEAD)
+        self.assertEqual(listed["effective_review_head"], model.NO_REVIEW_HEAD)
+        self.assertEqual(shown["review_head"], model.NO_REVIEW_HEAD)
+        self.assertEqual(shown["effective_review_head"], model.NO_REVIEW_HEAD)
 
 
 class TestClaim(PatchedBoardTest):
@@ -655,6 +715,13 @@ class TestClaim(PatchedBoardTest):
         ref = board.add_task("A", "Ready", meta={model.META_TASK_TYPE: "code",
                                                  model.META_PROJECT: "personal_site",
                                                  model.META_REVIEW_HEAD: "claude-opus"})
+        ops.claim_card(ref, "w1")  # must not raise
+
+    def test_no_review_claims_fine(self):
+        board = self.make_board()
+        ref = board.add_task("A", "Ready", meta={model.META_TASK_TYPE: "code",
+                                                 model.META_PROJECT: "personal_site",
+                                                 model.META_REVIEW_HEAD: model.NO_REVIEW_HEAD})
         ops.claim_card(ref, "w1")  # must not raise
 
     def test_refuses_unknown_head_with_clear_message(self):

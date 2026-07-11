@@ -118,7 +118,9 @@ def _build_parser() -> argparse.ArgumentParser:
     p_create.add_argument("--column", default="Идеи")
     p_create.add_argument("--blocked-by", dest="blocked_by")
     p_create.add_argument("--head", dest="head")
-    p_create.add_argument("--review-head", dest="review_head")
+    p_create.add_argument(
+        "--review-head", dest="review_head",
+        help="reviewer profile for Validate layer 3; reserved value 'none' skips only layer 3")
     p_create.add_argument("--slug")
     p_create.add_argument("--base-branch", dest="base_branch")
     p_create.add_argument("--description")
@@ -129,7 +131,9 @@ def _build_parser() -> argparse.ArgumentParser:
     p_update.add_argument("--ref", required=True)
     p_update.add_argument("--blocked-by", dest="blocked_by")
     p_update.add_argument("--head", dest="head")
-    p_update.add_argument("--review-head", dest="review_head")
+    p_update.add_argument(
+        "--review-head", dest="review_head",
+        help="reviewer profile, 'none' to skip layer 3, or empty string to restore the default")
     p_update.add_argument("--slug")
     p_update.add_argument("--base-branch", dest="base_branch")
 

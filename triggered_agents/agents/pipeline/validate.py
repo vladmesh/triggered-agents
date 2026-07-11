@@ -657,6 +657,10 @@ def _card_review_head(card: dict) -> str:
     return card.get("review_head") or worker.REVIEWER_HEAD
 
 
+def _no_review(card: dict) -> bool:
+    return (card.get("review_head") or "") == model.NO_REVIEW_HEAD
+
+
 def clear_review(rec: dict) -> None:
     """Drop the reviewer bookkeeping and tear down its throwaway worktree. The lifetime return
     count (review_returns) is deliberately kept — it caps returns across the whole card life."""
@@ -669,6 +673,7 @@ def clear_review(rec: dict) -> None:
     rec.pop("review_spawn_fails", None)
     rec.pop("automerge_done", None)
     rec.pop("review_green_logged", None)
+    rec.pop("no_review_logged", None)
     if ws:
         worker.teardown(ws)
 
@@ -698,8 +703,11 @@ def _review_gate(ref: str, pr: str | None, card: dict, records: dict, view: dict
     if rec is None:
         # An untracked Validate card (manual move / adopted without a record): a reviewer head needs
         # a record to be tracked, so skip rather than spawn one we can't watchdog or tear down.
+        # No-review still needs the same record for automerge idempotency and worker teardown.
         STATE.log_run("review", reference=ref, result="untracked", level="warn", pr=pr)
         return False
+    if _no_review(card):
+        return _review_skipped_by_po(ref, pr, card, is_stand, rec, records, contrib)
     if "review_baseline" not in rec:
         return _spawn_reviewer(ref, pr, card, rec, records, save_cards, statuses, contrib)
     verdict = _review_verdict(view, int(rec["review_baseline"]))
@@ -708,6 +716,25 @@ def _review_gate(ref: str, pr: str | None, card: dict, records: dict, view: dict
     if verdict == "green":
         return _review_green(ref, pr, card, is_stand, rec, records, contrib)
     return _review_red(ref, pr, card, rec, records, save_cards, refresh_worker_task, contrib)
+
+
+def _review_skipped_by_po(ref: str, pr: str | None, card: dict, is_stand: bool, rec: dict,
+                          records: dict, contrib: tuple[str, str] | None = None) -> bool:
+    """PO set review_head=none: lower layers are already green, so skip only layer 3."""
+    changed = False
+    if not rec.get("no_review_logged"):
+        label = pr if pr else f"ветке `{contrib[0]}` @ `{contrib[1]}`"
+        ops.add_comment(
+            "dispatcher", ref,
+            f"PO отключил LLM-review для этой карточки (`review_head=none`). Нижние слои "
+            f"валидации зелёные; слой 3 пропущен по {label}.",
+            marker=model.MARKER_REVIEW_SKIPPED)
+        rec["no_review_logged"] = True
+        STATE.log_run("review", reference=ref, result="skipped-by-po", pr=pr,
+                      review_head=model.NO_REVIEW_HEAD)
+        changed = True
+    return _review_green(ref, pr, card, is_stand, rec, records, contrib,
+                         review_skipped=True) or changed
 
 
 def _spawn_reviewer(ref: str, pr: str | None, card: dict, rec: dict, records: dict, save_cards,
@@ -861,7 +888,8 @@ def _review_watchdog_block(ref: str, rec: dict, records: dict, ws: str | None, e
     return True
 
 
-def _review_green_contrib(ref: str, rec: dict, records: dict) -> bool:
+def _review_green_contrib(ref: str, rec: dict, records: dict,
+                          review_skipped: bool = False) -> bool:
     """Contrib card, green verdict: there is no PR to wait on in this pipeline — a human opens the
     upstream PR from the pushed branch afterward (out of scope). All three layers are clear, so
     the card goes straight to Done, mirroring the merged-PR terminal in _validate_card: worker
@@ -871,12 +899,14 @@ def _review_green_contrib(ref: str, rec: dict, records: dict) -> bool:
     records.pop(ref, None)
     if ws:
         worker.teardown(ws)
-    STATE.log_run("review", reference=ref, to="Done", reason="contrib-green")
+    reason = "contrib-no-review" if review_skipped else "contrib-green"
+    STATE.log_run("review", reference=ref, to="Done", reason=reason)
     return True
 
 
 def _review_green(ref: str, pr: str | None, card: dict, is_stand: bool, rec: dict, records: dict,
-                  contrib: tuple[str, str] | None = None) -> bool:
+                  contrib: tuple[str, str] | None = None,
+                  review_skipped: bool = False) -> bool:
     """Green verdict: all three layers clear. Tear the reviewer worktree down once. A contrib card
     (`contrib` set) has nothing left to wait for — straight to Done (_review_green_contrib).
 
@@ -908,12 +938,13 @@ def _review_green(ref: str, pr: str | None, card: dict, is_stand: bool, rec: dic
         rec["review_ws"] = ""
         changed = True
     if contrib is not None:
-        return _review_green_contrib(ref, rec, records) or changed
+        return _review_green_contrib(ref, rec, records, review_skipped) or changed
     if not _automerge_enabled():
         if rec.get("review_green_logged"):
             return changed
         rec["review_green_logged"] = True
-        STATE.log_run("review", reference=ref, result="green")
+        result = "no-review-green" if review_skipped else "green"
+        STATE.log_run("review", reference=ref, result=result)
         return True
     if rec.get("automerge_done"):
         return changed
@@ -933,11 +964,15 @@ def _review_green(ref: str, pr: str | None, card: dict, is_stand: bool, rec: dic
     rec["automerge_done"] = True
     result = worker.merge_pr(pr)
     if result["ok"]:
-        layers = "CI, стенд, ревью" if is_stand else "CI, ревью"
+        if review_skipped:
+            layers = "CI, стенд, LLM-review отключён PO" if is_stand else "CI, LLM-review отключён PO"
+        else:
+            layers = "CI, стенд, ревью" if is_stand else "CI, ревью"
         ops.add_comment("dispatcher", ref,
                         f"Все слои валидации зелёные ({layers}) — автомерж {pr}.",
                         marker=model.MARKER_AUTOMERGE)
-        STATE.log_run("review", reference=ref, result="green-automerge", pr=pr)
+        log_result = "no-review-automerge" if review_skipped else "green-automerge"
+        STATE.log_run("review", reference=ref, result=log_result, pr=pr)
         return True
     scrubbed = worker.scrub_secrets(result.get("error") or "(без деталей)")
     ops.add_comment("dispatcher", ref,

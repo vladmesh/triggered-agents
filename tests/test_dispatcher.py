@@ -1466,6 +1466,12 @@ class TaskMdHistoryTest(_DispatcherBase):
         self.assertIn("слаг: my-slug", content)
         self.assertIn(f"blocked_by: {pred}", content)
 
+    def test_task_md_shows_no_review_as_explicit_metadata(self):
+        self._ready_card("B", meta={model.META_REVIEW_HEAD: model.NO_REVIEW_HEAD})
+        dispatcher.tick()
+        (_, content), = self.worker.tasks_written
+        self.assertIn("голова reviewer: none", content)
+
     def test_history_present_triggers_fetch_dont_recreate_warning(self):
         ref = self._ready_card("A")
         self._seed_comment(ref, f"[{model.MARKER_REPORT_BLOCKED}]\nold blocker", 100)
@@ -2355,6 +2361,78 @@ class ValidateReviewTest(_DispatcherBase):
         self.assertEqual(self.worker.reviewer_heads, [worker.REVIEWER_HEAD])
         self.assertEqual(rec["review_head"], worker.REVIEWER_HEAD)
 
+    def test_no_review_skips_layer3_and_automerges_after_green_ci(self):
+        ref = self._to_validate(review_head=model.NO_REVIEW_HEAD)
+        self._ci_green()
+
+        dispatcher.tick()
+
+        self.assertEqual(self.worker.reviewer_spawns, [])
+        self.assertEqual(self.worker.merged, [self.PR])
+        self.assertEqual(self._column(ref), "Validate")
+        journal = self._markers(ref)
+        self.assertIn(f"[{model.MARKER_REVIEW_SKIPPED}]", journal)
+        self.assertIn("review_head=none", journal)
+        self.assertTrue(any(r["event"] == "review" and r.get("result") == "skipped-by-po"
+                            and r.get("review_head") == model.NO_REVIEW_HEAD for r in self._runs()))
+        self.assertTrue(any(r["event"] == "review" and r.get("result") == "no-review-automerge"
+                            for r in self._runs()))
+
+    def test_research_no_review_with_pr_uses_same_merge_flow(self):
+        ref = self._claim_one(ttype="research", meta={model.META_REVIEW_HEAD: model.NO_REVIEW_HEAD})
+        ops.report(ref, "done", f"отчёт docs/result.md\nPR: {self.PR}")
+        self.worker.pr_status = None
+        dispatcher.tick()
+        self.assertEqual(self._column(ref), "Validate")
+        self._ci_green()
+
+        dispatcher.tick()
+
+        self.assertEqual(self.worker.reviewer_spawns, [])
+        self.assertEqual(self.worker.merged, [self.PR])
+        self.assertIn(f"[{model.MARKER_REVIEW_SKIPPED}]", self._markers(ref))
+
+    def test_no_review_does_not_turn_red_ci_green(self):
+        ref = self._to_validate(review_head=model.NO_REVIEW_HEAD)
+        self.worker.pr_status = {"merged": False, "state": "OPEN", "rollup": "FAILURE",
+                                 "failed_job": "CI", "failed_log": "boom"}
+
+        dispatcher.tick()
+
+        self.assertEqual(self._column(ref), model.IN_PROGRESS)
+        self.assertEqual(self.worker.reviewer_spawns, [])
+        self.assertEqual(self.worker.merged, [])
+        self.assertIn("CI красный", self._markers(ref))
+
+    def test_no_review_reentry_after_rework_still_skips_reviewer(self):
+        ref = self._to_validate(review_head=model.NO_REVIEW_HEAD)
+        self.worker.pr_status = {"merged": False, "state": "OPEN", "rollup": "FAILURE",
+                                 "failed_job": "CI", "failed_log": "boom"}
+        dispatcher.tick()
+        self.assertEqual(self._column(ref), model.IN_PROGRESS)
+
+        ops.report(ref, "done", "починил")
+        self.worker.pr_status = None
+        dispatcher.tick()
+        self._ci_green()
+        dispatcher.tick()
+
+        self.assertEqual(self.worker.reviewer_spawns, [])
+        self.assertEqual(self.worker.merged, [self.PR])
+        self.assertIn(f"[{model.MARKER_REVIEW_SKIPPED}]", self._markers(ref))
+
+    def test_po_update_back_to_reviewer_restores_layer3(self):
+        ref = self._to_validate(review_head=model.NO_REVIEW_HEAD)
+        ops.update_card("po", ref, review_head="claude-opus")
+        self._ci_green()
+
+        dispatcher.tick()
+
+        self.assertEqual(len(self.worker.reviewer_spawns), 1)
+        self.assertEqual(self.worker.reviewer_heads, ["claude-opus"])
+        self.assertEqual(self.worker.merged, [])
+        self.assertNotIn(f"[{model.MARKER_REVIEW_SKIPPED}]", self._markers(ref))
+
     def _automerge_off(self):
         os.environ["TA_AUTOMERGE"] = "off"
         self.addCleanup(lambda: os.environ.pop("TA_AUTOMERGE", None))
@@ -3087,6 +3165,22 @@ class ValidateContribTest(_DispatcherBase):
         self.assertEqual(pr_branch, self._branch(ref))     # naming.worker_branch(ref), no gh call
         self.assertEqual(head_sha, self.SHA)   # pinned to the reported sha, not the branch's tip
         self.assertEqual(self.worker.polled, [])
+
+    def test_no_review_goes_done_after_branch_head_check_without_reviewer(self):
+        ref = self._claim(title="A")
+        branch = self._branch(ref)
+        self.worker.remote_head_shas[branch] = self._full(self.SHA)
+        ops.update_card("po", ref, review_head=model.NO_REVIEW_HEAD)
+        ops.report(ref, "done", f"готово\nbranch: {branch}\nhead: {self.SHA}")
+
+        dispatcher.tick()
+
+        self.assertEqual(self._column(ref), "Done")
+        self.assertNotIn(ref, dispatcher._load_cards())
+        self.assertEqual(self.worker.reviewer_spawns, [])
+        self.assertIn(f"[{model.MARKER_REVIEW_SKIPPED}]", self._markers(ref))
+        self.assertTrue(any(r["event"] == "review" and r.get("reason") == "contrib-no-review"
+                            for r in self._runs()))
 
     def test_green_verdict_goes_straight_to_done_and_tears_down(self):
         ref = self._to_validate()
