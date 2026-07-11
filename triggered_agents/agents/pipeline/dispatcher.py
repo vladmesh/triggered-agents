@@ -381,9 +381,11 @@ def _advance(records: dict, statuses: dict[str, str]) -> bool:
             records.pop(ref)
             changed = True
             continue
-        worker.rename_terminal(rec.get("handle", ""), rec.get("title", ""))
-        if _try_claim_started_comment(ref, rec):
-            changed = True
+        was_parked = bool(rec.get("parked_worker"))
+        if not was_parked:
+            worker.rename_terminal(rec.get("handle", ""), rec.get("title", ""))
+            if _try_claim_started_comment(ref, rec):
+                changed = True
         verdict = _report_verdict(ref, int(rec.get("comment_baseline", 0)))
         if verdict == "done":
             ops.move_card("dispatcher", ref, "Validate")
@@ -404,6 +406,24 @@ def _advance(records: dict, statuses: dict[str, str]) -> bool:
             records.pop(ref)
             changed = True
         else:
+            if was_parked:
+                try:
+                    _relaunch_worker_after_resume(ref, card, rec, "legacy parked worker")
+                except Exception as e:  # noqa: BLE001
+                    rec["handle"] = ""
+                    rec.pop("parked_worker", None)
+                    rec["last_activity"] = time.time()
+                    ops.add_comment(
+                        "dispatcher", ref,
+                        "терминал остановлен паузой, перезапуск не удался. "
+                        "Карточка остаётся In progress под обычным watchdog; следующий tick "
+                        f"увидит пустой handle и применит retry policy. Ошибка: "
+                        f"{worker.scrub_secrets(str(e))}.")
+                    STATE.log_run("relaunch-after-resume", reference=ref, result="failed",
+                                  reason="legacy parked worker", level="warn",
+                                  error=worker.scrub_secrets(str(e)))
+                changed = True
+                continue
             handle = rec.get("handle", "")
             current_head = _current_head(card, rec)
             status = worker.terminal_status(handle, rec.get("workspace"), rec.get("terminal_kind"))
@@ -603,6 +623,32 @@ def _refresh_worker_task(card: dict, rec: dict) -> None:
     worker.write_task(workspace, _task_md(card, ops.show_card(card["reference"]), base))
 
 
+def _relaunch_worker_after_resume(ref: str, card: dict, rec: dict, reason: str) -> str:
+    workspace = rec.get("workspace")
+    if not workspace:
+        raise RuntimeError("worker workspace is missing")
+    _refresh_worker_task(card, rec)
+    title = rec.get("title") or naming.worker_title(naming.card_id(ref), card.get("title") or ref)
+    head = rec.get("head") or card.get("head")
+    handle = worker.launch_worker(workspace, head, rec.get("worker", ""), title)
+    if not handle:
+        raise RuntimeError("worker launch returned no handle")
+    rec["handle"] = handle
+    rec["title"] = title
+    rec["head"] = head
+    rec["terminal_kind"] = worker.terminal_kind(head)
+    rec["last_activity"] = time.time()
+    rec.pop("parked_worker", None)
+    rec.pop("park_notice_logged", None)
+    rec.pop("unpark_fails", None)
+    ops.add_comment(
+        "dispatcher", ref,
+        f"терминал остановлен паузой, перезапущен. Воркспейс {workspace}, причина: {reason}.")
+    STATE.log_run("relaunch-after-resume", reference=ref, result="relaunched",
+                  reason=reason, workspace=workspace, handle=handle)
+    return handle
+
+
 def _block(ref: str, reason: str, body: str, **log_fields) -> None:
     """Comment (scrubbed: provision logs / orca errors may echo env) + move to Blocked."""
     ops.add_comment("dispatcher", ref, worker.scrub_secrets(body))
@@ -760,11 +806,12 @@ def tick() -> int:
     """One dispatcher tick — see the module docstring for the per-tick order. A hard pause freezes
     this solid: reconcile/advance/validate/claim all touch a head or the board on the pipeline's
     behalf, and every head that would need touching was already stopped by pause() itself, so there
-    is nothing safe left to do until resume() relaunches them — running any of these against a
-    stopped head would either hang on a dead terminal or silently accumulate watchdog silence,
-    exactly what resume()'s clock reset exists to avoid needing in the first place. A soft pause
-    only turns off _claim_next: every claimed card keeps riding its normal cycle (advance, CI/stand,
-    layer-3 review, automerge) untouched, so Ready cards are the only thing that doesn't move."""
+    is nothing safe left to do until resume() marks stopped workers parked or relaunches their
+    reviewer. Running any of these against a stopped head would either hang on a dead terminal or
+    silently accumulate watchdog silence, exactly what resume()'s clock reset exists to avoid
+    needing in the first place. A soft pause only turns off _claim_next: every claimed card keeps
+    riding its normal cycle (advance, CI/stand, layer-3 review, automerge) untouched, so Ready
+    cards are the only thing that doesn't move."""
     _auto_resume_stale_hard_pause(pause_flag.load(), source="tick")
     with _tick_lock():
         paused = pause_flag.load()
@@ -791,19 +838,26 @@ def tick() -> int:
     return 0
 
 
+def _pause_excluded_workspaces(exclude_workspaces: list[str] | None) -> set[str]:
+    return {os.path.abspath(p) for p in (exclude_workspaces or []) if p}
+
+
 def pause(requested_mode: str, *, reason: str = pause_flag.DEFAULT_REASON,
-          actor: str = pause_flag.DEFAULT_ACTOR) -> dict:
+          actor: str = pause_flag.DEFAULT_ACTOR,
+          exclude_workspaces: list[str] | None = None) -> dict:
     """Pause the pipeline (triggered-agents-281) — the built-in replacement for the 2026-07-04
     workaround: hand-moving Ready cards to Blocked, disabling ta-pipeline.timer, killing terminals
     by hand. `soft` stops new worker claims and steward/curator/retro dispatch (runtime/dispatch.py
     checks the same flag), but every card already In progress or in Validate keeps riding its
     normal cycle untouched — advance, CI/stand, layer-3 review, automerge, all of it. `hard` also
-    stops every live worker/reviewer terminal right now (worker.stop_terminals only — it never
-    removes a worktree, so the branch/uncommitted work stays exactly as the head left it) and
-    freezes the whole tick (see tick()): nothing advances, nothing is claimed, no watchdog can fire
-    on a head that was stopped on purpose, not one that died. resume() relaunches each stopped head
-    in its own untouched workspace and gives it a fresh watchdog window, so the paused stretch never
-    reads as silence once ticking resumes.
+    stops live worker/reviewer terminals with worker.stop_terminals only — it never removes a
+    worktree, so the branch/uncommitted work stays exactly as the head left it — and freezes the
+    whole dispatcher tick (see tick()): nothing advances, nothing is claimed, no watchdog can fire
+    on a head that was stopped on purpose, not one that died. The one exception is a narrow
+    initiator exclude: callers can pass explicit workspaces that must keep running, such as the
+    backup-create worker's own workspace. resume() relaunches stopped In-progress workers in the
+    same workspace, relaunches reviewers, and gives every affected watchdog a fresh window, so the
+    paused stretch never reads as silence once ticking resumes.
 
     Idempotent: pausing again in the same mode is a no-op (still logged, so repeated calls are
     visible in runs.jsonl). Pausing in the other mode while already paused is a GuardError — resume
@@ -832,48 +886,57 @@ def pause(requested_mode: str, *, reason: str = pause_flag.DEFAULT_REASON,
                 f"{requested_mode!r}")
         stopped_worker: list[str] = []
         stopped_reviewer: list[str] = []
+        excluded_worker: list[str] = []
         if mode == "hard":
             records = _load_cards()
             by_ref = {c["reference"]: c for c in ops.list_cards()}
+            excluded_paths = _pause_excluded_workspaces(exclude_workspaces)
             for ref, rec in records.items():
                 card = by_ref.get(ref)
                 if card is None:
                     continue
-                if card["column"] in (model.IN_PROGRESS, "Validate") and rec.get("workspace"):
-                    worker.stop_terminals(rec["workspace"])
+                workspace = rec.get("workspace")
+                if card["column"] == model.IN_PROGRESS and workspace:
+                    if os.path.abspath(workspace) in excluded_paths:
+                        excluded_worker.append(ref)
+                        continue
+                    worker.stop_terminals(workspace)
+                    stopped_worker.append(ref)
+                elif card["column"] == "Validate" and workspace:
+                    # Validate workers are parked for future rework. They are not active writers
+                    # while the independent reviewer or CI polling owns the card.
+                    worker.stop_terminals(workspace)
                     stopped_worker.append(ref)
                 if card["column"] == "Validate" and rec.get("review_ws"):
                     worker.stop_terminals(rec["review_ws"])
                     stopped_reviewer.append(ref)
         pause_flag.save(mode, stopped_worker=stopped_worker,
-                        stopped_reviewer=stopped_reviewer, reason=reason, actor=actor)
+                        stopped_reviewer=stopped_reviewer, excluded_worker=excluded_worker,
+                        reason=reason, actor=actor)
         STATE.log_run("pause", mode=mode, display_mode=pause_flag.display_mode(mode),
                       action="paused", actor=actor, reason=worker.scrub_secrets(reason),
-                      stopped_worker=len(stopped_worker), stopped_reviewer=len(stopped_reviewer))
+                      stopped_worker=len(stopped_worker), stopped_reviewer=len(stopped_reviewer),
+                      excluded_worker=len(excluded_worker))
         return pause_flag.status()
 
 
 def resume() -> dict:
     """Undo pause(). Not paused at all is a no-op (still logged). A soft pause never stopped
     anything, so lifting it is just dropping the flag — the very next tick claims and ticks
-    normally again. A hard pause relaunches every stopped head that was actually WORKING, in the
-    exact same workspace with the exact same TASK.md/REVIEW.md pause() left untouched
-    (worker.launch_worker/worker.relaunch_reviewer only ever create a fresh terminal, never the
-    workspace itself), and resets its watchdog clock to now — last_activity/review_activity the
-    same way a fresh claim/spawn always does.
+    normally again. A hard pause relaunches stopped In-progress workers in their existing
+    workspaces, because Orca has no lossless terminal unpark primitive and an In-progress card must
+    not sit around forever without a live head or watchdog. Stopped reviewers are relaunched
+    immediately in their existing review workspaces, because Validate cannot finish layer 3 without
+    that independent head.
 
-    A worker stopped while its card sat In progress is relaunched exactly this way. A worker
-    stopped while its card sat in Validate is NOT: that worker was already just parked (kept alive
-    only for a CI-red nudge, see validate.py), and an independent reviewer may be reviewing this
-    exact branch right now — a fresh worker head reading TASK.md from scratch would start a new
-    turn and risk pushing commits under it, branch drift under review (triggered-agents-281
-    review). Its handle is cleared instead, so nothing mistakes it for live; validate.py relaunches
-    it lazily on the CI-red or review-red return path, only after TASK.md has been refreshed with
-    the latest card history. Either way ci_pending_since is dropped for a Validate card, so one
-    still on a non-terminal CI rollup gets a fresh CI_PENDING_STALL_SECONDS window instead of one
-    that already expired during the pause. A card pause() stopped but that no longer wants a head
-    when resume() runs (moved on, or its record vanished) is skipped rather than relaunched into a
-    state nobody is waiting on."""
+    A worker stopped while its card sat in Validate stays parked too: that worker is kept only for
+    a CI-red or review-red nudge, and an independent reviewer may be reviewing this exact branch
+    right now. validate.py relaunches it lazily on the return path, only after TASK.md has been
+    refreshed with the latest card history. Either way ci_pending_since is dropped for a Validate
+    card, so one still on a non-terminal CI rollup gets a fresh CI_PENDING_STALL_SECONDS window
+    instead of one that already expired during the pause. A card pause() stopped but that no longer
+    wants a head when resume() runs (moved on, or its record vanished) is skipped rather than
+    relaunched into a state nobody is waiting on."""
     with _admin_lock():
         state = pause_flag.load()
         if not state:
@@ -884,7 +947,16 @@ def resume() -> dict:
             by_ref = {c["reference"]: c for c in ops.list_cards()}
             relaunched: list[str] = []
             parked: list[str] = []
+            excluded: list[str] = []
             skipped: list[str] = []
+            for ref in state.get("excluded_worker") or []:
+                rec = records.get(ref)
+                card = by_ref.get(ref)
+                if rec is None or card is None or card["column"] != model.IN_PROGRESS:
+                    skipped.append(f"{ref}:worker")
+                    continue
+                rec["last_activity"] = time.time()
+                excluded.append(f"{ref}:worker")
             for ref in state.get("stopped_worker") or []:
                 rec = records.get(ref)
                 card = by_ref.get(ref)
@@ -893,15 +965,22 @@ def resume() -> dict:
                     continue
                 if card["column"] == model.IN_PROGRESS:
                     try:
-                        rec["handle"] = worker.launch_worker(rec["workspace"], rec.get("head"),
-                                                             rec["worker"], rec.get("title", ref))
-                        rec["terminal_kind"] = worker.terminal_kind(rec.get("head"))
-                    except Exception as e:  # noqa: BLE001 — one bad relaunch must not lose the rest
+                        _relaunch_worker_after_resume(ref, card, rec, "pipeline resume")
+                    except Exception as e:  # noqa: BLE001, one bad relaunch must not lose the rest
+                        rec["handle"] = ""
+                        rec.pop("parked_worker", None)
+                        rec["last_activity"] = time.time()
                         skipped.append(f"{ref}:worker")
-                        STATE.log_run("resume", reference=ref, result="relaunch-failed",
-                                      level="warn", error=worker.scrub_secrets(str(e)))
+                        ops.add_comment(
+                            "dispatcher", ref,
+                            "терминал остановлен паузой, перезапуск при resume не удался. "
+                            "Карточка остаётся In progress под обычным watchdog; следующий tick "
+                            f"увидит пустой handle и применит retry policy. Ошибка: "
+                            f"{worker.scrub_secrets(str(e))}.")
+                        STATE.log_run("relaunch-after-resume", reference=ref, result="failed",
+                                      reason="pipeline resume", level="warn",
+                                      error=worker.scrub_secrets(str(e)))
                         continue
-                    rec["last_activity"] = time.time()
                     relaunched.append(f"{ref}:worker")
                 elif card["column"] == "Validate":
                     # A parked Validate worker (kept for CI rework) must NOT be actively
@@ -917,6 +996,7 @@ def resume() -> dict:
                     # CI_PENDING_STALL_SECONDS window instead of one that already elapsed during
                     # the pause.
                     rec["handle"] = ""
+                    rec["parked_worker"] = True
                     rec.pop("ci_pending_since", None)
                     parked.append(f"{ref}:worker")
                 else:
@@ -944,7 +1024,7 @@ def resume() -> dict:
                 relaunched.append(f"{ref}:reviewer")
             _save_cards(records)
             STATE.log_run("resume", mode="hard", relaunched=relaunched, parked=parked,
-                          skipped=skipped)
+                          excluded=excluded, skipped=skipped)
         else:
             STATE.log_run("resume", mode="soft")
         pause_flag.clear()

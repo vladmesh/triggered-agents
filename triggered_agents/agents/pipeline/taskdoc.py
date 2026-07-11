@@ -1,9 +1,14 @@
 """Render the one-time TASK.md handed to a pipeline worker."""
 from __future__ import annotations
 
+import re
 from datetime import datetime, timezone
 
 from . import heads, naming, worker
+
+
+_COMMENT_MARKER_RE = re.compile(r"^\[([^\]]+)\]\n?(.*)\Z", re.DOTALL)
+_OPERATOR_MARKERS = {"po", "secretary", "steward", "steward:blocked-done"}
 
 
 def _format_comment_ts(ts) -> str:
@@ -40,6 +45,31 @@ def _history(comments: list[dict]) -> list[str]:
         lines.append(f"### {_format_comment_ts(c.get('ts'))}")
         lines.append("")
         lines.append((c.get("text") or "").strip())
+        lines.append("")
+    return lines
+
+
+def _operator_context(comments: list[dict], limit: int = 5) -> list[str]:
+    picked = []
+    for c in comments:
+        text = (c.get("text") or "").strip()
+        m = _COMMENT_MARKER_RE.match(text)
+        if not m:
+            continue
+        marker = m.group(1)
+        if marker not in _OPERATOR_MARKERS:
+            continue
+        body = m.group(2).strip()
+        if not body:
+            continue
+        picked.append((_format_comment_ts(c.get("ts")), marker, body))
+    if not picked:
+        return []
+    lines = ["## Операторский контекст", ""]
+    for ts, marker, body in picked[-limit:]:
+        lines.append(f"### {ts} [{marker}]")
+        lines.append("")
+        lines.append(body)
         lines.append("")
     return lines
 
@@ -116,5 +146,6 @@ def render(card: dict, view: dict, base: str) -> str:
     lines += _metadata(card, base)
     lines += [naming.memory_block("worker", card.get("project") or "?"), ""]
     lines += ["## Спека", "", view.get("description") or "(описание карточки пустое)", ""]
+    lines += _operator_context(comments)
     lines += _history(comments)
     return "\n".join(lines).rstrip("\n") + "\n"
