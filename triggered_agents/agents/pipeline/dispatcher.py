@@ -41,6 +41,7 @@ import os
 import sys
 import time
 from contextlib import contextmanager
+from datetime import datetime, timezone
 
 from ...runtime.state import PRECHECK_SKIP
 from . import health, heads, model, naming, ops, pause as pause_flag, taskdoc, validate, worker
@@ -381,6 +382,8 @@ def _advance(records: dict, statuses: dict[str, str]) -> bool:
             changed = True
             continue
         worker.rename_terminal(rec.get("handle", ""), rec.get("title", ""))
+        if _try_claim_started_comment(ref, rec):
+            changed = True
         verdict = _report_verdict(ref, int(rec.get("comment_baseline", 0)))
         if verdict == "done":
             ops.move_card("dispatcher", ref, "Validate")
@@ -607,6 +610,44 @@ def _block(ref: str, reason: str, body: str, **log_fields) -> None:
     STATE.log_run("bringup", reference=ref, to="Blocked", reason=reason, **log_fields)
 
 
+def _claim_started_comment_body(worker_id: str, ws: str, now: float) -> str:
+    ts = datetime.fromtimestamp(now, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    return f"Взята в работу {ts}, воркер {worker_id}, воркспейс {ws}."
+
+
+def _has_claim_started_comment(ref: str, worker_id: str, ws: str, baseline: int) -> bool:
+    marker = f"[{model.MARKER_CLAIM_STARTED}]"
+    for comment in ops.show_card(ref)["comments"][baseline:]:
+        text = comment.get("text", "")
+        if marker in text and f"воркер {worker_id}" in text and f"воркспейс {ws}" in text:
+            return True
+    return False
+
+
+def _try_claim_started_comment(ref: str, rec: dict) -> bool:
+    if rec.get("claim_started_comment"):
+        return False
+    worker_id = rec.get("worker") or ""
+    ws = rec.get("workspace") or ""
+    if not worker_id or not ws or not rec.get("handle"):
+        return False
+    baseline = int(rec.get("comment_baseline", 0))
+    try:
+        if _has_claim_started_comment(ref, worker_id, ws, baseline):
+            rec["claim_started_comment"] = True
+            return True
+        ops.add_comment(
+            "dispatcher", ref,
+            _claim_started_comment_body(worker_id, ws, float(rec.get("claimed_at") or time.time())),
+            marker=model.MARKER_CLAIM_STARTED)
+        rec["claim_started_comment"] = True
+        return True
+    except Exception as e:  # noqa: BLE001, marker retry must not lose a live worker record
+        STATE.log_run("bringup", reference=ref, result="claim-comment-failed", level="warn",
+                      error=worker.scrub_secrets(str(e)))
+        return False
+
+
 def _bring_up(card: dict, worker_id: str, records: dict, head: str) -> None:
     """After a successful claim: worktree, setup+smoke, then the worker head — or Blocked on any
     failure. The claim already persists on the board, so nothing here may escape as a traceback:
@@ -668,8 +709,11 @@ def _bring_up(card: dict, worker_id: str, records: dict, head: str) -> None:
         "claimed_at": now,
         "last_activity": now,
         "comment_baseline": len(view["comments"]),
+        "claim_started_comment": False,
     }
     _save_cards(records)
+    if _try_claim_started_comment(ref, records[ref]):
+        _save_cards(records)
     STATE.log_run("bringup", reference=ref, to="In progress", workspace=ws, head=head)
 
 

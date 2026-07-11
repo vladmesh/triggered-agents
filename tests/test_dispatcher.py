@@ -426,6 +426,87 @@ class DispatcherTest(_DispatcherBase):
         self.assertIn(ref, records)
         self.assertEqual(records[ref]["comment_baseline"], 0)
 
+    def test_successful_claim_posts_start_comment(self):
+        ref = self._ready_card("A")
+        with mock.patch.object(dispatcher.time, "time", return_value=1714824240):
+            dispatcher.tick()
+
+        tid = next(t["id"] for t in self.board.tasks.values() if t["reference"] == ref)
+        comments = [c["comment"] for c in self.board.comments.get(tid, [])]
+        self.assertEqual(len(comments), 1)
+        self.assertIn(f"[{model.MARKER_CLAIM_STARTED}]", comments[0])
+        self.assertIn("Взята в работу 2024-05-04 12:04 UTC", comments[0])
+        self.assertIn("воркер 1-a", comments[0])
+        self.assertIn("воркспейс /ws/1-a", comments[0])
+        self.assertEqual(dispatcher._load_cards()[ref]["comment_baseline"], 0)
+
+    def test_claim_comment_failure_keeps_live_worker_record(self):
+        ref = self._ready_card("A")
+        with mock.patch.object(ops, "add_comment", side_effect=RuntimeError("comment down")):
+            dispatcher.tick()
+
+        self.assertEqual(self._column(ref), model.IN_PROGRESS)
+        records = dispatcher._load_cards()
+        self.assertIn(ref, records)
+        self.assertEqual(records[ref]["handle"], "handle-1-a")
+        self.assertFalse(records[ref]["claim_started_comment"])
+        self.assertEqual(len(self.worker.launched), 1)
+
+        dispatcher.tick()
+
+        tid = next(t["id"] for t in self.board.tasks.values() if t["reference"] == ref)
+        comments = " ".join(c["comment"] for c in self.board.comments.get(tid, []))
+        self.assertIn(f"[{model.MARKER_CLAIM_STARTED}]", comments)
+        self.assertEqual(len(self.worker.launched), 1)
+        records = dispatcher._load_cards()
+        self.assertTrue(records[ref]["claim_started_comment"])
+        self.assertEqual(records[ref]["comment_baseline"], 0)
+
+    def test_claim_comment_reposts_after_watchdog_retry_reclaim(self):
+        ref = self._claim_one()
+        first = dispatcher._load_cards()[ref]
+        self.worker.dead_handles.add(first["handle"])
+
+        dispatcher.tick()
+
+        tid = next(t["id"] for t in self.board.tasks.values() if t["reference"] == ref)
+        markers = [c["comment"] for c in self.board.comments.get(tid, [])
+                   if f"[{model.MARKER_CLAIM_STARTED}]" in c["comment"]]
+        self.assertEqual(len(markers), 2)
+        self.assertEqual(self._column(ref), model.IN_PROGRESS)
+
+    def test_reconcile_without_handle_does_not_post_claim_comment(self):
+        ref = self._ready_card("A")
+        ops.claim_card(ref, "1-a")
+
+        dispatcher.tick()
+
+        tid = next(t["id"] for t in self.board.tasks.values() if t["reference"] == ref)
+        markers = [c["comment"] for c in self.board.comments.get(tid, [])
+                   if f"[{model.MARKER_CLAIM_STARTED}]" in c["comment"]]
+        retries = [c["comment"] for c in self.board.comments.get(tid, [])
+                   if f"[{model.MARKER_WATCHDOG_RETRY}]" in c["comment"]]
+        self.assertEqual(len(markers), 1)
+        self.assertEqual(len(retries), 1)
+        self.assertEqual(len(self.worker.launched), 1)
+        self.assertEqual(self._column(ref), model.IN_PROGRESS)
+
+    def test_fast_report_between_launch_and_claim_comment_is_not_hidden(self):
+        ref = self._ready_card("A")
+        original_save = dispatcher._save_cards
+
+        def save_and_report(records):
+            original_save(records)
+            if len(self.board.comments.get(1, [])) == 0:
+                ops.report(ref, "done", "готово\nPR: https://github.com/vladmesh/personal_site/pull/1")
+
+        with mock.patch.object(dispatcher, "_save_cards", side_effect=save_and_report):
+            dispatcher.tick()
+
+        self.assertEqual(dispatcher._load_cards()[ref]["comment_baseline"], 0)
+        dispatcher.tick()
+        self.assertEqual(self._column(ref), "Validate")
+
     def test_tick_renames_branch_before_launching_the_head(self):
         # bring-up must land the worktree on its own pipeline/<ref> branch before the worker head
         # ever starts — no head creates or renames its own branch.

@@ -175,6 +175,8 @@ MARKER_AUTOMERGE = "validate:automerge"
 # review:* marker: the invariant "only the reviewer posts a verdict" must not hinge on baseline
 # arithmetic — if this carried [review:red] and any baseline shift re-read it, the card would loop.
 MARKER_REVIEW_RETURN = "validate:review-return"
+# Posted once after a successful claim/bring-up, when the worker workspace and head are live.
+MARKER_CLAIM_STARTED = "claim:started"
 # Posted once when validating a single card blows up unexpectedly (e.g. a base workspace.toml that
 # won't parse). The failure is localized to that card — the tick keeps going for the others.
 MARKER_VALIDATE_ERROR = "validate:error"
