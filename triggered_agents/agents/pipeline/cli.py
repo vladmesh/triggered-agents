@@ -102,6 +102,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p_pause.add_argument("--reason")
     p_pause.add_argument("--reason-file")
     p_pause.add_argument("--actor", help="who requested the pause; defaults to the acting role")
+    p_pause.add_argument("--exclude-workspace", action="append", default=[],
+                         help="hard pause: leave this worker workspace running")
     sub.add_parser("resume")              # po/steward: undo pause, idempotent if not paused
     sub.add_parser("pause-status")        # any role: current pause state, read-only
 
@@ -219,7 +221,8 @@ def main(argv=None) -> int:
                 return 2
             actor = (args.actor or role or "").strip()
             from . import dispatcher
-            return _emit(dispatcher.pause(mode, reason=reason, actor=actor))
+            return _emit(dispatcher.pause(mode, reason=reason, actor=actor,
+                                          exclude_workspaces=args.exclude_workspace))
         if args.cmd == "resume":
             if not _need_role(role, ("po", "steward")):
                 return 2
