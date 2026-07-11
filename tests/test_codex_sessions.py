@@ -32,6 +32,12 @@ def _write_session(path: Path, cwd: str, mtime: float) -> None:
     os.utime(path, (mtime, mtime))
 
 
+def _write_rows(path: Path, rows: list[dict], mtime: float = 1234.5) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+    os.utime(path, (mtime, mtime))
+
+
 class SessionCwdTest(unittest.TestCase):
     def test_reads_cwd_from_session_meta(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -67,6 +73,40 @@ class LatestActivityTest(unittest.TestCase):
             _write_session(root / "2026" / "07" / "10" / "rollout-other.jsonl", "/ws/other", 9999.0)
             with mock.patch.object(codex_sessions, "SESSIONS_ROOT", root):
                 self.assertEqual(codex_sessions.latest_activity_for("/ws/fresh"), 1234.5)
+
+
+class LatestUserTurnTest(unittest.TestCase):
+    def test_finds_user_turn_after_timestamp_for_workspace(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "sessions"
+            _write_rows(root / "2026" / "07" / "10" / "rollout.jsonl", [
+                {"type": "session_meta", "payload": {"cwd": "/ws/fresh"}},
+                {"timestamp": "2026-07-10T07:59:07.142Z", "type": "response_item",
+                 "payload": {"type": "message", "role": "user", "content": []}},
+                {"timestamp": "2026-07-10T07:59:08.000Z", "type": "event_msg",
+                 "payload": {"type": "user_message", "message": "read TASK.md"}},
+            ])
+            with mock.patch.object(codex_sessions, "SESSIONS_ROOT", root):
+                self.assertEqual(
+                    codex_sessions.latest_user_turn_for("/ws/fresh", 1783670347.5),
+                    1783670348.0,
+                )
+
+    def test_ignores_other_workspace_and_old_turns(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "sessions"
+            _write_rows(root / "2026" / "07" / "10" / "old.jsonl", [
+                {"type": "session_meta", "payload": {"cwd": "/ws/fresh"}},
+                {"timestamp": "2026-07-10T07:59:07.142Z", "type": "event_msg",
+                 "payload": {"type": "user_message", "message": "old"}},
+            ])
+            _write_rows(root / "2026" / "07" / "10" / "other.jsonl", [
+                {"type": "session_meta", "payload": {"cwd": "/ws/other"}},
+                {"timestamp": "2026-07-10T07:59:08.000Z", "type": "event_msg",
+                 "payload": {"type": "user_message", "message": "other"}},
+            ])
+            with mock.patch.object(codex_sessions, "SESSIONS_ROOT", root):
+                self.assertIsNone(codex_sessions.latest_user_turn_for("/ws/fresh", 1783670347.5))
 
     def test_scan_limited_to_recent_day_dirs(self):
         with tempfile.TemporaryDirectory() as tmp:

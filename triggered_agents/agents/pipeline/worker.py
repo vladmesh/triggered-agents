@@ -41,6 +41,8 @@ _GH_LOG_TAIL_LINES = 40
 TUI_IDLE_TIMEOUT_MS = int(os.environ.get("TA_TUI_IDLE_TIMEOUT_MS", "60000"))
 TUI_DELIVERY_RETRIES = prompt_delivery.TUI_DELIVERY_RETRIES
 TUI_DELIVERY_CHECK_DELAY_S = prompt_delivery.TUI_DELIVERY_CHECK_DELAY_S
+TUI_DELIVERY_TIMEOUT_S = prompt_delivery.TUI_DELIVERY_TIMEOUT_S
+TUI_DELIVERY_RESEND_GRACE_S = prompt_delivery.TUI_DELIVERY_RESEND_GRACE_S
 # Head profile for the layer-3 reviewer. A plain config knob (not a per-card choice): the reviewer
 # is independent of the worker, so the card's `head` field is not reused here — this names a
 # profile in heads.toml, same registry every worker head resolves against.
@@ -566,21 +568,26 @@ def _close_terminal(handle: str) -> None:
         pass
 
 
-def _deliver_initial_prompt(handle: str, launch: heads.LaunchSpec) -> None:
+def _deliver_initial_prompt(handle: str, launch: heads.LaunchSpec, workspace: str) -> None:
     if not launch.initial_prompt:
         return
     if not handle:
         raise WorkspaceError("terminal create returned no handle for TUI prompt delivery")
-    _orca_json(["terminal", "wait", "--terminal", handle, "--for", "tui-idle",
-                "--timeout-ms", str(TUI_IDLE_TIMEOUT_MS)])
-    _orca_json(["terminal", "send", "--terminal", handle, "--text", launch.initial_prompt,
-                "--enter"])
     try:
-        prompt_delivery.confirm_initial_prompt_delivered(
+        prompt_delivery.deliver_initial_prompt(
             launch.initial_prompt,
-            lambda: _read_terminal_text(handle),
+            workspace,
+            handle,
+            lambda: _orca_json(["terminal", "wait", "--terminal", handle, "--for", "tui-idle",
+                                "--timeout-ms", str(TUI_IDLE_TIMEOUT_MS)]),
+            lambda: _orca_json(["terminal", "send", "--terminal", handle,
+                                "--text", launch.initial_prompt, "--enter"]),
             lambda: _orca_json(["terminal", "send", "--terminal", handle, "--text", "", "--enter"]),
+            lambda: _read_terminal_text(handle),
+            log_event=lambda **fields: STATE.log_run("tui-delivery", **fields),
             check_delay_s=TUI_DELIVERY_CHECK_DELAY_S,
+            timeout_s=TUI_DELIVERY_TIMEOUT_S,
+            resend_grace_s=TUI_DELIVERY_RESEND_GRACE_S,
         )
     except prompt_delivery.InjectDeliveryError as e:
         raise InjectDeliveryError(str(e)) from e
@@ -592,7 +599,7 @@ def _create_head_terminal(workspace: str, title: str, launch: heads.LaunchSpec) 
     term = data.get("terminal", data)
     handle = term.get("handle") or term.get("id") or ""
     try:
-        _deliver_initial_prompt(handle, launch)
+        _deliver_initial_prompt(handle, launch, workspace)
     except Exception:
         _close_terminal(handle)
         raise

@@ -4240,11 +4240,14 @@ class WorkerHostCallsTest(unittest.TestCase):
             calls.append(args)
             if args[:2] == ["terminal", "create"]:
                 return {"terminal": {"handle": "term-tui"}}
+            if args[:2] == ["terminal", "read"]:
+                return {"terminal": {"tail": ["Working"]}}
             if args[:2] == ["terminal", "list"]:
                 return {"terminals": [{"handle": "term-tui"}]}
             return {}
 
-        with mock.patch.object(self.worker, "_orca_json", fake_orca_json):
+        with mock.patch.object(self.worker, "TUI_DELIVERY_RESEND_GRACE_S", 0), \
+             mock.patch.object(self.worker, "_orca_json", fake_orca_json):
             handle = self.worker.launch_worker("/ws/fresh", "codex-tui", "worker-1",
                                                "worker A-1: title")
 
@@ -4283,7 +4286,8 @@ class WorkerHostCallsTest(unittest.TestCase):
                 return {"terminals": [{"handle": "term-tui"}]}
             return {}
 
-        with mock.patch.object(self.worker, "_orca_json", fake_orca_json):
+        with mock.patch.object(self.worker, "TUI_DELIVERY_RESEND_GRACE_S", 0), \
+             mock.patch.object(self.worker, "_orca_json", fake_orca_json):
             handle = self.worker.launch_worker("/ws/fresh", "codex-tui", "worker-1",
                                                "worker A-1: title")
 
@@ -4308,14 +4312,18 @@ class WorkerHostCallsTest(unittest.TestCase):
                 return {"terminals": [{"handle": "term-tui"}]}
             return {}
 
-        with mock.patch.object(self.worker, "_orca_json", fake_orca_json), \
+        with mock.patch.object(self.worker, "TUI_DELIVERY_TIMEOUT_S", 0.2), \
+             mock.patch.object(self.worker, "TUI_DELIVERY_CHECK_DELAY_S", 0), \
+             mock.patch.object(self.worker, "TUI_DELIVERY_RESEND_GRACE_S", 0), \
+             mock.patch.object(self.worker, "_orca_json", fake_orca_json), \
              self.assertRaises(self.worker.InjectDeliveryError):
             self.worker.launch_worker("/ws/fresh", "codex-tui", "worker-1",
                                       "worker A-1: title")
 
         sends = [c for c in calls if c[:2] == ["terminal", "send"]]
-        self.assertEqual(len(sends), self.worker.TUI_DELIVERY_RETRIES + 1)
+        self.assertGreaterEqual(len(sends), 2)
         self.assertEqual(sends[-1][sends[-1].index("--text") + 1], "")
+        self.assertIn(["terminal", "close", "--terminal", "term-tui"], calls)
 
     def test_launch_worker_codex_exec_does_not_send_post_start_prompt(self):
         self.worker.launch_worker("/ws/fresh", "codex", "worker-1", "worker A-1: title")
@@ -4331,6 +4339,8 @@ class WorkerHostCallsTest(unittest.TestCase):
             calls.append(args)
             if args[:2] == ["terminal", "create"]:
                 return {"terminal": {"handle": "term-tui"}}
+            if args[:2] == ["terminal", "read"]:
+                return {"terminal": {"tail": ["Working"]}}
             if args[:2] == ["terminal", "list"]:
                 return {"terminals": [{"handle": "term-tui"}]}
             return {}
