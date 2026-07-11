@@ -770,6 +770,7 @@ def _spawn_reviewer(ref: str, pr: str | None, card: dict, rec: dict, records: di
                     f"Нижние слои валидации зелёные. Запущена независимая голова-ревьюер (слой 3) "
                     f"`{review_head}` по {label}: вердикт по каждому criterion спеки и находки "
                     f"блокер/замечание появятся в комментарии.")
+    ops.set_resolved_review_head(ref, review_head)
     rec.pop("review_spawn_fails", None)
     rec["review_ws"] = ws
     rec["review_handle"] = handle

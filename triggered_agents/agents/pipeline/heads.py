@@ -174,6 +174,35 @@ class Registry:
         return sorted(self.profiles)
 
 
+def profile_info(profile_id: str, registry: Registry | None = None) -> dict:
+    """Display-facing profile facts. Unknown profiles return a marked record instead of raising.
+
+    `effort` is Codex-specific in the current registry. Non-Codex adapters deliberately show
+    `n/a` rather than an empty string, so board/list consumers never have to special-case a blank
+    label.
+    """
+    reg = registry or load_registry()
+    try:
+        prof = reg.profile(profile_id)
+    except HeadRegistryError:
+        return {
+            "profile": profile_id,
+            "known": False,
+            "adapter": "unknown",
+            "model": "unknown",
+            "effort": "unknown",
+        }
+    adapter = prof.get("adapter") or "unknown"
+    effort = prof.get("effort", "default") if adapter == "codex" else "n/a"
+    return {
+        "profile": profile_id,
+        "known": True,
+        "adapter": adapter,
+        "model": prof.get("model") or "default",
+        "effort": effort,
+    }
+
+
 def _validate(resources: dict, profiles: dict) -> None:
     for pid, prof in profiles.items():
         resource = prof.get("resource")
