@@ -38,6 +38,30 @@ CLI: `python3 -m triggered_agents <agent> <cmd>` (`harvest`/`advance`/`precheck`
 Реальные часы — systemd-таймер (`orca automations run <id>`); встроенный rrule в headless serve не
 тикает. Дизайн и инварианты — `control-panel/docs/ARCHITECTURE.md` и `docs/backlog.md`.
 
+## Pipeline Validate
+
+Code и research-карточки проходят Validate послойно: PR/branch integrity, GitHub CI или явный
+`[validate] ci = "none"` в манифесте проекта, stand/e2e для проектов со стендом, затем LLM-review
+слоя 3 и штатный merge/Done path. PO может отключить только слой 3 для отдельной карточки:
+
+```bash
+python3 -m triggered_agents pipeline --role po create \
+  --project personal_site --type code --title "..." --column Ready \
+  --slug my-task --review-head none --description-file "$spec"
+
+python3 -m triggered_agents pipeline --role po update \
+  --ref personal_site-42 --review-head none
+```
+
+Пустой `--review-head ""` на update возвращает глобальный reviewer по умолчанию. Значение `none`
+пишется в metadata и видно в `list`, `show` и `TASK.md`; это audit-сигнал, а не пустой профиль.
+Worker и reviewer не могут менять это поле, потому что `update` остаётся PO-only.
+
+`none` допустим для мелких, низкорисковых или уже вручную вычитанных карточек, когда PO принимает
+риск отсутствия независимой LLM-вычитки. Это не реакция на красный CI, зависший check, stand failure,
+закрытый PR или недоступный reviewer: нижние механические слои обязательны и при ошибке ведут
+карточку тем же путём, что и с обычным reviewer.
+
 ## Инварианты
 
 - Один сериализованный прогон на агента (лок/watermark), не спавн по сессии.

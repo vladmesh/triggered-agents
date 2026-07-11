@@ -59,7 +59,8 @@ TASK_TYPES = ("code", "research")
 #   head         worker head profile id (heads.toml [profiles.*]); empty -> heads.DEFAULT_PROFILE.
 #                On a watchdog retry-switch this is overwritten with the head actually launched,
 #                so a later reclaim keeps using it instead of bouncing back to the original.
-#   review_head  reviewer head profile id for Validate layer 3; empty -> worker.REVIEWER_HEAD.
+#   review_head  reviewer head profile id for Validate layer 3; empty -> worker.REVIEWER_HEAD;
+#                "none" -> PO explicitly disabled layer 3 for this card only.
 #   claim        worker/workspace id, set by the claim command
 #   slug         short [a-z0-9-]{1,30} tag naming the card's worker/reviewer workspace; a card
 #                without one (old/manual) falls back to a transliterated slug of its title
@@ -82,6 +83,7 @@ META_PROJECT = "project"
 META_BLOCKED_BY = "blocked_by"
 META_HEAD = "head"
 META_REVIEW_HEAD = "review_head"
+NO_REVIEW_HEAD = "none"
 META_CLAIM = "claim"
 META_SLUG = "slug"
 META_BASE_BRANCH = "base_branch"
@@ -179,6 +181,8 @@ MARKER_AUTOMERGE = "validate:automerge"
 # review:* marker: the invariant "only the reviewer posts a verdict" must not hinge on baseline
 # arithmetic — if this carried [review:red] and any baseline shift re-read it, the card would loop.
 MARKER_REVIEW_RETURN = "validate:review-return"
+# Dispatcher audit note when a PO set review_head=none and Validate skips only layer 3.
+MARKER_REVIEW_SKIPPED = "validate:review-skipped"
 # Posted once after a successful claim/bring-up, when the worker workspace and head are live.
 MARKER_CLAIM_STARTED = "claim:started"
 # Posted once when validating a single card blows up unexpectedly (e.g. a base workspace.toml that
