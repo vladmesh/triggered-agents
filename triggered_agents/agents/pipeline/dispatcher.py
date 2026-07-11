@@ -44,7 +44,9 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 
 from ...runtime.state import PRECHECK_SKIP
-from . import health, heads, model, naming, ops, pause as pause_flag, taskdoc, validate, worker
+from . import (
+    health, heads, model, naming, ops, pause as pause_flag, pause_ops, taskdoc, validate, worker,
+)
 from .state import STATE
 # Re-exported so dispatcher.<NAME> keeps resolving for existing callers/tests — validate.py owns
 # these now (its layer-3 rework/spawn/stall caps), dispatcher just orchestrates the tick.
@@ -273,20 +275,6 @@ def precheck() -> int:
     return PRECHECK_SKIP
 
 
-def _report_verdict(reference: str, baseline: int) -> str | None:
-    """'done'/'blocked'/None from the worker's comments past `baseline` (the count at launch).
-    The last report wins if a worker somehow posted more than one."""
-    comments = ops.show_card(reference)["comments"]
-    verdict = None
-    for c in comments[baseline:]:
-        text = c.get("text", "")
-        if f"[{model.MARKER_REPORT_DONE}]" in text:
-            verdict = "done"
-        elif f"[{model.MARKER_REPORT_BLOCKED}]" in text:
-            verdict = "blocked"
-    return verdict
-
-
 def _restore_workspace(claim: str, project: str) -> str:
     """The workspace path a claim points at: `claim` already IS a card's workspace base name
     (naming.worker_workspace_base, stamped verbatim as the claim by ops.claim_card/_worker_id), so
@@ -386,75 +374,61 @@ def _advance(records: dict, statuses: dict[str, str]) -> bool:
             worker.rename_terminal(rec.get("handle", ""), rec.get("title", ""))
             if _try_claim_started_comment(ref, rec):
                 changed = True
-        verdict = _report_verdict(ref, int(rec.get("comment_baseline", 0)))
-        if verdict == "done":
-            ops.move_card("dispatcher", ref, "Validate")
-            # Keep the record; advance the baseline past this report so a CI-red return to
-            # In progress doesn't re-read the same done comment and bounce straight back. Reset the
-            # stand retry budget and any review state: every (re)entry into Validate is a fresh code
-            # state — rework gets its own auto-retry and a fresh layer-3 review, never a stale
-            # green/red verdict from the previous stint.
-            validate.clear_review(rec)
-            rec["comment_baseline"] = len(ops.show_card(ref)["comments"])
-            rec["stand_fails"] = 0
-            rec.pop("ci_pending_since", None)
-            STATE.log_run("advance", reference=ref, to="Validate", reason="report:done")
+        # Report-first, one source of truth with resume_hard: a posted [report:done]/[report:blocked]
+        # always wins over relaunching or watchdogging a head (pause_ops.apply_report_transition).
+        if pause_ops.apply_report_transition(ref, card, rec, records) is not None:
             changed = True
-        elif verdict == "blocked":
-            ops.move_card("dispatcher", ref, "Blocked")
-            STATE.log_run("advance", reference=ref, to="Blocked", reason="report:blocked")
-            records.pop(ref)
+            continue
+        if was_parked:
+            try:
+                pause_ops.relaunch_worker_after_resume(
+                    ref, card, rec, _refresh_worker_task, "legacy parked worker")
+            except Exception as e:  # noqa: BLE001
+                rec["handle"] = ""
+                rec.pop("parked_worker", None)
+                rec["last_activity"] = time.time()
+                ops.add_comment(
+                    "dispatcher", ref,
+                    "терминал остановлен паузой, перезапуск не удался. "
+                    "Карточка остаётся In progress под обычным watchdog; следующий tick "
+                    f"увидит пустой handle и применит retry policy. Ошибка: "
+                    f"{worker.scrub_secrets(str(e))}.")
+                STATE.log_run("relaunch-after-resume", reference=ref, result="failed",
+                              reason="legacy parked worker", level="warn",
+                              error=worker.scrub_secrets(str(e)))
             changed = True
-        else:
-            if was_parked:
-                try:
-                    _relaunch_worker_after_resume(ref, card, rec, "legacy parked worker")
-                except Exception as e:  # noqa: BLE001
-                    rec["handle"] = ""
-                    rec.pop("parked_worker", None)
-                    rec["last_activity"] = time.time()
-                    ops.add_comment(
-                        "dispatcher", ref,
-                        "терминал остановлен паузой, перезапуск не удался. "
-                        "Карточка остаётся In progress под обычным watchdog; следующий tick "
-                        f"увидит пустой handle и применит retry policy. Ошибка: "
-                        f"{worker.scrub_secrets(str(e))}.")
-                    STATE.log_run("relaunch-after-resume", reference=ref, result="failed",
-                                  reason="legacy parked worker", level="warn",
-                                  error=worker.scrub_secrets(str(e)))
-                changed = True
-                continue
-            handle = rec.get("handle", "")
-            current_head = _current_head(card, rec)
-            status = worker.terminal_status(handle, rec.get("workspace"), rec.get("terminal_kind"))
-            if status.get("known") and not status.get("live"):
-                resource = health.resource_of(current_head)
-                if resource and statuses.get(resource) == health.RED:
-                    rec["last_activity"] = time.time()
-                    changed = True
-                    continue
-                elapsed = time.time() - rec.get("last_activity", rec.get("claimed_at", time.time()))
-                _watchdog_retry(ref, card, rec, statuses, elapsed,
-                                trigger=WATCHDOG_TRIGGER_DEAD_HANDLE,
-                                handle_status=status.get("reason") or "dead",
-                                handle=handle)
-                records.pop(ref)
-                changed = True
-                continue
-            last = status.get("last_activity") if status.get("live") else None
-            if last:
-                rec["last_activity"] = last
-                changed = True
+            continue
+        handle = rec.get("handle", "")
+        current_head = _current_head(card, rec)
+        status = worker.terminal_status(handle, rec.get("workspace"), rec.get("terminal_kind"))
+        if status.get("known") and not status.get("live"):
             resource = health.resource_of(current_head)
             if resource and statuses.get(resource) == health.RED:
                 rec["last_activity"] = time.time()
                 changed = True
                 continue
-            silent = time.time() - rec.get("last_activity", rec.get("claimed_at", time.time()))
-            if silent > WATCHDOG_SECONDS:
-                _watchdog_retry(ref, card, rec, statuses, silent)
-                records.pop(ref)
-                changed = True
+            elapsed = time.time() - rec.get("last_activity", rec.get("claimed_at", time.time()))
+            _watchdog_retry(ref, card, rec, statuses, elapsed,
+                            trigger=WATCHDOG_TRIGGER_DEAD_HANDLE,
+                            handle_status=status.get("reason") or "dead",
+                            handle=handle)
+            records.pop(ref)
+            changed = True
+            continue
+        last = status.get("last_activity") if status.get("live") else None
+        if last:
+            rec["last_activity"] = last
+            changed = True
+        resource = health.resource_of(current_head)
+        if resource and statuses.get(resource) == health.RED:
+            rec["last_activity"] = time.time()
+            changed = True
+            continue
+        silent = time.time() - rec.get("last_activity", rec.get("claimed_at", time.time()))
+        if silent > WATCHDOG_SECONDS:
+            _watchdog_retry(ref, card, rec, statuses, silent)
+            records.pop(ref)
+            changed = True
     return changed
 
 
@@ -621,32 +595,6 @@ def _refresh_worker_task(card: dict, rec: dict) -> None:
     project = card.get("project") or ""
     base = worker.resolve_base_branch(project, card.get("base_branch") or "")
     worker.write_task(workspace, _task_md(card, ops.show_card(card["reference"]), base))
-
-
-def _relaunch_worker_after_resume(ref: str, card: dict, rec: dict, reason: str) -> str:
-    workspace = rec.get("workspace")
-    if not workspace:
-        raise RuntimeError("worker workspace is missing")
-    _refresh_worker_task(card, rec)
-    title = rec.get("title") or naming.worker_title(naming.card_id(ref), card.get("title") or ref)
-    head = rec.get("head") or card.get("head")
-    handle = worker.launch_worker(workspace, head, rec.get("worker", ""), title)
-    if not handle:
-        raise RuntimeError("worker launch returned no handle")
-    rec["handle"] = handle
-    rec["title"] = title
-    rec["head"] = head
-    rec["terminal_kind"] = worker.terminal_kind(head)
-    rec["last_activity"] = time.time()
-    rec.pop("parked_worker", None)
-    rec.pop("park_notice_logged", None)
-    rec.pop("unpark_fails", None)
-    ops.add_comment(
-        "dispatcher", ref,
-        f"терминал остановлен паузой, перезапущен. Воркспейс {workspace}, причина: {reason}.")
-    STATE.log_run("relaunch-after-resume", reference=ref, result="relaunched",
-                  reason=reason, workspace=workspace, handle=handle)
-    return handle
 
 
 def _block(ref: str, reason: str, body: str, **log_fields) -> None:
@@ -891,25 +839,8 @@ def pause(requested_mode: str, *, reason: str = pause_flag.DEFAULT_REASON,
             records = _load_cards()
             by_ref = {c["reference"]: c for c in ops.list_cards()}
             excluded_paths = _pause_excluded_workspaces(exclude_workspaces)
-            for ref, rec in records.items():
-                card = by_ref.get(ref)
-                if card is None:
-                    continue
-                workspace = rec.get("workspace")
-                if card["column"] == model.IN_PROGRESS and workspace:
-                    if os.path.abspath(workspace) in excluded_paths:
-                        excluded_worker.append(ref)
-                        continue
-                    worker.stop_terminals(workspace)
-                    stopped_worker.append(ref)
-                elif card["column"] == "Validate" and workspace:
-                    # Validate workers are parked for future rework. They are not active writers
-                    # while the independent reviewer or CI polling owns the card.
-                    worker.stop_terminals(workspace)
-                    stopped_worker.append(ref)
-                if card["column"] == "Validate" and rec.get("review_ws"):
-                    worker.stop_terminals(rec["review_ws"])
-                    stopped_reviewer.append(ref)
+            stopped_worker, stopped_reviewer, excluded_worker = pause_ops.plan_hard_pause(
+                records, by_ref, excluded_paths)
         pause_flag.save(mode, stopped_worker=stopped_worker,
                         stopped_reviewer=stopped_reviewer, excluded_worker=excluded_worker,
                         reason=reason, actor=actor)
@@ -936,7 +867,9 @@ def resume() -> dict:
     card, so one still on a non-terminal CI rollup gets a fresh CI_PENDING_STALL_SECONDS window
     instead of one that already expired during the pause. A card pause() stopped but that no longer
     wants a head when resume() runs (moved on, or its record vanished) is skipped rather than
-    relaunched into a state nobody is waiting on."""
+    relaunched into a state nobody is waiting on. A card that reported [report:done]/[report:blocked]
+    while frozen is moved by that report before any head is touched (pause_ops.resume_hard's
+    report-first step), so resume never launches a fresh worker into a card that already finished."""
     with _admin_lock():
         state = pause_flag.load()
         if not state:
@@ -945,86 +878,9 @@ def resume() -> dict:
         if state.get("mode") == "hard":
             records = _load_cards()
             by_ref = {c["reference"]: c for c in ops.list_cards()}
-            relaunched: list[str] = []
-            parked: list[str] = []
-            excluded: list[str] = []
-            skipped: list[str] = []
-            for ref in state.get("excluded_worker") or []:
-                rec = records.get(ref)
-                card = by_ref.get(ref)
-                if rec is None or card is None or card["column"] != model.IN_PROGRESS:
-                    skipped.append(f"{ref}:worker")
-                    continue
-                rec["last_activity"] = time.time()
-                excluded.append(f"{ref}:worker")
-            for ref in state.get("stopped_worker") or []:
-                rec = records.get(ref)
-                card = by_ref.get(ref)
-                if rec is None or card is None or not rec.get("workspace"):
-                    skipped.append(f"{ref}:worker")
-                    continue
-                if card["column"] == model.IN_PROGRESS:
-                    try:
-                        _relaunch_worker_after_resume(ref, card, rec, "pipeline resume")
-                    except Exception as e:  # noqa: BLE001, one bad relaunch must not lose the rest
-                        rec["handle"] = ""
-                        rec.pop("parked_worker", None)
-                        rec["last_activity"] = time.time()
-                        skipped.append(f"{ref}:worker")
-                        ops.add_comment(
-                            "dispatcher", ref,
-                            "терминал остановлен паузой, перезапуск при resume не удался. "
-                            "Карточка остаётся In progress под обычным watchdog; следующий tick "
-                            f"увидит пустой handle и применит retry policy. Ошибка: "
-                            f"{worker.scrub_secrets(str(e))}.")
-                        STATE.log_run("relaunch-after-resume", reference=ref, result="failed",
-                                      reason="pipeline resume", level="warn",
-                                      error=worker.scrub_secrets(str(e)))
-                        continue
-                    relaunched.append(f"{ref}:worker")
-                elif card["column"] == "Validate":
-                    # A parked Validate worker (kept for CI rework) must NOT be actively
-                    # relaunched here: an independent reviewer may be reviewing this exact branch
-                    # right now, and a fresh worker head reading TASK.md from scratch would start
-                    # a new turn and risk pushing commits under it — branch drift under review
-                    # (triggered-agents-281 review, blocker B1). Leave it stopped (handle cleared,
-                    # so nothing mistakes it for live); validate.py relaunches it lazily, only if/
-                    # when a CI-red or review-red return actually hands the card back for rework.
-                    # That path refreshes TASK.md, checks the saved handle and relaunches if it is
-                    # gone. ci_pending_since is still dropped: a plain wall-clock stall timer with
-                    # no head to reset it, so a card still on a non-terminal CI rollup gets a fresh
-                    # CI_PENDING_STALL_SECONDS window instead of one that already elapsed during
-                    # the pause.
-                    rec["handle"] = ""
-                    rec["parked_worker"] = True
-                    rec.pop("ci_pending_since", None)
-                    parked.append(f"{ref}:worker")
-                else:
-                    skipped.append(f"{ref}:worker")
-            for ref in state.get("stopped_reviewer") or []:
-                rec = records.get(ref)
-                card = by_ref.get(ref)
-                if (rec is None or card is None or card["column"] != "Validate"
-                        or not rec.get("review_ws")):
-                    skipped.append(f"{ref}:reviewer")
-                    continue
-                try:
-                    rec["review_handle"] = worker.relaunch_reviewer(
-                        rec["review_ws"], rec.get("worker", ref), rec.get("review_title", ref),
-                        rec.get("review_head"))
-                    rec["review_terminal_kind"] = worker.reviewer_terminal_kind(
-                        rec.get("review_head"))
-                except Exception as e:  # noqa: BLE001 — one bad relaunch must not lose the rest
-                    skipped.append(f"{ref}:reviewer")
-                    STATE.log_run("resume", reference=ref, result="relaunch-failed",
-                                  level="warn", error=worker.scrub_secrets(str(e)))
-                    continue
-                rec["review_activity"] = time.time()
-                rec.pop("ci_pending_since", None)
-                relaunched.append(f"{ref}:reviewer")
+            buckets = pause_ops.resume_hard(state, records, by_ref, _refresh_worker_task)
             _save_cards(records)
-            STATE.log_run("resume", mode="hard", relaunched=relaunched, parked=parked,
-                          excluded=excluded, skipped=skipped)
+            STATE.log_run("resume", mode="hard", **buckets)
         else:
             STATE.log_run("resume", mode="soft")
         pause_flag.clear()

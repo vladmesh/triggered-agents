@@ -3718,6 +3718,41 @@ class PipelinePauseTest(_DispatcherBase):
         self.assertTrue(any(r.get("reference") == ref and r.get("result") == "relaunched"
                             for r in runs))
 
+    def test_hard_resume_moves_card_by_report_done_without_relaunching(self):
+        # review blocker B1: a [report:done] posted while frozen must win over the resume relaunch.
+        # Otherwise resume starts a fresh head and only the next tick reads the report, leaving a new
+        # terminal alive under a card already on its way to Validate.
+        ref = self._claim_one(head="claude-opus")
+        self._pause("hard")
+        ops.report(ref, "done", f"готово\nPR: {self.PR}")   # landed during the freeze
+        launched_before = len(self.worker.launched)
+
+        dispatcher.resume()
+
+        self.assertEqual(self.worker.launched[launched_before:], [])   # no fresh head
+        self.assertEqual(self._column(ref), "Validate")
+        rec = dispatcher._load_cards()[ref]
+        self.assertEqual(rec["handle"], "")
+        self.assertTrue(rec.get("parked_worker"))            # parked for a possible CI-red rework
+        runs = [r for r in self._runs() if r["event"] == "resume"]
+        self.assertIn(f"{ref}:worker:done", runs[-1]["moved"])
+
+    def test_hard_resume_moves_card_by_report_blocked_without_relaunching(self):
+        # review blocker B1: a [report:blocked] posted while frozen must move the card to Blocked and
+        # leave the terminal stopped, not relaunch a fresh head into a card no dispatcher owns.
+        ref = self._claim_one(head="claude-opus")
+        self._pause("hard")
+        ops.report(ref, "blocked", "оператор отменил старый acceptance")   # landed during the freeze
+        launched_before = len(self.worker.launched)
+
+        dispatcher.resume()
+
+        self.assertEqual(self.worker.launched[launched_before:], [])   # no orphan head
+        self.assertEqual(self._column(ref), "Blocked")
+        self.assertNotIn(ref, dispatcher._load_cards())
+        runs = [r for r in self._runs() if r["event"] == "resume"]
+        self.assertIn(f"{ref}:worker:blocked", runs[-1]["moved"])
+
     def test_hard_resume_relaunches_the_reviewer_in_the_same_workspace(self):
         ref = self._to_validate_with_reviewer()
         review_ws = dispatcher._load_cards()[ref]["review_ws"]
