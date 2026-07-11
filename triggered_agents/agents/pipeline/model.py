@@ -59,8 +59,12 @@ TASK_TYPES = ("code", "research")
 #   head         worker head profile id (heads.toml [profiles.*]); empty -> heads.DEFAULT_PROFILE.
 #                On a watchdog retry-switch this is overwritten with the head actually launched,
 #                so a later reclaim keeps using it instead of bouncing back to the original.
+#   resolved_head worker profile id actually selected at claim time after health fallback. Empty
+#                means "not currently claimed", so board UI/list fall back to `head` or default.
 #   review_head  reviewer head profile id for Validate layer 3; empty -> worker.REVIEWER_HEAD;
 #                "none" -> PO explicitly disabled layer 3 for this card only.
+#   resolved_review_head reviewer profile id actually selected when Validate layer 3 spawns after
+#                health fallback. Empty means no active/current reviewer profile.
 #   claim        worker/workspace id, set by the claim command
 #   slug         short [a-z0-9-]{1,30} tag naming the card's worker/reviewer workspace; a card
 #                without one (old/manual) falls back to a transliterated slug of its title
@@ -82,7 +86,9 @@ META_TASK_TYPE = "task_type"
 META_PROJECT = "project"
 META_BLOCKED_BY = "blocked_by"
 META_HEAD = "head"
+META_RESOLVED_HEAD = "resolved_head"
 META_REVIEW_HEAD = "review_head"
+META_RESOLVED_REVIEW_HEAD = "resolved_review_head"
 NO_REVIEW_HEAD = "none"
 META_CLAIM = "claim"
 META_SLUG = "slug"

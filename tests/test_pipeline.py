@@ -33,6 +33,7 @@ class FakeBoard:
         self.tasks: dict[int, dict] = {}
         self.metadata: dict[int, dict] = {}
         self.comments: dict[int, list] = {}
+        self.tags: dict[int, list[str]] = {}
         self._next_task = 1
         self._next_sw = 2
         self._next_col = 200
@@ -143,6 +144,13 @@ class FakeBoard:
 
     def m_getAllComments(self, task_id):
         return list(self.comments.get(int(task_id), []))
+
+    def m_getTaskTags(self, task_id):
+        return {str(i + 1): tag for i, tag in enumerate(self.tags.get(int(task_id), []))}
+
+    def m_setTaskTags(self, project_id, task_id, tags):
+        self.tags[int(task_id)] = [str(tag) for tag in tags]
+        return True
 
     def m_closeTask(self, task_id):
         self.tasks[int(task_id)]["is_active"] = 0
@@ -687,8 +695,16 @@ class TestListShowHeads(PatchedBoardTest):
         self.assertEqual(card["reference"], ref)
         self.assertEqual(card["head"], "codex-extra")
         self.assertEqual(card["effective_head"], "codex-extra")
+        self.assertEqual(card["requested_head"], "codex-extra")
+        self.assertEqual(card["resolved_head"], "codex-extra")
+        self.assertEqual(card["head_model"], "gpt-5.5")
+        self.assertEqual(card["head_effort"], "extra")
         self.assertEqual(card["review_head"], "claude-opus")
         self.assertEqual(card["effective_review_head"], "claude-opus")
+        self.assertEqual(card["requested_review_head"], "claude-opus")
+        self.assertEqual(card["resolved_review_head"], "claude-opus")
+        self.assertEqual(card["review_model"], "opus")
+        self.assertEqual(card["review_effort"], "n/a")
 
     def test_show_exposes_default_reviewer_for_old_cards(self):
         board = self.make_board()
@@ -697,8 +713,14 @@ class TestListShowHeads(PatchedBoardTest):
         card = ops.show_card(ref)
         self.assertEqual(card["head"], "")
         self.assertEqual(card["effective_head"], "codex")
+        self.assertEqual(card["requested_head"], "codex")
+        self.assertEqual(card["resolved_head"], "codex")
+        self.assertEqual(card["head_model"], "gpt-5.5")
+        self.assertEqual(card["head_effort"], "default")
         self.assertEqual(card["review_head"], "")
         self.assertEqual(card["effective_review_head"], worker.REVIEWER_HEAD)
+        self.assertEqual(card["requested_review_head"], worker.REVIEWER_HEAD)
+        self.assertEqual(card["resolved_review_head"], worker.REVIEWER_HEAD)
 
     def test_list_show_expose_no_review_as_effective_value(self):
         board = self.make_board()
@@ -711,6 +733,41 @@ class TestListShowHeads(PatchedBoardTest):
         self.assertEqual(listed["effective_review_head"], model.NO_REVIEW_HEAD)
         self.assertEqual(shown["review_head"], model.NO_REVIEW_HEAD)
         self.assertEqual(shown["effective_review_head"], model.NO_REVIEW_HEAD)
+        self.assertEqual(shown["review_model"], "n/a")
+        self.assertEqual(shown["review_effort"], "n/a")
+
+    def test_claude_head_has_model_and_no_effort_marker(self):
+        board = self.make_board()
+        ref = board.add_task("A", "Ready", meta={model.META_TASK_TYPE: "code",
+                                                 model.META_PROJECT: "personal_site",
+                                                 model.META_HEAD: "claude-opus"})
+        card = ops.show_card(ref)
+        self.assertEqual(card["requested_head"], "claude-opus")
+        self.assertEqual(card["resolved_head"], "claude-opus")
+        self.assertEqual(card["head_model"], "opus")
+        self.assertEqual(card["head_effort"], "n/a")
+
+    def test_unknown_head_degrades_without_breaking_show(self):
+        board = self.make_board()
+        ref = board.add_task("A", "Ready", meta={model.META_TASK_TYPE: "code",
+                                                 model.META_PROJECT: "personal_site",
+                                                 model.META_HEAD: "codex-missing"})
+        card = ops.show_card(ref)
+        self.assertEqual(card["requested_head"], "codex-missing")
+        self.assertEqual(card["resolved_head"], "codex-missing")
+        self.assertFalse(card["head_known"])
+        self.assertEqual(card["head_model"], "unknown")
+        self.assertEqual(card["head_effort"], "unknown")
+
+    def test_create_writes_compact_head_tags_without_changing_title(self):
+        board = self.make_board()
+        out = ops.create_card("personal_site", "code", "Keep title", column="Ready",
+                              head="codex-extra", review_head="claude-opus")
+        tid = out["id"]
+        self.assertEqual(board.tasks[tid]["title"], "Keep title")
+        self.assertEqual(board.tags[tid],
+                         ["worker:codex-extra", "model:gpt-5.5", "effort:extra",
+                          "reviewer:claude-opus"])
 
 
 class TestClaim(PatchedBoardTest):

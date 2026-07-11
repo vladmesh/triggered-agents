@@ -722,10 +722,15 @@ class DispatcherTest(_DispatcherBase):
             dispatcher.tick()   # same-head budget spent -> switch: primary -> secondary
             self.assertEqual(self._column(ref), model.IN_PROGRESS)
             self.assertEqual(self.worker.launched[-1]["head"], "secondary")
-            meta = ops.show_card(ref)["metadata"]
+            shown = ops.show_card(ref)
+            meta = shown["metadata"]
             self.assertEqual(meta[model.META_RETRY_SWITCH], "1")
             self.assertEqual(meta[model.META_HEAD], "secondary")
             self.assertEqual(meta[model.META_RETRY_HEADS], "primary,secondary")
+            self.assertEqual(shown["requested_head"], "secondary")
+            self.assertEqual(shown["resolved_head"], "secondary")
+            tid = next(t["id"] for t in self.board.tasks.values() if t["reference"] == ref)
+            self.assertIn("worker:secondary", self.board.tags[tid])
 
             dispatcher.tick()   # both budgets spent -> terminal Blocked, workspace kept for a human
             self.assertEqual(self._column(ref), "Blocked")
@@ -1287,7 +1292,12 @@ class HeadHealthTest(_DispatcherBase):
         self.assertEqual(self.worker.launched[0]["head"], "secondary")
         # the card's own metadata preference is untouched — once res-a is green again, a fresh
         # claim of a card asking for "primary" goes back to using it.
-        self.assertEqual(ops.show_card(ref)["metadata"][model.META_HEAD], "primary")
+        shown = ops.show_card(ref)
+        self.assertEqual(shown["metadata"][model.META_HEAD], "primary")
+        self.assertEqual(shown["requested_head"], "primary")
+        self.assertEqual(shown["resolved_head"], "secondary")
+        tid = next(t["id"] for t in self.board.tasks.values() if t["reference"] == ref)
+        self.assertIn("worker:secondary", self.board.tags[tid])
 
     def test_claim_skips_card_when_whole_fallback_chain_is_red(self):
         reg = self._two_resource_registry()
@@ -2780,6 +2790,12 @@ class ValidateReviewTest(_DispatcherBase):
         dispatcher.tick()
         self.assertEqual(self.worker.reviewer_heads, ["claude-opus"])
         self.assertEqual(dispatcher._load_cards()[ref]["review_head"], "claude-opus")
+        shown = ops.show_card(ref)
+        self.assertEqual(shown["requested_review_head"], worker.REVIEWER_HEAD)
+        self.assertEqual(shown["resolved_review_head"], "claude-opus")
+        self.assertNotEqual(shown["resolved_head"], shown["resolved_review_head"])
+        tid = next(t["id"] for t in self.board.tasks.values() if t["reference"] == ref)
+        self.assertIn("reviewer:claude-opus", self.board.tags[tid])
         self.assertEqual(self._column(ref), "Validate")
 
     def test_spawn_waits_when_reviewer_chain_all_red(self):

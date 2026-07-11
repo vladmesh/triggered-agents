@@ -677,7 +677,7 @@ def _bring_up(card: dict, worker_id: str, records: dict, head: str) -> None:
                    workspace=ws)
             return
         view = ops.show_card(ref)
-        worker.write_task(ws, _task_md(card, view, base))
+        worker.write_task(ws, _task_md({**card, **view}, view, base))
         title = naming.worker_title(naming.card_id(ref), card.get("title") or ref)
         handle = worker.launch_worker(ws, head, worker_id, title)
     except worker.InjectDeliveryError as e:
@@ -739,7 +739,7 @@ def _claim_next(records: dict, statuses: dict[str, str]) -> None:
                 continue
         worker_id = _worker_id(card)
         try:
-            ops.claim_card(ref, worker_id, cap=WORKER_CAP)
+            ops.claim_card(ref, worker_id, cap=WORKER_CAP, resolved_head=resolved)
         except model.GuardError as e:
             STATE.log_run("claim-skip", reference=ref, reason=str(e))
             if "cap reached" in str(e):

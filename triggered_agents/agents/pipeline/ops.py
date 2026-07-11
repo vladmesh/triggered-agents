@@ -135,6 +135,93 @@ def _effective_review_head(meta: dict) -> str:
     return review_head or worker.REVIEWER_HEAD
 
 
+_HEAD_TAG_PREFIXES = ("worker:", "model:", "effort:", "reviewer:")
+
+
+def _requested_head(meta: dict) -> str:
+    return meta.get(model.META_HEAD) or heads.DEFAULT_PROFILE
+
+
+def _resolved_head(meta: dict) -> str:
+    return meta.get(model.META_RESOLVED_HEAD) or _requested_head(meta)
+
+
+def _profile_info(profile_id: str) -> dict:
+    if profile_id == model.NO_REVIEW_HEAD:
+        return {
+            "profile": model.NO_REVIEW_HEAD,
+            "known": True,
+            "adapter": "none",
+            "model": "n/a",
+            "effort": "n/a",
+        }
+    return heads.profile_info(profile_id)
+
+
+def _worker_head_view(meta: dict) -> dict:
+    requested = _requested_head(meta)
+    resolved = _resolved_head(meta)
+    info = _profile_info(resolved)
+    return {
+        "requested_head": requested,
+        "resolved_head": resolved,
+        "head_adapter": info["adapter"],
+        "head_model": info["model"],
+        "head_effort": info["effort"],
+        "head_known": info["known"],
+    }
+
+
+def _review_head_view(meta: dict) -> dict:
+    requested = _effective_review_head(meta)
+    resolved = meta.get(model.META_RESOLVED_REVIEW_HEAD) or requested
+    info = _profile_info(resolved)
+    return {
+        "requested_review_head": requested,
+        "resolved_review_head": resolved,
+        "review_adapter": info["adapter"],
+        "review_model": info["model"],
+        "review_effort": info["effort"],
+        "review_head_known": info["known"],
+    }
+
+
+def _tag_profile(profile_id: str, known: bool) -> str:
+    return profile_id if known else f"?{profile_id}"
+
+
+def _head_tags(meta: dict) -> list[str]:
+    worker_view = _worker_head_view(meta)
+    review_view = _review_head_view(meta)
+    return [
+        f"worker:{_tag_profile(worker_view['resolved_head'], worker_view['head_known'])}",
+        f"model:{worker_view['head_model']}",
+        f"effort:{worker_view['head_effort']}",
+        f"reviewer:{_tag_profile(review_view['resolved_review_head'], review_view['review_head_known'])}",
+    ]
+
+
+def _task_tags(task_id: int) -> list[str]:
+    raw = call("getTaskTags", task_id=task_id) or {}
+    if isinstance(raw, dict):
+        return [str(v) for v in raw.values()]
+    return [str(v.get("name", v)) if isinstance(v, dict) else str(v) for v in raw]
+
+
+def _is_head_tag(tag: str) -> bool:
+    return any(tag.startswith(prefix) for prefix in _HEAD_TAG_PREFIXES)
+
+
+def _sync_head_tags(pid: int, task_id: int, meta: dict) -> None:
+    if meta.get(model.META_STEWARD_REPORT) == "1":
+        return
+    current = _task_tags(task_id)
+    desired = _head_tags(meta)
+    next_tags = [tag for tag in current if not _is_head_tag(tag)] + desired
+    if next_tags != current:
+        call("setTaskTags", project_id=pid, task_id=task_id, tags=next_tags)
+
+
 def _get_by_ref(reference: str) -> dict:
     """Task dict for `reference` on the board, or GuardError if there is no such card."""
     pid = board_id()
@@ -269,6 +356,7 @@ def create_card(project: str, task_type: str, title: str, description: str = "",
     if base_branch:
         values[model.META_BASE_BRANCH] = base_branch
     call("saveTaskMetadata", task_id=task_id, values=values)
+    _sync_head_tags(pid, task_id, values)
     return {"action": "created", "id": task_id, "reference": ref, "column": column}
 
 
@@ -339,6 +427,8 @@ def update_card(role: str, reference: str, slug: str | None = None,
     if values:
         call("saveTaskMetadata", task_id=int(task["id"]), values=values)
     meta = call("getTaskMetadata", task_id=int(task["id"])) or {}
+    if values:
+        _sync_head_tags(pid, int(task["id"]), meta)
     return {
         "action": "updated",
         "reference": reference,
@@ -404,13 +494,22 @@ def move_card(role: str, reference: str, to_column: str, reason: str = "") -> di
                 f"{reference!r}: In progress -> Done is only for the steward's own report card "
                 "(created via create_report_card); other cards go through Validate/review"
             )
+    meta_updates = {}
     if to_column == "Ready":
-        call("saveTaskMetadata", task_id=int(task["id"]), values={
+        meta_updates.update({
             model.META_CLAIM: "",
+            model.META_RESOLVED_HEAD: "",
+            model.META_RESOLVED_REVIEW_HEAD: "",
             model.META_RETRY_SAME: "",
             model.META_RETRY_SWITCH: "",
             model.META_RETRY_HEADS: "",
         })
+    elif cur == "Validate" and to_column != "Validate":
+        meta_updates[model.META_RESOLVED_REVIEW_HEAD] = ""
+    if meta_updates:
+        call("saveTaskMetadata", task_id=int(task["id"]), values=meta_updates)
+        meta = call("getTaskMetadata", task_id=int(task["id"])) or {}
+        _sync_head_tags(pid, int(task["id"]), meta)
     _move_position(pid, int(task["id"]), _column_id(pid, to_column), int(task["swimlane_id"]))
     if move == model.STEWARD_OVERRIDE:
         add_comment(role, reference, reason, marker=model.MARKER_STEWARD_OVERRIDE)
@@ -435,6 +534,7 @@ def set_retry_state(reference: str, *, retry_same: int, retry_switch: int, retry
     real values on top, in the same tick, so the reset is never the last write."""
     task = _get_by_ref(reference)
     values = {
+        model.META_RESOLVED_HEAD: "",
         model.META_RETRY_SAME: str(retry_same),
         model.META_RETRY_SWITCH: str(retry_switch),
         model.META_RETRY_HEADS: retry_heads,
@@ -442,10 +542,25 @@ def set_retry_state(reference: str, *, retry_same: int, retry_switch: int, retry
     if head is not None:
         values[model.META_HEAD] = head
     call("saveTaskMetadata", task_id=int(task["id"]), values=values)
+    meta = call("getTaskMetadata", task_id=int(task["id"])) or {}
+    _sync_head_tags(board_id(), int(task["id"]), meta)
     return {"action": "retry-state", "reference": reference, **values}
 
 
-def claim_card(reference: str, worker: str, cap: int = 3) -> dict:
+def set_resolved_review_head(reference: str, review_head: str) -> dict:
+    """Dispatcher-only: stamp the reviewer profile actually spawned after health fallback."""
+    if review_head != model.NO_REVIEW_HEAD:
+        _check_review_head(review_head)
+    pid = board_id()
+    task = _get_by_ref(reference)
+    values = {model.META_RESOLVED_REVIEW_HEAD: review_head}
+    call("saveTaskMetadata", task_id=int(task["id"]), values=values)
+    meta = call("getTaskMetadata", task_id=int(task["id"])) or {}
+    _sync_head_tags(pid, int(task["id"]), meta)
+    return {"action": "resolved-review-head", "reference": reference, **values}
+
+
+def claim_card(reference: str, worker: str, cap: int = 3, resolved_head: str | None = None) -> dict:
     """Dispatcher-only entry into In progress: guard, stamp claim, then move.
 
     Guards (each its own message): the card is Ready; it is unclaimed; its head, if set, names a
@@ -475,6 +590,8 @@ def claim_card(reference: str, worker: str, cap: int = 3) -> dict:
         head = meta.get(model.META_HEAD)
         if head:
             _check_head(head)
+        selected_head = resolved_head or head or heads.DEFAULT_PROFILE
+        _check_head(selected_head)
         review_head = meta.get(model.META_REVIEW_HEAD)
         if review_head:
             _check_review_head(review_head)
@@ -515,7 +632,12 @@ def claim_card(reference: str, worker: str, cap: int = 3) -> dict:
         if wip >= cap:
             raise model.GuardError(f"cap reached: {wip} card(s) in In progress/Validate (cap {cap})")
 
-        call("saveTaskMetadata", task_id=tid, values={model.META_CLAIM: worker})
+        call("saveTaskMetadata", task_id=tid, values={
+            model.META_CLAIM: worker,
+            model.META_RESOLVED_HEAD: selected_head,
+        })
+        meta = call("getTaskMetadata", task_id=tid) or {}
+        _sync_head_tags(pid, tid, meta)
         _move_position(pid, tid, _column_id(pid, model.IN_PROGRESS), int(task["swimlane_id"]))
     STATE.log_run("claim", reference=reference, worker=worker)
     return {"action": "claimed", "reference": reference, "worker": worker}
@@ -598,6 +720,8 @@ def feedback(reference: str, body: str) -> dict:
 
 def _card_view(pid: int, task: dict, cols: dict, lanes: dict) -> dict:
     meta = call("getTaskMetadata", task_id=int(task["id"])) or {}
+    worker_head = _worker_head_view(meta)
+    review_head = _review_head_view(meta)
     try:
         date_moved = int(task["date_moved"]) or None
     except (KeyError, TypeError, ValueError):
@@ -616,9 +740,11 @@ def _card_view(pid: int, task: dict, cols: dict, lanes: dict) -> dict:
         "project": meta.get(model.META_PROJECT, ""),
         "blocked_by": meta.get(model.META_BLOCKED_BY, ""),
         "head": meta.get(model.META_HEAD, ""),
-        "effective_head": meta.get(model.META_HEAD) or heads.DEFAULT_PROFILE,
+        "effective_head": worker_head["resolved_head"],
+        **worker_head,
         "review_head": meta.get(model.META_REVIEW_HEAD, ""),
-        "effective_review_head": _effective_review_head(meta),
+        "effective_review_head": review_head["resolved_review_head"],
+        **review_head,
         "claim": meta.get(model.META_CLAIM, ""),
         "slug": meta.get(model.META_SLUG, ""),
         "base_branch": meta.get(model.META_BASE_BRANCH, ""),
@@ -647,6 +773,8 @@ def show_card(reference: str) -> dict:
     pid = board_id()
     task = _get_by_ref(reference)
     meta = call("getTaskMetadata", task_id=int(task["id"])) or {}
+    worker_head = _worker_head_view(meta)
+    review_head = _review_head_view(meta)
     comments = [
         {"ts": c.get("date_creation", ""), "text": c.get("comment", "")}
         for c in call("getAllComments", task_id=int(task["id"])) or []
@@ -661,9 +789,11 @@ def show_card(reference: str) -> dict:
         "project": meta.get(model.META_PROJECT, ""),
         "blocked_by": meta.get(model.META_BLOCKED_BY, ""),
         "head": meta.get(model.META_HEAD, ""),
-        "effective_head": meta.get(model.META_HEAD) or heads.DEFAULT_PROFILE,
+        "effective_head": worker_head["resolved_head"],
+        **worker_head,
         "review_head": meta.get(model.META_REVIEW_HEAD, ""),
-        "effective_review_head": _effective_review_head(meta),
+        "effective_review_head": review_head["resolved_review_head"],
+        **review_head,
         "claim": meta.get(model.META_CLAIM, ""),
         "slug": meta.get(model.META_SLUG, ""),
         "base_branch": meta.get(model.META_BASE_BRANCH, ""),
