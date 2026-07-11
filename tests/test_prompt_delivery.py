@@ -107,6 +107,28 @@ class PromptDeliveryTest(unittest.TestCase):
         self.assertEqual(result.signal, "session-user-turn")
         self.assertEqual(sent, [])
 
+    def test_working_word_in_composer_does_not_confirm_turn(self):
+        sent = []
+        checks = {"n": 0}
+
+        def turn_started():
+            checks["n"] += 1
+            return "session-user-turn" if checks["n"] >= 2 else None
+
+        result = prompt_delivery.confirm_initial_prompt_delivered(
+            "working TASK.md",
+            lambda: "› working TASK.md gpt-5.5 · /ws/fresh",
+            lambda: sent.append("enter"),
+            turn_started=turn_started,
+            check_delay_s=0,
+            poll_s=0.01,
+            timeout_s=1,
+            resend_grace_s=0,
+        )
+
+        self.assertEqual(result.signal, "session-user-turn")
+        self.assertEqual(sent, ["enter"])
+
 
 if __name__ == "__main__":
     unittest.main()

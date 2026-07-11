@@ -17,7 +17,6 @@ import os
 import re
 import shutil
 import subprocess
-import time
 import tomllib
 from pathlib import Path
 
@@ -574,26 +573,18 @@ def _deliver_initial_prompt(handle: str, launch: heads.LaunchSpec, workspace: st
         return
     if not handle:
         raise WorkspaceError("terminal create returned no handle for TUI prompt delivery")
-    _orca_json(["terminal", "wait", "--terminal", handle, "--for", "tui-idle",
-                "--timeout-ms", str(TUI_IDLE_TIMEOUT_MS)])
-    sent_at = time.time()
-    STATE.log_run("tui-delivery", workspace=workspace, handle=handle, result="initial")
-    _orca_json(["terminal", "send", "--terminal", handle, "--text", launch.initial_prompt,
-                "--enter"])
-
-    def turn_started() -> str | None:
-        return "session-user-turn" if codex_sessions.latest_user_turn_for(workspace, sent_at) else None
-
-    def log_delivery(**fields) -> None:
-        STATE.log_run("tui-delivery", workspace=workspace, handle=handle, **fields)
-
     try:
-        prompt_delivery.confirm_initial_prompt_delivered(
+        prompt_delivery.deliver_initial_prompt(
             launch.initial_prompt,
-            lambda: _read_terminal_text(handle),
+            workspace,
+            handle,
+            lambda: _orca_json(["terminal", "wait", "--terminal", handle, "--for", "tui-idle",
+                                "--timeout-ms", str(TUI_IDLE_TIMEOUT_MS)]),
+            lambda: _orca_json(["terminal", "send", "--terminal", handle,
+                                "--text", launch.initial_prompt, "--enter"]),
             lambda: _orca_json(["terminal", "send", "--terminal", handle, "--text", "", "--enter"]),
-            turn_started=turn_started,
-            log_event=log_delivery,
+            lambda: _read_terminal_text(handle),
+            log_event=lambda **fields: STATE.log_run("tui-delivery", **fields),
             check_delay_s=TUI_DELIVERY_CHECK_DELAY_S,
             timeout_s=TUI_DELIVERY_TIMEOUT_S,
             resend_grace_s=TUI_DELIVERY_RESEND_GRACE_S,

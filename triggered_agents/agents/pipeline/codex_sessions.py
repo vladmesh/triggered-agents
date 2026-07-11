@@ -101,13 +101,11 @@ def _recent_day_dirs(root: Path, limit: int = SCAN_DAY_DIRS) -> list[Path]:
     return days or [root]
 
 
-def latest_activity_for(workspace: str) -> float | None:
-    """Latest mtime among recent session files whose session_meta cwd is `workspace`."""
+def _session_paths_for(workspace: str):
     root = SESSIONS_ROOT
     if not root.is_dir():
-        return None
+        return
     want = str(Path(workspace).resolve(strict=False))
-    latest: float | None = None
     for day_dir in _recent_day_dirs(root):
         try:
             files = list(day_dir.glob("*.jsonl"))
@@ -116,12 +114,19 @@ def latest_activity_for(workspace: str) -> float | None:
         for path in files:
             if session_cwd(path) != want:
                 continue
-            try:
-                mtime = path.stat().st_mtime
-            except OSError:
-                continue
-            if latest is None or mtime > latest:
-                latest = mtime
+            yield path
+
+
+def latest_activity_for(workspace: str) -> float | None:
+    """Latest mtime among recent session files whose session_meta cwd is `workspace`."""
+    latest: float | None = None
+    for path in _session_paths_for(workspace):
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            continue
+        if latest is None or mtime > latest:
+            latest = mtime
     return latest
 
 
@@ -132,33 +137,22 @@ def latest_user_turn_for(workspace: str, since: float) -> float | None:
     and timestamps, never prompt text, so TASK.md and REVIEW.md share the same path
     without leaking task content into telemetry.
     """
-    root = SESSIONS_ROOT
-    if not root.is_dir():
-        return None
-    want = str(Path(workspace).resolve(strict=False))
     latest: float | None = None
-    for day_dir in _recent_day_dirs(root):
+    for path in _session_paths_for(workspace):
         try:
-            files = list(day_dir.glob("*.jsonl"))
+            with path.open(encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    try:
+                        rec = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if not isinstance(rec, dict) or not _is_user_turn(rec):
+                        continue
+                    ts = _record_timestamp(rec)
+                    if ts is None or ts <= since:
+                        continue
+                    if latest is None or ts > latest:
+                        latest = ts
         except OSError:
             continue
-        for path in files:
-            if session_cwd(path) != want:
-                continue
-            try:
-                with path.open(encoding="utf-8", errors="replace") as f:
-                    for line in f:
-                        try:
-                            rec = json.loads(line)
-                        except json.JSONDecodeError:
-                            continue
-                        if not isinstance(rec, dict) or not _is_user_turn(rec):
-                            continue
-                        ts = _record_timestamp(rec)
-                        if ts is None or ts <= since:
-                            continue
-                        if latest is None or ts > latest:
-                            latest = ts
-            except OSError:
-                continue
     return latest

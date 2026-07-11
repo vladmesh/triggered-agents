@@ -7,7 +7,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from . import terminal_session
+from . import codex_sessions, terminal_session
 
 TUI_DELIVERY_RETRIES = int(os.environ.get("TA_TUI_DELIVERY_RETRIES", "2"))
 TUI_DELIVERY_CHECK_DELAY_S = float(os.environ.get("TA_TUI_DELIVERY_CHECK_DELAY_S", "0.5"))
@@ -47,7 +47,10 @@ def _prompt_still_in_codex_composer(screen: str, prompt: str) -> bool:
 
 
 def _screen_started_turn(screen: str) -> bool:
-    return bool(_WORKING_RE.search(terminal_session.strip_ansi(screen)))
+    screen = terminal_session.strip_ansi(screen)
+    marker = screen.rfind("\u203a")
+    status_area = screen[:marker] if marker >= 0 else screen
+    return bool(_WORKING_RE.search(status_area))
 
 
 def confirm_initial_prompt_delivered(
@@ -90,3 +93,39 @@ def confirm_initial_prompt_delivered(
     raise InjectDeliveryError(
         f"inject не доставлен: turn не стартовал после {timeout_s:.1f}s "
         f"(reason={last_reason}, resends={resends})")
+
+
+def deliver_initial_prompt(
+    prompt: str,
+    workspace: str,
+    handle: str,
+    wait_idle: Callable[[], None],
+    send_prompt: Callable[[], None],
+    send_enter: Callable[[], None],
+    read_screen: Callable[[], str],
+    log_event: Callable[..., None] | None = None,
+    check_delay_s: float = TUI_DELIVERY_CHECK_DELAY_S,
+    timeout_s: float = TUI_DELIVERY_TIMEOUT_S,
+    poll_s: float = TUI_DELIVERY_POLL_S,
+    resend_grace_s: float = TUI_DELIVERY_RESEND_GRACE_S,
+) -> DeliveryResult:
+    log = log_event or (lambda **_: None)
+    wait_idle()
+    sent_at = time.time()
+    log(workspace=workspace, handle=handle, result="initial")
+    send_prompt()
+
+    def turn_started() -> str | None:
+        return "session-user-turn" if codex_sessions.latest_user_turn_for(workspace, sent_at) else None
+
+    return confirm_initial_prompt_delivered(
+        prompt,
+        read_screen,
+        send_enter,
+        turn_started=turn_started,
+        log_event=lambda **fields: log(workspace=workspace, handle=handle, **fields),
+        check_delay_s=check_delay_s,
+        timeout_s=timeout_s,
+        poll_s=poll_s,
+        resend_grace_s=resend_grace_s,
+    )
