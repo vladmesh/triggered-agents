@@ -46,7 +46,11 @@ COLUMNS = ["Идеи", "Ready", "In progress", "Validate", "Blocked", "Done"]
 
 ROLES = ("po", "dispatcher", "worker", "reviewer", "steward", "retro")
 
-TASK_TYPES = ("code", "research", "debug")
+# Два типа по одному признаку — меняет ли карточка код: code генерит PR (и участвует
+# в per-project claim-гейте), research отдаёт только отчёт. Тип debug убран (решение
+# vladmesh 2026-07-11): он производил PR как code, но не считался гейтом — две
+# PR-карточки одного проекта могли ехать параллельно.
+TASK_TYPES = ("code", "research")
 
 # Metadata keys (flat str->str dict on the Kanboard card):
 #   task_type    one of TASK_TYPES
