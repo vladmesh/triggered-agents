@@ -21,7 +21,7 @@ def block_inject_delivery(
     scrubbed = worker.scrub_secrets(str(error))
     ops.add_comment("dispatcher", ref,
                     f"Не удалось поднять голову-ревьюера (слой 3): inject не доставлен "
-                    f"в TUI, prompt остался в composer после ретраев. Карточка в Blocked "
+                    f"в TUI, turn не стартовал после bounded delivery protocol. Карточка в Blocked "
                     f"до vladmesh. {note}")
     ops.move_card("dispatcher", ref, "Blocked")
     records.pop(ref, None)

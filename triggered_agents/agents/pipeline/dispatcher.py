@@ -682,8 +682,8 @@ def _bring_up(card: dict, worker_id: str, records: dict, head: str) -> None:
         handle = worker.launch_worker(ws, head, worker_id, title)
     except worker.InjectDeliveryError as e:
         _block(ref, "inject-delivery",
-               f"bring-up упал: inject не доставлен в TUI, prompt остался в composer после "
-               f"ретраев. Карточка в Blocked до vladmesh."
+               f"bring-up упал: inject не доставлен в TUI, turn не стартовал после "
+               f"bounded delivery protocol. Карточка в Blocked до vladmesh."
                + (f"\nВоркспейс {ws} оставлен." if ws else ""),
                error=worker.scrub_secrets(str(e)))
         return
