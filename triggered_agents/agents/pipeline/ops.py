@@ -120,6 +120,14 @@ def _check_review_head(review_head: str) -> None:
     _check_head(review_head)
 
 
+def _check_no_review_role(role: str | None) -> None:
+    """Only PO may deliberately disable layer 3 through board-facing create/update paths."""
+    if role not in (None, "po"):
+        raise model.GuardError(
+            f"role {role!r} may not set review_head={model.NO_REVIEW_HEAD!r} (po only)"
+        )
+
+
 def _effective_review_head(meta: dict) -> str:
     review_head = meta.get(model.META_REVIEW_HEAD) or ""
     if review_head == model.NO_REVIEW_HEAD:
@@ -211,7 +219,8 @@ def create_card(project: str, task_type: str, title: str, description: str = "",
     omitted, claim falls back to a transliterated slug of the title (naming.fallback_slug) so an
     old/manual card without one still claims fine. `head`, when given, must name a profile in
     heads.toml (checked before anything is written); omitted, the card gets heads.DEFAULT_PROFILE
-    at bring-up. `review_head`, when given, must name a profile too; omitted, Validate uses
+    at bring-up. `review_head`, when given, must name a profile, except the reserved PO-only
+    value `none`, which disables Validate layer 3 for this card. Omitted means Validate uses
     worker.REVIEWER_HEAD. `base_branch`, when given, overrides the project's manifest base_branch
     for this card only (worker.resolve_base_branch); omitted, bring-up falls back to the manifest
     lookup exactly as before this field existed.
@@ -232,6 +241,8 @@ def create_card(project: str, task_type: str, title: str, description: str = "",
         _check_head(head)
     if review_head:
         _check_review_head(review_head)
+        if review_head == model.NO_REVIEW_HEAD:
+            _check_no_review_role(role)
     if role == "worker":
         _check_worker_continuation(project, column, blocked_by, own_ref)
     if role == "steward":

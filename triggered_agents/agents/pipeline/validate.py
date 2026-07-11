@@ -49,7 +49,7 @@ import re
 import time
 from collections.abc import Callable
 
-from . import health, model, naming, ops, review_spawn, reviewer, worker
+from . import health, model, naming, ops, review_spawn, reviewer, validate_review, worker
 from .state import STATE
 
 RefreshWorkerTask = Callable[[dict, dict], None]
@@ -73,13 +73,6 @@ VALIDATE_STALL_ATTEMPTS = int(os.environ.get("TA_VALIDATE_STALL_ATTEMPTS", "5"))
 CI_PENDING_STALL_SECONDS = int(os.environ.get("TA_CI_PENDING_STALL_SECONDS", str(6 * 3600)))
 REVIEW_WATCHDOG_TRIGGER_SILENCE = "silence-timeout"
 REVIEW_WATCHDOG_TRIGGER_DEAD_HANDLE = "dead-terminal-handle"
-
-
-def _automerge_enabled() -> bool:
-    """Kill switch for the dispatcher's own squash-merge on a green layer-3 verdict — read fresh
-    on every call (not a module-load constant) so flipping it back is a plain env change, no
-    redeploy. off/0/false (case-insensitive) disables it; unset or anything else leaves it on."""
-    return os.environ.get("TA_AUTOMERGE", "").strip().lower() not in ("off", "0", "false")
 
 
 # PR link the worker pastes into its report (the done protocol in TASK.md requires it). The last
@@ -280,8 +273,8 @@ def run(records: dict, watchdog_seconds: int, save_cards, statuses: dict[str, st
     """Drive each Validate card (zero LLM below layer 3). `statuses` is this tick's resource health
     from health.refresh, threaded through to _review_watchdog to freeze the layer-3 reviewer's
     clock the same way dispatcher._advance freezes the worker's (see _review_watchdog). The
-    dispatcher merges a green-reviewed PR itself (_review_green; TA_AUTOMERGE=off reverts merging
-    to a human); below layer 3 it only reacts to what gh and the stand report:
+    dispatcher merges a green-reviewed PR itself (validate_review.review_green; TA_AUTOMERGE=off
+    reverts merging to a human); below layer 3 it only reacts to what gh and the stand report:
       merged  -> worker workspace torn down, Done, record dropped (the worker session is over);
       closed without a merge -> Blocked with the reason, record dropped (a human closed it, or it
         went stale — the card must not sit in Validate forever waiting for a merge that won't come);
@@ -697,8 +690,9 @@ def _review_gate(ref: str, pr: str | None, card: dict, records: dict, view: dict
                  contrib: tuple[str, str] | None = None) -> bool:
     """Drive layer 3 for a card whose lower layers are green. Returns whether `records` changed.
     `is_stand` is the caller's already-resolved stand_cfg presence — passed through rather than
-    re-read here, since `_review_green` needs it too. `contrib` is (branch, head sha) for a
-    contrib card (`pr` is then None — see _validate_contrib_card); None for a regular PR card."""
+    re-read here, since validate_review.review_green needs it too. `contrib` is (branch, head sha)
+    for a contrib card (`pr` is then None — see _validate_contrib_card); None for a regular PR
+    card."""
     rec = records.get(ref)
     if rec is None:
         # An untracked Validate card (manual move / adopted without a record): a reviewer head needs
@@ -707,34 +701,15 @@ def _review_gate(ref: str, pr: str | None, card: dict, records: dict, view: dict
         STATE.log_run("review", reference=ref, result="untracked", level="warn", pr=pr)
         return False
     if _no_review(card):
-        return _review_skipped_by_po(ref, pr, card, is_stand, rec, records, contrib)
+        return validate_review.review_skipped_by_po(ref, pr, card, is_stand, rec, records, contrib)
     if "review_baseline" not in rec:
         return _spawn_reviewer(ref, pr, card, rec, records, save_cards, statuses, contrib)
     verdict = _review_verdict(view, int(rec["review_baseline"]))
     if verdict is None:
         return _review_watchdog(ref, rec, records, watchdog_seconds, statuses)
     if verdict == "green":
-        return _review_green(ref, pr, card, is_stand, rec, records, contrib)
+        return validate_review.review_green(ref, pr, card, is_stand, rec, records, contrib)
     return _review_red(ref, pr, card, rec, records, save_cards, refresh_worker_task, contrib)
-
-
-def _review_skipped_by_po(ref: str, pr: str | None, card: dict, is_stand: bool, rec: dict,
-                          records: dict, contrib: tuple[str, str] | None = None) -> bool:
-    """PO set review_head=none: lower layers are already green, so skip only layer 3."""
-    changed = False
-    if not rec.get("no_review_logged"):
-        label = pr if pr else f"ветке `{contrib[0]}` @ `{contrib[1]}`"
-        ops.add_comment(
-            "dispatcher", ref,
-            f"PO отключил LLM-review для этой карточки (`review_head=none`). Нижние слои "
-            f"валидации зелёные; слой 3 пропущен по {label}.",
-            marker=model.MARKER_REVIEW_SKIPPED)
-        rec["no_review_logged"] = True
-        STATE.log_run("review", reference=ref, result="skipped-by-po", pr=pr,
-                      review_head=model.NO_REVIEW_HEAD)
-        changed = True
-    return _review_green(ref, pr, card, is_stand, rec, records, contrib,
-                         review_skipped=True) or changed
 
 
 def _spawn_reviewer(ref: str, pr: str | None, card: dict, rec: dict, records: dict, save_cards,
@@ -885,103 +860,6 @@ def _review_watchdog_block(ref: str, rec: dict, records: dict, ws: str | None, e
     if handle is not None:
         fields["handle"] = handle
     STATE.log_run("review", reference=ref, to="Blocked", reason="review-watchdog", **fields)
-    return True
-
-
-def _review_green_contrib(ref: str, rec: dict, records: dict,
-                          review_skipped: bool = False) -> bool:
-    """Contrib card, green verdict: there is no PR to wait on in this pipeline — a human opens the
-    upstream PR from the pushed branch afterward (out of scope). All three layers are clear, so
-    the card goes straight to Done, mirroring the merged-PR terminal in _validate_card: worker
-    workspace torn down, record dropped."""
-    ws = rec.get("workspace")
-    ops.move_card("dispatcher", ref, "Done")
-    records.pop(ref, None)
-    if ws:
-        worker.teardown(ws)
-    reason = "contrib-no-review" if review_skipped else "contrib-green"
-    STATE.log_run("review", reference=ref, to="Done", reason=reason)
-    return True
-
-
-def _review_green(ref: str, pr: str | None, card: dict, is_stand: bool, rec: dict, records: dict,
-                  contrib: tuple[str, str] | None = None,
-                  review_skipped: bool = False) -> bool:
-    """Green verdict: all three layers clear. Tear the reviewer worktree down once. A contrib card
-    (`contrib` set) has nothing left to wait for — straight to Done (_review_green_contrib).
-
-    With automerge on (the default — _automerge_enabled; TA_AUTOMERGE=off reverts to a human merge
-    with no redeploy) the dispatcher squash-merges the PR itself, once per green verdict, whether
-    the project has a stand or not: a stand's e2e run, or CI + independent review for a project
-    with no stand, is assurance enough (vladmesh: stand automerge on 2026-07-02, extended to every
-    project on 2026-07-04 after 12 green-reviewed merges in a row needed no human catch).
-    `automerge_done` makes a repeated tick that still sees the same green verdict (gh merge-state
-    lag before `poll_pr` reports merged) a no-op rather than a second `gh pr merge` call. A failed
-    attempt — conflict, stale branch, gh down — is a final outcome here, not a retry: a comment
-    with the reason and straight to Blocked so a human is pulled in instead of the tick hammering
-    `gh pr merge` forever.
-
-    Before that squash merge, the PR's actual base (worker.pr_base_branch) is checked against
-    resolve_base_branch(project, card's own base_branch) — a worker on a sprint-shim card
-    (base_branch=sprint/NNN) who ignores TASK.md and lets `gh pr create` default to main would
-    otherwise get silently squash-merged into main, exactly what the shim exists to prevent
-    (triggered-agents-266). A mismatch never reached a merge, so it Blocks rather than retrying;
-    gh being unreachable here is a transient like poll_pr/pr_branch, so it just waits for a tick
-    where gh answers.
-
-    With automerge off, the card logs the terminal green exactly once (`review_green_logged`), not
-    on every tick it idles here waiting for a human to merge — the original one-shot contract this
-    event had before automerge existed at all."""
-    changed = False
-    if rec.get("review_ws"):
-        worker.teardown(rec["review_ws"])
-        rec["review_ws"] = ""
-        changed = True
-    if contrib is not None:
-        return _review_green_contrib(ref, rec, records, review_skipped) or changed
-    if not _automerge_enabled():
-        if rec.get("review_green_logged"):
-            return changed
-        rec["review_green_logged"] = True
-        result = "no-review-green" if review_skipped else "green"
-        STATE.log_run("review", reference=ref, result=result)
-        return True
-    if rec.get("automerge_done"):
-        return changed
-    expected_base = worker.resolve_base_branch(card.get("project") or "", card.get("base_branch") or "")
-    actual_base = worker.pr_base_branch(pr)
-    if actual_base is None:
-        return changed
-    if actual_base != expected_base:
-        ops.add_comment("dispatcher", ref,
-                        f"PR {pr} открыт против `{actual_base}`, ожидалась база `{expected_base}` — "
-                        f"автомерж остановлен, карточка в Blocked.")
-        ops.move_card("dispatcher", ref, "Blocked")
-        records.pop(ref, None)
-        STATE.log_run("review", reference=ref, to="Blocked", reason="base-mismatch", pr=pr,
-                      expected=expected_base, actual=actual_base)
-        return True
-    rec["automerge_done"] = True
-    result = worker.merge_pr(pr)
-    if result["ok"]:
-        if review_skipped:
-            layers = "CI, стенд, LLM-review отключён PO" if is_stand else "CI, LLM-review отключён PO"
-        else:
-            layers = "CI, стенд, ревью" if is_stand else "CI, ревью"
-        ops.add_comment("dispatcher", ref,
-                        f"Все слои валидации зелёные ({layers}) — автомерж {pr}.",
-                        marker=model.MARKER_AUTOMERGE)
-        log_result = "no-review-automerge" if review_skipped else "green-automerge"
-        STATE.log_run("review", reference=ref, result=log_result, pr=pr)
-        return True
-    scrubbed = worker.scrub_secrets(result.get("error") or "(без деталей)")
-    ops.add_comment("dispatcher", ref,
-                    f"Автомерж {pr} не удался: {scrubbed}. Карточка в Blocked, нужна ручная "
-                    f"проверка и мерж руками.")
-    ops.move_card("dispatcher", ref, "Blocked")
-    records.pop(ref, None)
-    STATE.log_run("review", reference=ref, to="Blocked", reason="automerge-fail", pr=pr,
-                  error=scrubbed)
     return True
 
 

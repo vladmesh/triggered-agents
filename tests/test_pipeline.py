@@ -294,6 +294,18 @@ class TestCreate(PatchedBoardTest):
         out = ops.create_card("personal_site", "code", "T", review_head=model.NO_REVIEW_HEAD)
         self.assertEqual(board.metadata[out["id"]][model.META_REVIEW_HEAD], model.NO_REVIEW_HEAD)
 
+    def test_worker_and_steward_create_cannot_set_no_review(self):
+        board = self.make_board()
+        own = board.add_task("A", "In progress", meta={model.META_TASK_TYPE: "code",
+                                                       model.META_PROJECT: "personal_site"})
+        with self.assertRaises(model.GuardError):
+            ops.create_card("personal_site", "code", "T", column="Ready", blocked_by=own,
+                            role="worker", own_ref=own, review_head=model.NO_REVIEW_HEAD)
+        with self.assertRaises(model.GuardError):
+            ops.create_card("personal_site", "code", "T", role="steward",
+                            review_head=model.NO_REVIEW_HEAD)
+        self.assertEqual(len(board.tasks), 1)
+
     def test_unknown_head_raises_and_creates_nothing(self):
         board = self.make_board()
         with self.assertRaises(model.GuardError):
@@ -651,6 +663,17 @@ class TestCliCreateReviewHead(PatchedBoardTest):
         self.assertEqual(rc, 0)
         tid = next(iter(board.tasks))
         self.assertEqual(board.metadata[tid][model.META_REVIEW_HEAD], model.NO_REVIEW_HEAD)
+
+    def test_worker_create_with_review_head_none_rejected(self):
+        board = self.make_board()
+        own = board.add_task("A", "In progress", meta={model.META_TASK_TYPE: "code",
+                                                       model.META_PROJECT: "personal_site"})
+        rc = self.cli.main(["--role", "worker", "create", "--project", "personal_site",
+                           "--type", "code", "--title", "T", "--column", "Ready",
+                           "--blocked-by", own, "--own-ref", own,
+                           "--review-head", model.NO_REVIEW_HEAD])
+        self.assertEqual(rc, 3)
+        self.assertEqual(len(board.tasks), 1)
 
 
 class TestListShowHeads(PatchedBoardTest):

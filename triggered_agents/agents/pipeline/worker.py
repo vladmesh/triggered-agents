@@ -803,9 +803,9 @@ def merge_pr(pr_url: str) -> dict:
     """Squash-merge a PR via gh. Returns {"ok": bool, "error": str|None}.
 
     Unlike poll_pr/pr_branch/run_stand, this is never a "retry next tick" call: the dispatcher
-    calls it at most once per green review (see validate._review_green), and any failure here —
-    including gh being unavailable — is a final outcome the caller reports and Blocks on, not an
-    unknown to poll again."""
+    calls it at most once per green review (see validate_review.review_green), and any failure
+    here — including gh being unavailable — is a final outcome the caller reports and Blocks on,
+    not an unknown to poll again."""
     try:
         p = subprocess.run([GH, "pr", "merge", pr_url, "--squash"],
                            capture_output=True, text=True, timeout=GH_TIMEOUT_S)
@@ -916,9 +916,9 @@ def pr_branch(pr_url: str) -> str | None:
 
 def pr_base_branch(pr_url: str) -> str | None:
     """The PR's actual base branch via gh, or None if gh cannot answer (same contract as poll_pr) —
-    read by validate._review_green right before merge_pr, to catch a PR opened against the wrong
-    base (e.g. a sprint-shim card whose worker ignored TASK.md and let `gh pr create` default to
-    main) instead of silently squash-merging it there."""
+    read by validate_review.review_green right before merge_pr, to catch a PR opened against the
+    wrong base (e.g. a sprint-shim card whose worker ignored TASK.md and let `gh pr create`
+    default to main) instead of silently squash-merging it there."""
     data = _gh_json(["pr", "view", pr_url, "--json", "baseRefName"])
     if not isinstance(data, dict):
         return None
