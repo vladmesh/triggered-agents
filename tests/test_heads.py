@@ -34,6 +34,8 @@ class RealRegistryTest(unittest.TestCase):
         self.assertEqual(set(self.reg.known()),
                          {"claude-default", "claude-sonnet", "claude-opus", "claude-fable",
                           "hermes", "codex", "codex-high", "codex-extra", "codex-reviewer",
+                          "codex-sol", "codex-terra", "codex-luna", "codex-5-4",
+                          "codex-mini", "codex-spark",
                           "codex-tui", "codex-high-tui", "codex-extra-tui",
                           "codex-reviewer-tui", "codex-curator", "codex-steward",
                           "codex-retro"})
@@ -67,6 +69,29 @@ class RealRegistryTest(unittest.TestCase):
         self.assertEqual(self.reg.profile("codex-steward").get("fallback"), ["claude-fable"])
         self.assertEqual(self.reg.profile("codex-reviewer").get("fallback"), ["claude-opus"])
         self.assertEqual(self.reg.profile("codex-reviewer-tui").get("fallback"), ["claude-opus"])
+
+    def test_visible_codex_catalog_has_worker_profiles(self):
+        expected = {
+            "codex-sol": "gpt-5.6-sol",
+            "codex-terra": "gpt-5.6-terra",
+            "codex-luna": "gpt-5.6-luna",
+            "codex": "gpt-5.5",
+            "codex-5-4": "gpt-5.4",
+            "codex-mini": "gpt-5.4-mini",
+            "codex-spark": "gpt-5.3-codex-spark",
+        }
+        for profile_id, model in expected.items():
+            profile = self.reg.profile(profile_id)
+            self.assertEqual(profile["resource"], "openai-sub")
+            self.assertEqual(profile["adapter"], "codex")
+            self.assertEqual(profile["model"], model)
+            self.assertEqual(profile["effort"], "default")
+            self.assertEqual(profile.get("fallback") or [], [])
+
+    def test_hidden_auto_review_model_is_not_a_worker_profile(self):
+        self.assertNotIn("codex-auto-review", self.reg.known())
+        self.assertFalse(any(self.reg.profile(pid).get("model") == "codex-auto-review"
+                             for pid in self.reg.known()))
 
     def test_hermes_is_on_its_own_resource(self):
         self.assertEqual(self.reg.profile("hermes")["resource"], "openrouter")
@@ -162,6 +187,20 @@ class RenderCodexTest(unittest.TestCase):
         cmd = heads.render_command("codex-extra", role="worker", prompt="ping", registry=self.reg)
         self.assertIn("-m gpt-5.5", cmd)
         self.assertIn("model_reasoning_effort=\"xhigh\"", cmd)
+
+    def test_renders_explicit_catalog_models_without_effort_override(self):
+        expected = {
+            "codex-sol": "gpt-5.6-sol",
+            "codex-terra": "gpt-5.6-terra",
+            "codex-luna": "gpt-5.6-luna",
+            "codex-5-4": "gpt-5.4",
+            "codex-mini": "gpt-5.4-mini",
+            "codex-spark": "gpt-5.3-codex-spark",
+        }
+        for profile_id, model in expected.items():
+            cmd = heads.render_command(profile_id, role="worker", prompt="ping", registry=self.reg)
+            self.assertIn(f"-m {model}", cmd)
+            self.assertNotIn("model_reasoning_effort", cmd)
 
     def test_profile_codex_home_overrides_pin(self):
         prof = dict(self.reg.profile("codex"), codex_home="/tmp/throwaway-home")
