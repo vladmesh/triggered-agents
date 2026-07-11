@@ -806,12 +806,12 @@ def tick() -> int:
     """One dispatcher tick — see the module docstring for the per-tick order. A hard pause freezes
     this solid: reconcile/advance/validate/claim all touch a head or the board on the pipeline's
     behalf, and every head that would need touching was already stopped by pause() itself, so there
-    is nothing safe left to do until resume() marks stopped workers parked or relaunches their
-    reviewer. Running any of these against a stopped head would either hang on a dead terminal or
-    silently accumulate watchdog silence, exactly what resume()'s clock reset exists to avoid
-    needing in the first place. A soft pause only turns off _claim_next: every claimed card keeps
-    riding its normal cycle (advance, CI/stand, layer-3 review, automerge) untouched, so Ready
-    cards are the only thing that doesn't move."""
+    is nothing safe left to do until resume() relaunches stopped In-progress workers and reviewers
+    or parks Validate-only workers for a possible rework return. Running any of these against a
+    stopped head would either hang on a dead terminal or silently accumulate watchdog silence,
+    exactly what resume()'s clock reset exists to avoid needing in the first place. A soft pause
+    only turns off _claim_next: every claimed card keeps riding its normal cycle (advance, CI/stand,
+    layer-3 review, automerge) untouched, so Ready cards are the only thing that doesn't move."""
     _auto_resume_stale_hard_pause(pause_flag.load(), source="tick")
     with _tick_lock():
         paused = pause_flag.load()
