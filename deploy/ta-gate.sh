@@ -8,7 +8,11 @@
 # Exit-code protocol of `python3 -m triggered_agents <agent> precheck` (all agents, see each cli.py
 # and runtime/state.py PRECHECK_SKIP):
 #   0              -> there is work: exec the dispatch, the head wakes up.
-#   100            -> deliberate skip (nothing changed / paused): a clean unit run, nothing to do.
+#   100            -> deliberate skip (nothing changed / paused): no new skill dispatch, but still
+#                     run `dispatch --cleanup-only` (triggered-agents-445) so an ephemeral agent's
+#                     already-finished or stuck terminal gets torn down on THIS tick instead of
+#                     waiting for a future tick that happens to have real work — dispatch (and
+#                     every cleanup path inside it) is otherwise never invoked at all on a skip.
 #   any other code -> precheck itself broke (crash, bad env, board unreachable): propagate the code
 #                     so the unit is recorded `failed` in systemctl, distinguishable from a skip.
 # 100 is deliberately not 1: Python's default uncaught-crash exit code is 1, so a precheck that dies
@@ -48,8 +52,8 @@ rc=$?
 if [ "$rc" -eq 0 ]; then
     exec_role_env python3 -m triggered_agents "$agent" dispatch
 elif [ "$rc" -eq 100 ]; then
-    echo "[ta-$agent] precheck: no change, run skipped"
-    exit 0
+    echo "[ta-$agent] precheck: no change, skill dispatch skipped"
+    exec_role_env python3 -m triggered_agents "$agent" dispatch --cleanup-only
 else
     echo "[ta-$agent] precheck: ERROR (rc=$rc); see runs.jsonl" >&2
     exit "$rc"

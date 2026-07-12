@@ -42,6 +42,7 @@ class AgentState:
         self.lockfile = self.dir / "lock"
         self.head_profile_file = self.dir / "head_profile.json"
         self.terminal_handle_file = self.dir / "terminal_handle.json"
+        self.terminal_generation_file = self.dir / "terminal_generation.json"
         self.active_report_file = self.dir / "active_report.json"
 
     def ensure_dir(self) -> None:
@@ -92,11 +93,76 @@ class AgentState:
         except json.JSONDecodeError:
             return None
 
-    def save_terminal_handle(self, handle: str | None) -> None:
+    def next_terminal_generation(self) -> int:
+        """Monotonic per-agent counter, bumped once per real terminal create and stamped into that
+        terminal's own self-teardown trailer (triggered-agents-445, PR #95 review B2, round 4).
+
+        Never reset — not even when a terminal is torn down. A finalizer running after its head
+        exits must be able to tell its OWN completed terminal apart from a replacement a concurrent
+        tick created in the meantime: it compares the generation baked into its trailer against the
+        generation recorded for the workspace's current terminal (`load_terminal_generation`). A
+        counter that reset on teardown could hand a replacement the same number a late finalizer is
+        still carrying, which would let that finalizer's blanket `terminal stop` kill the live
+        replacement. Kept in its own file so tearing the handle down (which unlinks
+        terminal_handle.json) never rolls the counter back."""
+        cur = 0
+        if self.terminal_generation_file.is_file():
+            try:
+                cur = int(json.loads(self.terminal_generation_file.read_text(encoding="utf-8")).get("counter", 0))
+            except (json.JSONDecodeError, ValueError, TypeError):
+                cur = 0
+        nxt = cur + 1
+        self.ensure_dir()
+        tmp = self.terminal_generation_file.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps({"counter": nxt}, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(self.terminal_generation_file)
+        return nxt
+
+    def load_terminal_generation(self) -> int | None:
+        """The generation stamped on the workspace's CURRENT live terminal (the one recorded in
+        terminal_handle.json), or None if none is recorded. `dispatch.finalize` compares the
+        generation baked into its own trailer against this to decide whether the live terminal is
+        still its own (safe to stop) or a replacement a concurrent tick already put in its place
+        (must not be touched) — triggered-agents-445, PR #95 review B2, round 4."""
+        if not self.terminal_handle_file.is_file():
+            return None
+        try:
+            return json.loads(self.terminal_handle_file.read_text(encoding="utf-8")).get("generation")
+        except json.JSONDecodeError:
+            return None
+
+    def load_terminal_created_at(self) -> float | None:
+        """When `_create_terminal` last actually spawned a process for this agent (epoch
+        seconds), or None if never recorded — the marker `dispatch.run`'s "no terminal" branch
+        checks before creating another one, since a terminal it just created may not be visible
+        in `terminal list` yet (triggered-agents-445, PR #95 review B2): a second dispatch landing
+        in that visibility gap must not read "no terminal" as "nothing was ever spawned" and
+        create a duplicate."""
+        if not self.terminal_handle_file.is_file():
+            return None
+        try:
+            return json.loads(self.terminal_handle_file.read_text(encoding="utf-8")).get("created_at")
+        except json.JSONDecodeError:
+            return None
+
+    def save_terminal_handle(self, handle: str | None, created_at: float | None = None,
+                             generation: int | None = None) -> None:
         """Record the terminal handle from the latest fresh spawn.
 
         Codex can rename its tab away from the explicit `triggered-agent:<name>` title after
-        startup, so title matching alone is not stable enough for singleton reuse."""
+        startup, so title matching alone is not stable enough for singleton reuse.
+
+        `created_at` (epoch seconds) is set only by `_create_terminal` at the moment it actually
+        spawns a process — a plain warm-reuse call (the terminal already existed and is just being
+        re-confirmed as the survivor) passes none, which drops any previously recorded timestamp:
+        by the time reuse runs the terminal is already confirmed visible, so there is nothing left
+        for `load_terminal_created_at`'s visibility-gap check to guard.
+
+        `generation` is the monotonic id from `next_terminal_generation`, recorded only for an
+        ephemeral agent's fresh create so `dispatch.finalize` can tell whether the workspace's live
+        terminal is still the one its own trailer belongs to (triggered-agents-445, PR #95 review
+        B2, round 4). A `handle=None` call tears the record down (finalize after a confirmed
+        teardown); the monotonic counter in its own file is deliberately left untouched."""
         self.ensure_dir()
         if not handle:
             try:
@@ -104,12 +170,16 @@ class AgentState:
             except FileNotFoundError:
                 pass
             return
+        payload = {"handle": handle}
+        if created_at is not None:
+            payload["created_at"] = created_at
+        if generation is not None:
+            payload["generation"] = generation
         tmp = self.terminal_handle_file.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps({"handle": handle}, ensure_ascii=False), encoding="utf-8")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
         tmp.replace(self.terminal_handle_file)
 
     def load_active_report(self) -> dict | None:
-        """The steward report card currently tied to a successfully delivered dispatch."""
         if not self.active_report_file.is_file():
             return None
         try:
@@ -119,25 +189,16 @@ class AgentState:
         return data if isinstance(data, dict) else None
 
     def save_active_report(self, reference: str | None, terminal_handle: str | None) -> None:
-        """Record the report-card/run identity after the head accepts a steward dispatch."""
         self.ensure_dir()
         if not reference or not terminal_handle:
             self.clear_active_report(reference)
             return
         tmp = self.active_report_file.with_suffix(".json.tmp")
-        tmp.write_text(
-            json.dumps({"reference": reference, "terminal_handle": terminal_handle},
-                       ensure_ascii=False),
-            encoding="utf-8",
-        )
+        tmp.write_text(json.dumps({"reference": reference, "terminal_handle": terminal_handle},
+                                  ensure_ascii=False), encoding="utf-8")
         tmp.replace(self.active_report_file)
 
     def clear_active_report(self, reference: str | None = None) -> None:
-        """Drop the active steward report marker.
-
-        When `reference` is supplied, leave a newer marker alone. That keeps a failed cleanup for
-        an older card from erasing the identity of a later dispatch.
-        """
         if reference is not None:
             current = self.load_active_report()
             if current and current.get("reference") != reference:

@@ -4,6 +4,10 @@ Focus: every path that spawns a NEW process (fresh create, watchdog restart) mus
 pre-answer folder trust + the onboarding theme picker first (`_ensure_claude_ready`), so a fresh
 Claude head never lands on an interactive prompt and becomes an orphan invisible to the terminal
 match. Warm reuse sends into an already-answered terminal, so it must not re-run prep.
+
+triggered-agents-445's ephemeral/cleanup-only/stray-sweep lifecycle tests live in
+`test_dispatch_lifecycle.py`, not here — kept separate so this file doesn't grow past a size
+where a single PR's diff is hard to review in one pass (PR #95 review B4).
 """
 from __future__ import annotations
 
@@ -21,6 +25,7 @@ os.environ["TA_PIPELINE_STATE_DIR"] = tempfile.mkdtemp(prefix="ta-runtime-dispat
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # repo root
 
 from triggered_agents.runtime import dispatch  # noqa: E402
+from tests._dispatch_fixtures import _DispatchBase  # noqa: E402
 
 
 def _inner_shell(cmd: str) -> str:
@@ -33,72 +38,6 @@ def _inner_shell(cmd: str) -> str:
 def _role(cmd: str) -> str:
     parts = shlex.split(cmd)
     return parts[parts.index("--role") + 1]
-
-
-class _DispatchBase(unittest.TestCase):
-    """Fakes every Orca touch dispatch.run() makes; records the ones a test cares about."""
-
-    def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.tmp.cleanup)
-        self._state_patch = mock.patch("triggered_agents.runtime.state.STATE_ROOT", Path(self.tmp.name))
-        self._state_patch.start()
-        self.addCleanup(self._state_patch.stop)
-
-        self.terminals = []          # terminal list dispatch sees for the workspace
-        self.orca_json_calls = []
-        self.orca_calls = []
-        self.ready_calls = []        # (workspace,) each time _ensure_claude_ready runs
-
-        p = mock.patch.object(dispatch, "_launch_cmd",
-                              lambda agent, variant=None: ("/skill", "claude ... /skill", "fake-profile"))
-        p.start()
-        self.addCleanup(p.stop)
-
-        p = mock.patch.object(dispatch, "_workspace", lambda agent: "/ws/agent")
-        p.start()
-        self.addCleanup(p.stop)
-
-        p = mock.patch.object(dispatch, "_reap_ghosts", lambda ws: 0)
-        p.start()
-        self.addCleanup(p.stop)
-
-        def fake_orca_json(args):
-            self.orca_json_calls.append(args)
-            if args[:2] == ["terminal", "list"]:
-                return {"terminals": self.terminals}
-            if args[:2] == ["terminal", "wait"]:
-                return {"wait": {"satisfied": self.idle}}
-            if args[:2] == ["terminal", "create"]:
-                return {"terminal": {"handle": "new-terminal"}}
-            return {}
-
-        p = mock.patch.object(dispatch, "_orca_json", fake_orca_json)
-        p.start()
-        self.addCleanup(p.stop)
-
-        p = mock.patch.object(dispatch, "_orca", lambda args: self.orca_calls.append(args))
-        p.start()
-        self.addCleanup(p.stop)
-
-        p = mock.patch.object(dispatch, "_ensure_claude_ready",
-                              lambda ws: self.ready_calls.append(ws))
-        p.start()
-        self.addCleanup(p.stop)
-
-        p = mock.patch("time.sleep", lambda s: None)
-        p.start()
-        self.addCleanup(p.stop)
-
-        self.idle = True
-
-    def _logged_actions(self):
-        import json
-
-        runs = dispatch.AgentState("agent").dir / "runs.jsonl"
-        if not runs.is_file():
-            return []
-        return [json.loads(l).get("action") for l in runs.read_text(encoding="utf-8").splitlines()]
 
 
 class DispatchRunTest(_DispatchBase):
@@ -571,7 +510,7 @@ class StewardReportCardDispatchTest(unittest.TestCase):
         p.start()
         self.addCleanup(p.stop)
 
-        p = mock.patch.object(dispatch, "_reap_ghosts", lambda ws: 0)
+        p = mock.patch.object(dispatch, "_reap_ghosts", lambda ws: (0, True))
         p.start()
         self.addCleanup(p.stop)
 
@@ -591,7 +530,12 @@ class StewardReportCardDispatchTest(unittest.TestCase):
         p.start()
         self.addCleanup(p.stop)
 
-        p = mock.patch.object(dispatch, "_orca", lambda args: self.orca_calls.append(args))
+        def fake_orca(args):
+            self.orca_calls.append(args)
+            if args[:2] == ["terminal", "stop"]:
+                self.terminals = []
+
+        p = mock.patch.object(dispatch, "_orca", fake_orca)
         p.start()
         self.addCleanup(p.stop)
 
