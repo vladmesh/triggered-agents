@@ -1,8 +1,7 @@
 """Kanboard JSON-RPC transport — thin, stdlib-only, credentials from env.
 
 App-level access is HTTP Basic `jsonrpc:$KANBOARD_API_TOKEN` against the endpoint in
-`$KANBOARD_URL` (`.../jsonrpc.php`). Injected by the Orca automation; for manual runs
-source `control-panel/.env` first.
+`$KANBOARD_URL` (`.../jsonrpc.php`). Launchers provide these through role-scoped runtime env.
 
 `call(method, **params)` returns the JSON-RPC `result` or raises KanboardError on a
 transport failure or an RPC-level error. Higher-level board operations live in
@@ -32,7 +31,7 @@ def _creds() -> tuple[str, str, str]:
         token = os.environ[_ENV_TOKEN]
     except KeyError as e:
         raise KanboardError(
-            f"missing {e.args[0]} in env (source control-panel/.env before running)"
+            f"missing {e.args[0]} in runtime env (check provisioning/launcher)"
         ) from e
     return url, user, token
 

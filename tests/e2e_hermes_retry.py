@@ -16,9 +16,7 @@ Proves three things:
 NOT a unit test (name is e2e_*, so `unittest discover` skips it). Board: throwaway __e2e__
 (removed after).
 
-Prep:
-  1. source control-panel/.env (KANBOARD_*)
-  2. python3 tests/e2e_hermes_retry.py
+Run: `python3 tests/e2e_hermes_retry.py`. The script loads the pipeline runtime env itself.
 """
 from __future__ import annotations
 
@@ -29,8 +27,14 @@ import sys
 import tempfile
 from pathlib import Path
 
-if not os.environ.get("KANBOARD_URL"):
-    print("e2e: KANBOARD_URL unset; source control-panel/.env first, then re-run", file=sys.stderr)
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from triggered_agents.runtime import role_env  # noqa: E402
+
+try:
+    role_env.apply_runtime_env("pipeline")
+except role_env.RoleEnvError as e:
+    print(f"e2e: {e}", file=sys.stderr)
     raise SystemExit(2)
 
 os.environ["TA_PIPELINE_BOARD"] = "__e2e__"
@@ -38,8 +42,6 @@ os.environ["TA_HEALTH_FORCE_RED"] = "claude-sub"
 _STATE_DIR = tempfile.mkdtemp(prefix="ta-hermes-e2e-")
 os.environ["TA_STATE"] = _STATE_DIR
 os.environ["TA_PIPELINE_STATE_DIR"] = tempfile.mkdtemp(prefix="ta-hermes-live-state-e2e-")
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from triggered_agents.runtime.kanboard import call  # noqa: E402
 from triggered_agents.agents.pipeline import cli, dispatcher, heads, health, model, ops  # noqa: E402
@@ -95,7 +97,6 @@ def main() -> int:
         prompt = (f"Ответь одним словом, ровно этой строкой, без кавычек и пояснений: {marker}. "
                   "Затем немедленно заверши сессию командой /exit.")
         cmd = heads.render_command("hermes", role="worker", prompt=prompt)
-        cmd = cmd.split(" ", 1)[1]  # strip BOARD_ROLE=worker: no board interaction in this leg
         print(f"hermes cmd: {cmd}")
         proc = subprocess.run(["bash", "-lc", cmd], capture_output=True, text=True,
                               timeout=HERMES_TIMEOUT_S)

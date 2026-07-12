@@ -24,10 +24,10 @@ class VariantServiceUnitTest(unittest.TestCase):
         self.assertIn(f"ExecStart={GATE_INSTALL_PATH} steward deep-sweep", unit)
         self.assertNotIn("bash -lc", unit)
 
-    def test_env_file_included_when_given(self):
-        unit = _variant_service_unit("steward", "deep-sweep", "03:47:00", Path("/ws/steward"),
-                                      env_file="/home/dev/control-panel/.env")
-        self.assertIn("EnvironmentFile=/home/dev/control-panel/.env", unit)
+    def test_full_env_file_is_not_included(self):
+        unit = _variant_service_unit("steward", "deep-sweep", "03:47:00", Path("/ws/steward"))
+        self.assertNotIn("EnvironmentFile=", unit)
+        self.assertNotIn("/home/dev/control-panel/.env", unit)
 
     def test_env_file_omitted_when_blank(self):
         unit = _variant_service_unit("steward", "deep-sweep", "03:47:00", Path("/ws/steward"))

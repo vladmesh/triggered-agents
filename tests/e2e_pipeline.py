@@ -4,7 +4,7 @@ NOT a unit test (name is e2e_*, so `unittest discover` skips it). It drives the 
 in-process through cli.main(argv), so exit codes come from main()'s return, not process
 exit. It runs against a throwaway board `__e2e__` and removes it in a finally.
 
-Prep: source control-panel/.env first so KANBOARD_* are set, then `python3 tests/e2e_pipeline.py`.
+Run: `python3 tests/e2e_pipeline.py`. The script loads the pipeline runtime env itself.
 """
 from __future__ import annotations
 
@@ -16,8 +16,14 @@ import tempfile
 from contextlib import redirect_stdout
 from pathlib import Path
 
-if not os.environ.get("KANBOARD_URL"):
-    print("e2e: KANBOARD_URL unset; source control-panel/.env first, then re-run", file=sys.stderr)
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from triggered_agents.runtime import role_env  # noqa: E402
+
+try:
+    role_env.apply_runtime_env("pipeline")
+except role_env.RoleEnvError as e:
+    print(f"e2e: {e}", file=sys.stderr)
     raise SystemExit(2)
 
 # Set env BEFORE importing triggered_agents (BOARD_NAME and TA_STATE are read at import time).
@@ -25,9 +31,6 @@ os.environ["TA_PIPELINE_BOARD"] = "__e2e__"
 _STATE_DIR = tempfile.mkdtemp(prefix="ta-pipeline-e2e-")
 os.environ["TA_STATE"] = _STATE_DIR
 os.environ["TA_PIPELINE_STATE_DIR"] = tempfile.mkdtemp(prefix="ta-pipeline-live-state-e2e-")
-
-# Run as `python3 tests/e2e_pipeline.py`: sys.path[0] is tests/, so add the repo root.
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from triggered_agents.runtime.kanboard import call  # noqa: E402
 from triggered_agents.agents.pipeline import cli, model  # noqa: E402

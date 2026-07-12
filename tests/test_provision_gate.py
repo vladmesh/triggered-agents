@@ -21,8 +21,26 @@ def _run_gate(rc: int, *args: str) -> subprocess.CompletedProcess:
     with tempfile.TemporaryDirectory(prefix="ta-gate-test-") as d:
         root = Path(d)
         pkg = root / "triggered_agents"
+        runtime = pkg / "runtime"
         pkg.mkdir()
+        runtime.mkdir()
         (pkg / "__init__.py").write_text("", encoding="utf-8")
+        (runtime / "__init__.py").write_text("", encoding="utf-8")
+        (runtime / "role_env.py").write_text(textwrap.dedent("""
+            import os
+            import sys
+
+            def main():
+                argv = sys.argv[1:]
+                if argv[:1] != ["exec"]:
+                    raise SystemExit(2)
+                idx = argv.index("--")
+                cmd = argv[idx + 1:]
+                os.execvp(cmd[0], cmd)
+
+            if __name__ == "__main__":
+                main()
+        """), encoding="utf-8")
         (pkg / "__main__.py").write_text(textwrap.dedent("""
             import os
             import sys

@@ -67,7 +67,7 @@ class DriftCheckTest(unittest.TestCase):
     def _expected(self, agent: str) -> tuple[str, str]:
         ws = self.workspaces_root / agent
         service = provision._service_unit(agent, "hourly", ws,
-                                          f"python3 -m triggered_agents {agent} precheck", "")
+                                          f"python3 -m triggered_agents {agent} precheck")
         timer = provision._timer_unit(agent, "hourly", 90)
         return service, timer
 

@@ -17,8 +17,8 @@ gh CLI — so the merge/Done path is exercised end to end, not stubbed. Only wor
 terminal nudge) is stubbed, since there is no live worker head. If gh is missing/unauthed the poll
 returns None and the card stays put with a warn line — the run prints that it could not reach gh.
 
-Prep: source control-panel/.env first so KANBOARD_* are set, gh authed, then
-`python3 tests/e2e_dispatcher.py`.
+Run: `python3 tests/e2e_dispatcher.py`. The script loads the pipeline runtime env itself; gh
+must still be authed through its normal credential store.
 """
 from __future__ import annotations
 
@@ -29,8 +29,14 @@ import sys
 import tempfile
 from pathlib import Path
 
-if not os.environ.get("KANBOARD_URL"):
-    print("e2e: KANBOARD_URL unset; source control-panel/.env first, then re-run", file=sys.stderr)
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from triggered_agents.runtime import role_env  # noqa: E402
+
+try:
+    role_env.apply_runtime_env("pipeline")
+except role_env.RoleEnvError as e:
+    print(f"e2e: {e}", file=sys.stderr)
     raise SystemExit(2)
 
 os.environ["TA_PIPELINE_BOARD"] = "__e2e__"
@@ -38,8 +44,6 @@ _STATE_DIR = tempfile.mkdtemp(prefix="ta-dispatcher-e2e-")
 os.environ["TA_STATE"] = _STATE_DIR
 _PIPELINE_STATE_DIR = tempfile.mkdtemp(prefix="ta-dispatcher-live-state-e2e-")
 os.environ["TA_PIPELINE_STATE_DIR"] = _PIPELINE_STATE_DIR
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from triggered_agents.runtime.kanboard import call  # noqa: E402
 from triggered_agents.agents.pipeline import cli, dispatcher, model, ops, worker  # noqa: E402
