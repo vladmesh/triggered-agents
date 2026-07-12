@@ -34,17 +34,28 @@ def main(argv=None) -> int:
         # generic singleton terminal driver that keeps one warm claude terminal per agent.
         dispatch_args = rest[1:]
         cleanup_only = "--cleanup-only" in dispatch_args
+        finalize = "--finalize" in dispatch_args
         if agent == "pipeline":
             # ta-gate.sh (triggered-agents-445) now sends `--cleanup-only` to EVERY agent on a
             # precheck skip, pipeline included. The dispatcher has no terminal/PTY lifecycle at
             # all -- `--cleanup-only` here must be the exact no-op a plain skip always was, NOT a
             # full reconcile/advance/validate/claim tick (PR #95 review B1: this special case
-            # ignored the flag entirely and ran dispatcher.tick() regardless).
-            if cleanup_only:
+            # ignored the flag entirely and ran dispatcher.tick() regardless). `--finalize` is
+            # never appended to a pipeline launch command (dispatch.py only does that for an
+            # ephemeral singleton-terminal agent, which pipeline isn't), but treat it the same
+            # defensive way if it somehow arrives.
+            if cleanup_only or finalize:
                 return 0
             from .agents.pipeline import dispatcher
             return dispatcher.tick()
         from .runtime import dispatch
+        if finalize:
+            # Self-teardown trailer `_with_finalizer` appends to an ephemeral head's own launch
+            # command (triggered-agents-445, PR #95 review B1, round 3) -- runs inside the very
+            # terminal it's tearing down, the instant the head process exits. Not `dispatch.run`:
+            # it doesn't dispatch anything, doesn't take a variant, and needs its own lock
+            # handling (see dispatch.finalize's docstring).
+            return dispatch.finalize(agent)
         # An optional variant name (e.g. the steward's "deep-sweep", triggered-agents-254)
         # selects a second, differently-scheduled mode of the same agent — see automation.toml's
         # [variants.<name>] table and dispatch.run's docstring. `--cleanup-only` (triggered-

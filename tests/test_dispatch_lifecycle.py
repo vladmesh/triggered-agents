@@ -253,6 +253,93 @@ class StraySweepTest(_DispatchBase):
         self.assertEqual(self._logged_actions(), ["created"])
 
 
+class FinalizerTest(_DispatchBase):
+    """triggered-agents-445, PR #95 review B1 (round 3): every dispatch.run() cleanup path
+    (idle-ephemeral, watchdog, cleanup-only, stray-sweep) is still only ever REACHED by some
+    future tick's poll. `_create_terminal` closes that gap for an ephemeral agent by appending a
+    self-teardown trailer (`_with_finalizer`) to the head's own launch command, so the terminal
+    tears itself down (`dispatch.finalize`) the instant the head process exits, with no tick
+    involved at all."""
+
+    def setUp(self):
+        super().setUp()
+        p = mock.patch.object(dispatch, "_load_spec", lambda agent: {"ephemeral": True})
+        p.start()
+        self.addCleanup(p.stop)
+
+    def _created_command(self):
+        create_calls = [c for c in self.orca_json_calls if c[:2] == ["terminal", "create"]]
+        self.assertEqual(len(create_calls), 1)
+        args = create_calls[0]
+        return args[args.index("--command") + 1]
+
+    def test_ephemeral_create_embeds_a_self_teardown_trailer(self):
+        self.terminals = []
+        dispatch.run("agent")
+        command = self._created_command()
+        self.assertIn("dispatch --finalize", command)
+        # `;`, not `&&` -- the trailer must run regardless of the head's own exit code
+        self.assertIn("; ", command)
+        self.assertLess(command.index("claude"), command.index("dispatch --finalize"))
+
+    def test_non_ephemeral_create_gets_no_trailer(self):
+        with mock.patch.object(dispatch, "_load_spec", lambda agent: {}):
+            self.terminals = []
+            dispatch.run("agent")
+        command = self._created_command()
+        self.assertNotIn("--finalize", command)
+
+    def test_finalize_tears_down_after_stop_confirms(self):
+        self.terminals = [{"handle": "h1", "title": "✳ Claude Code", "lastOutputAt": 1000}]
+        reap_calls = []
+        with mock.patch.object(dispatch, "_reap_ghosts", lambda ws: reap_calls.append(ws) or 1):
+            dispatch.finalize("agent")
+        stop_calls = [c for c in self.orca_calls if c[:2] == ["terminal", "stop"]]
+        self.assertEqual(len(stop_calls), 1)
+        self.assertEqual(reap_calls, ["/ws/agent"])
+        self.assertEqual(self._logged_actions(), ["self-teardown"])
+
+    def test_finalize_never_creates_a_terminal(self):
+        self.terminals = [{"handle": "h1", "title": "✳ Claude Code", "lastOutputAt": 1000}]
+        dispatch.finalize("agent")
+        create_calls = [c for c in self.orca_json_calls if c[:2] == ["terminal", "create"]]
+        self.assertEqual(create_calls, [])
+
+    def test_finalize_logs_failure_without_raising_when_stop_not_confirmed(self):
+        def fake_orca_never_clears(args):
+            self.orca_calls.append(args)
+            # deliberately does not clear self.terminals
+
+        with mock.patch.object(dispatch, "_orca", fake_orca_never_clears):
+            self.terminals = [{"handle": "h1", "title": "✳ Claude Code", "lastOutputAt": 1000}]
+            dispatch.finalize("agent")
+        self.assertEqual(self._logged_actions(), ["self-teardown-failed"])
+
+    def test_finalize_is_a_noop_for_a_non_ephemeral_agent(self):
+        with mock.patch.object(dispatch, "_load_spec", lambda agent: {}):
+            dispatch.finalize("agent")
+        self.assertEqual(self.orca_calls, [])
+        self.assertEqual(self._logged_actions(), [])
+
+    def test_finalize_backs_off_on_lock_contention_instead_of_racing_a_live_tick(self):
+        """A concurrent dispatch.run() already holding the lock is already handling this
+        workspace's own teardown/create -- finalize must not also stop it, which could kill a
+        replacement terminal that tick just created moments earlier."""
+        import os
+
+        state = dispatch.AgentState("agent")
+        state.ensure_dir()
+        fd = os.open(state.lockfile, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.write(fd, b"12345")
+        os.close(fd)
+        try:
+            with self.assertRaises(SystemExit):
+                dispatch.finalize("agent")
+        finally:
+            state.lockfile.unlink()
+        self.assertEqual(self.orca_calls, [])
+
+
 class CleanupOnlyTest(_DispatchBase):
     """triggered-agents-445, PR #95 review B1 (round 1): `dispatch.run(..., cleanup_only=True)` is
     `ta-gate.sh`'s call on a precheck skip (no new work). It must never dispatch a skill or
@@ -433,6 +520,29 @@ class EphemeralTwoTickLifecycleTest(unittest.TestCase):
         self.assertEqual(self.sent_texts, [])
 
         self.assertEqual(self._actions(), ["created", "ephemeral-restart"])
+
+    def test_finalize_tears_down_immediately_after_head_exit_without_a_second_tick(self):
+        """PR #95 review B1, round 3: the review's core, repeated objection is that every
+        teardown path is only ever reached by a FUTURE tick's poll, never by the head's own
+        completion. Prove the opposite here: after tick 1 creates a terminal, simulate the head
+        process exiting by calling `dispatch.finalize` directly -- exactly what `_create_terminal`
+        appends to the launch command as its own trailer -- with NO second `dispatch.run` tick
+        anywhere in between, and assert the workspace reaches zero terminals/tabs from that call
+        alone."""
+        dispatch.run("curator")
+        self.assertEqual(len(self.created_handles), 1)
+        handle = self.created_handles[0]
+        self.assertEqual(list(self.live), [handle])
+        self.assertEqual(self.tabs, {handle: "ready"})
+
+        # the head process exits; its own launch command's trailer runs finalize() -- no
+        # dispatch.run() tick is involved at all
+        dispatch.finalize("curator")
+
+        self.assertEqual(self.live, {})
+        self.assertEqual(self.tabs, {})
+        self.assertEqual(len(self.created_handles), 1)  # finalize never creates anything
+        self.assertEqual(self._actions(), ["created", "self-teardown"])
 
     def test_third_tick_with_no_new_work_leaves_literally_zero_terminals_and_tabs(self):
         """PR #95 review B4: proving "the old terminal was replaced by a new one" on every tick

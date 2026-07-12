@@ -3,7 +3,9 @@
 compose correctly with a real variant like the steward's "deep-sweep". Also covers the `pipeline`
 special case, which routes to the deterministic dispatcher instead of `dispatch.run` (PR #95
 review B1, round 2): `--cleanup-only` there must be a genuine no-op, not fall through to a full
-`dispatcher.tick()` just because the pipeline branch didn't know about the flag.
+`dispatcher.tick()` just because the pipeline branch didn't know about the flag. And `--finalize`
+(PR #95 review B1, round 3): the self-teardown trailer `dispatch.py` appends to an ephemeral
+agent's own launch command must route to `dispatch.finalize`, not `dispatch.run`.
 """
 from __future__ import annotations
 
@@ -73,6 +75,37 @@ class PipelineDispatchCleanupOnlyTest(unittest.TestCase):
         rc = ta_main.main(["pipeline", "dispatch"])
         self.assertEqual(rc, 0)
         self.assertEqual(self.tick_calls, 1)
+
+    def test_finalize_never_runs_a_dispatcher_tick_either(self):
+        rc = ta_main.main(["pipeline", "dispatch", "--finalize"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.tick_calls, 0)
+
+
+class FinalizeArgvRoutingTest(unittest.TestCase):
+    """triggered-agents-445, PR #95 review B1 (round 3): `--finalize` must route to
+    `dispatch.finalize`, never to `dispatch.run` -- it isn't a dispatch decision, it's the
+    self-teardown trailer a launch command runs against itself."""
+
+    def setUp(self):
+        self.finalize_calls = []
+        self.run_calls = []
+        p = mock.patch.object(dispatch, "finalize", lambda agent: self.finalize_calls.append(agent) or 0)
+        p.start()
+        self.addCleanup(p.stop)
+        p = mock.patch.object(dispatch, "run", lambda *a, **kw: self.run_calls.append((a, kw)) or 0)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_finalize_flag_routes_to_dispatch_finalize_not_run(self):
+        ta_main.main(["curator", "dispatch", "--finalize"])
+        self.assertEqual(self.finalize_calls, ["curator"])
+        self.assertEqual(self.run_calls, [])
+
+    def test_plain_dispatch_still_routes_to_run_not_finalize(self):
+        ta_main.main(["curator", "dispatch"])
+        self.assertEqual(self.finalize_calls, [])
+        self.assertEqual(len(self.run_calls), 1)
 
 
 if __name__ == "__main__":
