@@ -31,8 +31,8 @@ probe = "python3 -m triggered_agents pipeline probe --resource openrouter"
 [resources.openai-sub]
 # The ChatGPT/OpenAI subscription codex draws from via its native `codex` CLI — one account, no
 # per-profile credential, mirroring resources.claude-sub. Authed once with `codex login` (ChatGPT
-# OAuth) into the pinned CODEX_HOME (heads.CODEX_HOME), which also holds the memory MCP server and
-# the global AGENTS.md. Probe: one real `codex exec` token through that home (health.probe_openai_sub)
+# OAuth) into the Orca-managed CODEX_HOME (heads.CODEX_HOME), which also holds MCP, skills, hooks,
+# and the global AGENTS.md. Probe: one real `codex exec` token through that home (health.probe_openai_sub)
 # — red exactly when the subscription is rate-limited or the CLI can't reach the API.
 account = "openai-subscription"
 probe = "python3 -m triggered_agents pipeline probe --resource openai-sub"
@@ -48,7 +48,8 @@ effort = "default"
 fallback = []
 
 # Explicit model profiles mirror the visible catalog returned by
-# `CODEX_HOME=/home/dev/.codex-pipeline codex debug models` (2026-07-12). Keep `codex` above as
+# `CODEX_HOME=/home/dev/.config/orca/codex-runtime-home/home codex debug models` (2026-07-12).
+# Keep `codex` above as
 # the stable default/compatibility id for GPT-5.5; these entries only add per-card choices.
 [profiles.codex-sol]
 resource = "openai-sub"

@@ -532,6 +532,7 @@ class LaunchWorkerClosesOrphanTest(unittest.TestCase):
     def test_launch_worker_closes_orphans_keeping_its_own_handle(self):
         with mock.patch.object(worker, "ensure_trust"), \
              mock.patch.object(worker, "ensure_theme"), \
+             mock.patch.object(worker, "_deliver_initial_prompt"), \
              mock.patch.object(worker, "_orca_json", return_value={"terminal": {"handle": "term-new"}}), \
              mock.patch.object(worker, "_close_orphan_terminals") as close:
             handle = worker.launch_worker("/ws", None, "w1", "title")
@@ -548,6 +549,7 @@ class SpawnReviewerClosesOrphanTest(unittest.TestCase):
              mock.patch.object(worker, "_write_excluded"), \
              mock.patch.object(worker, "ensure_trust"), \
              mock.patch.object(worker, "ensure_theme"), \
+             mock.patch.object(worker, "_deliver_initial_prompt"), \
              mock.patch.object(worker, "_orca_json", return_value={"terminal": {"handle": "term-rev"}}), \
              mock.patch.object(worker, "_close_orphan_terminals") as close:
             ws, handle = worker.spawn_reviewer(

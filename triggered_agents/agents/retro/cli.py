@@ -31,6 +31,7 @@ from pathlib import Path
 
 from ...runtime.state import PRECHECK_SKIP, AgentState
 from ..curator import discover, harvest
+from ..pipeline import ops as pipeline_ops
 from . import search_log
 
 STATE = AgentState("retro")
@@ -42,7 +43,20 @@ def _batch_window(batch: dict):
     return (min(ts), max(ts)) if ts else (None, None)
 
 
+def _cleanup_done() -> dict:
+    out = pipeline_ops.close_old_done_cards()
+    refs = out["closed"]
+    STATE.log_run(
+        "done-cleanup",
+        result="closed" if refs else "no-op",
+        closed_count=len(refs),
+        references=",".join(refs),
+    )
+    return {"closed_refs": refs, "closed_count": len(refs)}
+
+
 def cmd_harvest(as_json: bool) -> int:
+    cleanup = _cleanup_done()
     with STATE.lock():
         batch = harvest.harvest(STATE)
         STATE.ensure_dir()
@@ -50,8 +64,16 @@ def cmd_harvest(as_json: bool) -> int:
     since, until = _batch_window(batch)
     log = search_log.tail(since, until)
     if as_json:
-        print(json.dumps({"batch": batch, "search_log": log}, ensure_ascii=False, indent=2))
+        print(json.dumps(
+            {"batch": batch, "search_log": log, "done_cleanup": cleanup},
+            ensure_ascii=False, indent=2))
     else:
+        print("## Done cleanup")
+        if cleanup["closed_refs"]:
+            print("Закрыты: " + ", ".join(cleanup["closed_refs"]))
+        else:
+            print("Нет старых Done-карточек для закрытия")
+        print()
         print(harvest.render_markdown(batch))
         print()
         print(search_log.render_markdown(log))
@@ -75,6 +97,7 @@ def cmd_precheck() -> int:
     """Exit 0 if there are new turns to review, PRECHECK_SKIP (100) to skip a clean run when nothing
     is new. Any other code means precheck crashed. An uncaught exception exits 1, which the systemd
     gate treats as an error, not a skip. See runtime/state.py PRECHECK_SKIP and deploy/ta-gate.sh."""
+    _cleanup_done()
     batch = harvest.harvest(STATE)
     if batch["sessions"]:
         STATE.log_run("precheck", result="change")

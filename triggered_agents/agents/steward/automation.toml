@@ -19,18 +19,20 @@ head = "codex-steward"
 # staleness threshold, a resource health flip, a worker/reviewer workspace on disk with no
 # in-flight card). Gated in the systemd unit, not Orca's field (manual `automations run` ignores
 # --precheck; see provision.py). The steward's whole reason to exist is post-merge self-
-# modification safety-netting, not an hourly LLM-cost sweep — a quiet hour costs nothing.
+# modification safety-netting, not a frequent LLM-cost sweep — a quiet tick costs nothing.
 precheck = "python3 -m triggered_agents steward precheck"
 
 [trigger]
-# Orca's own rrule does not tick in headless `orca serve`; kept for correctness but the real
-# clock is the systemd timer below.
-orca = "hourly"
+# systemd is the sole schedule owner. Keep the equivalent cron recorded for GUI/manual context,
+# but disable Orca's native trigger so a desktop/local scheduler cannot run a second steward in
+# parallel with ta-steward.timer. Manual `orca automations run` remains available.
+orca = "0 */3 * * *"
+enabled = false
 
 [systemd]
 # The actual scheduler on this headless box. Unit name is derived as ta-<name>.
-calendar = "hourly"
-randomized_delay_sec = 150   # jitter so the hourly sweep never races curator/board at :00-:03
+calendar = "00/3:00:00"
+randomized_delay_sec = 150   # jitter so the three-hour sweep never races curator/board at :00-:03
 # precheck hits Kanboard directly (signals.py), before any LLM head is up; ta-gate loads the
 # steward allowlist through role-scoped runtime env.
 
@@ -38,7 +40,7 @@ randomized_delay_sec = 150   # jitter so the hourly sweep never races curator/bo
 # precheck gate at all, regardless of whether signals.py found anything — the five signal
 # detectors themselves can be blind (253: a wrong path made the pipeline log look permanently
 # quiet), and a signal-gated wake-up can never catch that. deploy/provision.py reads this table
-# and provisions a SECOND systemd unit (ta-<name>-deep-sweep) alongside the hourly one above —
+# and provisions a SECOND systemd unit (ta-<name>-deep-sweep) alongside the three-hour one above —
 # same worktree/workspace/head, no separate Orca automation. `skill` carries an argument
 # ("deep-sweep") the same way a slash command would if typed by hand, so the one SKILL.md file
 # can branch to its own section instead of the five-signal one; cli.py's deep-sweep-since/
@@ -49,7 +51,7 @@ skill = "/steward deep-sweep"
 
 [variants.deep-sweep.systemd]
 # Fixed, deliberately not-round time so it never coincides with retro's daily pass (00:00 +
-# <=5min jitter, see retro/automation.toml) or the hourly :00-:03 crowd (curator/pipeline).
+# <=5min jitter, see retro/automation.toml) or the :00-:03 crowd (curator/pipeline).
 # Time-only systemd OnCalendar shorthand (no date field, so no internal space — provision.py's
 # `_timer_unit` splits `calendar` on whitespace to emit one OnCalendar line per space-separated
 # spec, the same convention pipeline/automation.toml uses for its two-offset 3-min cadence; a
