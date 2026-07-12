@@ -42,7 +42,7 @@ class FakeBoard:
 
     # test helpers -----------------------------------------------------------
     def add_task(self, title, column, swimlane="personal_site", reference=None,
-                 meta=None, is_active=1):
+                 meta=None, is_active=1, date_moved=None):
         tid = self._next_task
         self._next_task += 1
         col_id = next(c["id"] for c in self.columns if c["title"] == column)
@@ -53,6 +53,8 @@ class FakeBoard:
             "reference": reference if reference is not None else f"{swimlane}-{tid}",
             "is_active": is_active, "position": 1,
         }
+        if date_moved is not None:
+            self.tasks[tid]["date_moved"] = date_moved
         self.metadata[tid] = dict(meta or {})
         return self.tasks[tid]["reference"]
 
@@ -230,6 +232,54 @@ class TestMatrix(unittest.TestCase):
         with self.assertRaises(model.GuardError) as ctx:
             model.check_move("dispatcher", "Ready", "In progress")
         self.assertIn("claim", str(ctx.exception))
+
+
+class TestCloseOldDoneCards(PatchedBoardTest):
+    def test_closes_only_active_done_cards_older_than_five_full_days(self):
+        board = self.make_board()
+        now = 1_000_000
+        threshold = 5 * 24 * 60 * 60
+        old = board.add_task("old", "Done", reference="old", date_moved=now - threshold - 1)
+        exact = board.add_task("exact", "Done", reference="exact", date_moved=now - threshold)
+        young = board.add_task("young", "Done", reference="young", date_moved=now - threshold + 1)
+        other_column = board.add_task("ready", "Ready", reference="ready",
+                                      date_moved=now - threshold - 100)
+        inactive = board.add_task("closed", "Done", reference="closed", is_active=0,
+                                  date_moved=now - threshold - 100)
+
+        out = ops.close_old_done_cards(now=now)
+
+        self.assertEqual(out["closed"], [old])
+        self.assertEqual(board.tasks[1]["is_active"], 0)
+        self.assertEqual(board.tasks[2]["is_active"], 1)
+        self.assertEqual(board.tasks[3]["is_active"], 1)
+        self.assertEqual(board.tasks[4]["is_active"], 1)
+        self.assertEqual(board.tasks[5]["is_active"], 0)
+        self.assertEqual([c["task_id"] for c in board.method_calls("closeTask")], [1])
+        self.assertEqual({exact, young, other_column, inactive}, {"exact", "young", "ready", "closed"})
+
+    def test_cleanup_is_idempotent_after_success(self):
+        board = self.make_board()
+        now = 1_000_000
+        board.add_task("old", "Done", reference="old",
+                       date_moved=now - (5 * 24 * 60 * 60) - 1)
+
+        first = ops.close_old_done_cards(now=now)
+        second = ops.close_old_done_cards(now=now)
+
+        self.assertEqual(first["closed"], ["old"])
+        self.assertEqual(second["closed"], [])
+        self.assertEqual(len(board.method_calls("closeTask")), 1)
+
+    def test_cards_without_usable_date_moved_are_left_open(self):
+        board = self.make_board()
+        board.add_task("missing", "Done", reference="missing")
+        board.add_task("bad", "Done", reference="bad", date_moved="not-a-timestamp")
+
+        out = ops.close_old_done_cards(now=1_000_000)
+
+        self.assertEqual(out["closed"], [])
+        self.assertEqual(board.method_calls("closeTask"), [])
 
 
 class TestCreate(PatchedBoardTest):
