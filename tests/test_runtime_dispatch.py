@@ -498,10 +498,21 @@ class StewardReportCardDispatchTest(unittest.TestCase):
         self.orca_json_calls = []
         self.created_cards = []
         self.active_report_cards = []
+        self.comments = []
+        self.moves = []
+        self.create_error = None
 
         def fake_create_report_card(project, title, slug, description=""):
             ref = f"triggered-agents-{len(self.created_cards) + 1}"
-            self.created_cards.append({"project": project, "title": title, "slug": slug})
+            self.created_cards.append({
+                "reference": ref,
+                "project": project,
+                "title": title,
+                "slug": slug,
+                "column": "In progress",
+                "date_moved": 1234,
+                "steward_report": "1",
+            })
             return {"action": "created", "id": len(self.created_cards), "reference": ref,
                     "column": "In progress"}
 
@@ -510,7 +521,49 @@ class StewardReportCardDispatchTest(unittest.TestCase):
         p.start()
         self.addCleanup(p.stop)
 
-        p = mock.patch.object(pipeline_ops, "list_cards", lambda column=None, project=None: self.active_report_cards)
+        def fake_list_cards(column=None, project=None):
+            cards = self.active_report_cards + self.created_cards
+            out = []
+            for card in cards:
+                if column and card.get("column") != column:
+                    continue
+                if project and card.get("project", "triggered-agents") != project:
+                    continue
+                out.append(card)
+            return out
+
+        p = mock.patch.object(pipeline_ops, "list_cards", fake_list_cards)
+        p.start()
+        self.addCleanup(p.stop)
+
+        def fake_add_comment(role, reference, body, marker=None):
+            self.comments.append({
+                "role": role,
+                "reference": reference,
+                "body": body,
+                "marker": marker or role,
+            })
+            return {"action": "commented", "reference": reference, "marker": marker or role}
+
+        p = mock.patch.object(pipeline_ops, "add_comment", fake_add_comment)
+        p.start()
+        self.addCleanup(p.stop)
+
+        def fake_move_card(role, reference, to_column, reason=""):
+            self.moves.append({
+                "role": role,
+                "reference": reference,
+                "to": to_column,
+                "reason": reason,
+            })
+            for card in self.created_cards + self.active_report_cards:
+                if card.get("reference") == reference:
+                    card["column"] = to_column
+            if reason.strip():
+                fake_add_comment(role, reference, reason)
+            return {"action": "moved", "reference": reference, "to": to_column}
+
+        p = mock.patch.object(pipeline_ops, "move_card", fake_move_card)
         p.start()
         self.addCleanup(p.stop)
 
@@ -529,6 +582,8 @@ class StewardReportCardDispatchTest(unittest.TestCase):
             if args[:2] == ["terminal", "wait"]:
                 return {"wait": {"satisfied": self.idle}}
             if args[:2] == ["terminal", "create"]:
+                if self.create_error:
+                    raise self.create_error
                 return {"terminal": {"handle": "new-terminal"}}
             return {}
 
@@ -579,9 +634,12 @@ class StewardReportCardDispatchTest(unittest.TestCase):
         self.terminals = []
         self.active_report_cards = [{
             "reference": "triggered-agents-299",
+            "project": "triggered-agents",
+            "column": "In progress",
             "date_moved": 1234,
             "steward_report": "1",
         }]
+        AgentState("steward").save_active_report("triggered-agents-299", "new-terminal")
         with mock.patch("time.time", lambda: 1235):
             dispatch.run("steward", "deep-sweep")
         self.assertEqual(self.created_cards, [])
@@ -591,12 +649,28 @@ class StewardReportCardDispatchTest(unittest.TestCase):
         self.assertIn("active-report-skip", runs.read_text(encoding="utf-8"))
         self.assertIn("triggered-agents-299", runs.read_text(encoding="utf-8"))
 
+    def test_fresh_report_card_without_run_identity_does_not_skip_dispatch(self):
+        self.terminals = []
+        self.active_report_cards = [{
+            "reference": "triggered-agents-299",
+            "project": "triggered-agents",
+            "column": "In progress",
+            "date_moved": 1234,
+            "steward_report": "1",
+        }]
+        with mock.patch("time.time", lambda: 1235):
+            dispatch.run("steward", "deep-sweep")
+        self.assertEqual(len(self.created_cards), 1)
+        self.assertIn("--card triggered-agents-1", self._launch_command_sent())
+
     def test_stale_active_report_card_does_not_skip_dispatch(self):
         from triggered_agents.agents.steward import signals as steward_signals
 
         self.terminals = []
         self.active_report_cards = [{
             "reference": "triggered-agents-299",
+            "project": "triggered-agents",
+            "column": "In progress",
             "date_moved": 1000,
             "steward_report": "1",
         }]
@@ -605,6 +679,51 @@ class StewardReportCardDispatchTest(unittest.TestCase):
             dispatch.run("steward", "deep-sweep")
         self.assertEqual(len(self.created_cards), 1)
         self.assertIn("--card triggered-agents-1", self._launch_command_sent())
+
+    def test_terminal_create_failure_recovers_report_card_and_next_dispatch_runs(self):
+        from triggered_agents.runtime.state import AgentState
+
+        self.terminals = []
+        self.create_error = RuntimeError("orca terminal create failed: selector_not_found")
+        with self.assertRaisesRegex(RuntimeError, "selector_not_found"):
+            dispatch.run("steward")
+
+        self.assertEqual(len(self.created_cards), 1)
+        self.assertEqual(self.created_cards[0]["column"], "Done")
+        self.assertEqual(self.moves[0]["reference"], "triggered-agents-1")
+        self.assertEqual(self.moves[0]["to"], "Done")
+        self.assertIn("selector_not_found", self.moves[0]["reason"])
+        self.assertEqual(self.comments[0]["reference"], "triggered-agents-1")
+        self.assertIn("selector_not_found", self.comments[0]["body"])
+        self.assertIsNone(AgentState("steward").load_active_report())
+
+        self.create_error = None
+        dispatch.run("steward")
+        self.assertEqual(len(self.created_cards), 2)
+        creates = [c for c in self.orca_json_calls if c[:2] == ["terminal", "create"]]
+        self.assertIn("--card triggered-agents-2", creates[-1][creates[-1].index("--command") + 1])
+
+        runs = AgentState("steward").dir / "runs.jsonl"
+        text = runs.read_text(encoding="utf-8")
+        self.assertIn("dispatch-recovery", text)
+        self.assertIn('"result": "done"', text)
+        self.assertNotIn("active-report-skip", text)
+
+    def test_recovery_failure_does_not_mask_terminal_create_failure(self):
+        from triggered_agents.agents.pipeline import ops as pipeline_ops
+        from triggered_agents.runtime.state import AgentState
+
+        self.terminals = []
+        self.create_error = RuntimeError("orca terminal create failed: selector_not_found")
+        with mock.patch.object(pipeline_ops, "move_card", side_effect=RuntimeError("board down")):
+            with self.assertRaisesRegex(RuntimeError, "selector_not_found"):
+                dispatch.run("steward")
+
+        runs = AgentState("steward").dir / "runs.jsonl"
+        text = runs.read_text(encoding="utf-8")
+        self.assertIn("dispatch-recovery", text)
+        self.assertIn('"result": "failed"', text)
+        self.assertIn("board down", text)
 
     def test_deep_sweep_variant_names_itself_in_the_card_title(self):
         self.terminals = []
