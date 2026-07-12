@@ -54,7 +54,7 @@ class EphemeralLifecycleTest(_DispatchBase):
         self.terminals = [{"handle": "h1", "title": "✳ Claude Code", "lastOutputAt": 1000}]
         self.idle = True
         reap_calls = []
-        with mock.patch.object(dispatch, "_reap_ghosts", lambda ws: reap_calls.append(ws) or 1):
+        with mock.patch.object(dispatch, "_reap_ghosts", lambda ws: (reap_calls.append(ws) or 1, True)):
             dispatch.run("agent")
         # top-of-run reap, then the ephemeral branch's own reap right after the stop
         self.assertEqual(reap_calls, ["/ws/agent", "/ws/agent"])
@@ -84,7 +84,7 @@ class EphemeralLifecycleTest(_DispatchBase):
         self.idle = False
         reap_calls = []
         with mock.patch.object(dispatch, "_quiet_seconds", lambda t, now: dispatch.WATCHDOG_SECONDS + 1), \
-             mock.patch.object(dispatch, "_reap_ghosts", lambda ws: reap_calls.append(ws) or 1):
+             mock.patch.object(dispatch, "_reap_ghosts", lambda ws: (reap_calls.append(ws) or 1, True)):
             dispatch.run("agent")
         self.assertEqual(reap_calls, ["/ws/agent", "/ws/agent"])
         self.assertEqual(self._logged_actions(), ["watchdog-restart"])
@@ -295,7 +295,7 @@ class FinalizerTest(_DispatchBase):
     def test_finalize_tears_down_after_stop_confirms(self):
         self.terminals = [{"handle": "h1", "title": "✳ Claude Code", "lastOutputAt": 1000}]
         reap_calls = []
-        with mock.patch.object(dispatch, "_reap_ghosts", lambda ws: reap_calls.append(ws) or 1):
+        with mock.patch.object(dispatch, "_reap_ghosts", lambda ws: (reap_calls.append(ws) or 1, True)):
             dispatch.finalize("agent")
         stop_calls = [c for c in self.orca_calls if c[:2] == ["terminal", "stop"]]
         self.assertEqual(len(stop_calls), 1)
@@ -354,7 +354,7 @@ class FinalizerTest(_DispatchBase):
         state.save_terminal_handle("replacement", created_at=time.time(), generation=5)
         self.terminals = [{"handle": "replacement", "title": "triggered-agent:agent", "lastOutputAt": 1}]
         reap_calls = []
-        with mock.patch.object(dispatch, "_reap_ghosts", lambda ws: reap_calls.append(ws) or 0):
+        with mock.patch.object(dispatch, "_reap_ghosts", lambda ws: (reap_calls.append(ws) or 0, True)):
             dispatch.finalize("agent", generation=4)
         stop_calls = [c for c in self.orca_calls if c[:2] == ["terminal", "stop"]]
         self.assertEqual(stop_calls, [])                  # replacement never stopped
@@ -369,7 +369,7 @@ class FinalizerTest(_DispatchBase):
         state = dispatch.AgentState("agent")
         state.save_terminal_handle("h1", created_at=time.time(), generation=7)
         self.terminals = [{"handle": "h1", "title": "triggered-agent:agent", "lastOutputAt": 1}]
-        with mock.patch.object(dispatch, "_reap_ghosts", lambda ws: 0):
+        with mock.patch.object(dispatch, "_reap_ghosts", lambda ws: (0, True)):
             dispatch.finalize("agent", generation=7)
         stop_calls = [c for c in self.orca_calls if c[:2] == ["terminal", "stop"]]
         self.assertEqual(len(stop_calls), 1)
@@ -383,7 +383,7 @@ class FinalizerTest(_DispatchBase):
         state.save_terminal_handle("h1", created_at=time.time(), generation=1)
         self.terminals = [{"handle": "h1", "title": "triggered-agent:agent", "lastOutputAt": 1}]
         with mock.patch.object(dispatch, "_raw_terminal_count", lambda ws: None), \
-             mock.patch.object(dispatch, "_reap_ghosts", lambda ws: 0):
+             mock.patch.object(dispatch, "_reap_ghosts", lambda ws: (0, True)):
             dispatch.finalize("agent", generation=1)
         self.assertEqual(self._logged_actions(), ["self-teardown-failed"])
 
@@ -521,6 +521,106 @@ class RawListFailureTest(_DispatchBase):
         self.assertEqual(self._logged_actions(), ["cleanup-stray-check-failed"])
 
 
+class ReapGhostsPrimitiveTest(unittest.TestCase):
+    """triggered-agents-445, PR #95 review B1 (round 6): `_reap_ghosts` itself must report whether
+    every ghost tab actually closed. Standalone (not `_DispatchBase`, which stubs `_reap_ghosts`
+    out) so the real function runs against a patched `orca_rpc.call`."""
+
+    def test_reports_not_ok_when_a_close_fails(self):
+        def fake_rpc(method, params=None):
+            if method == "session.tabs.listAll":
+                return {"result": {"snapshots": [
+                    {"worktree": "env::/ws/agent",
+                     "tabs": [{"status": "pending-handle", "parentTabId": "t1"}]}]}}
+            if method == "session.tabs.close":
+                raise RuntimeError("close boom")
+            return {"result": {}}
+
+        with mock.patch.object(dispatch.orca_rpc, "call", fake_rpc):
+            closed, ok = dispatch._reap_ghosts("/ws/agent")
+        self.assertEqual(closed, 0)
+        self.assertFalse(ok)
+
+    def test_reports_not_ok_when_listall_fails(self):
+        def fake_rpc(method, params=None):
+            raise RuntimeError("orca restarting")
+
+        with mock.patch.object(dispatch.orca_rpc, "call", fake_rpc):
+            self.assertEqual(dispatch._reap_ghosts("/ws/agent"), (0, False))
+
+    def test_is_ok_when_every_close_succeeds(self):
+        def fake_rpc(method, params=None):
+            if method == "session.tabs.listAll":
+                return {"result": {"snapshots": [
+                    {"worktree": "env::/ws/agent",
+                     "tabs": [{"status": "pending-handle", "parentTabId": "t1"}]}]}}
+            return {"result": {}}
+
+        with mock.patch.object(dispatch.orca_rpc, "call", fake_rpc):
+            self.assertEqual(dispatch._reap_ghosts("/ws/agent"), (1, True))
+
+    def test_is_ok_when_there_are_no_ghost_tabs(self):
+        def fake_rpc(method, params=None):
+            if method == "session.tabs.listAll":
+                return {"result": {"snapshots": [
+                    {"worktree": "env::/ws/agent",
+                     "tabs": [{"status": "ready", "parentTabId": "t1"}]}]}}
+            return {"result": {}}
+
+        with mock.patch.object(dispatch.orca_rpc, "call", fake_rpc):
+            self.assertEqual(dispatch._reap_ghosts("/ws/agent"), (0, True))
+
+
+class TabReapFailureTest(_DispatchBase):
+    """triggered-agents-445, PR #95 review B1 (round 6): a `session.tabs.close` failure must not be
+    swallowed into a healthy teardown. `_reap_ghosts` returns `(closed, ok)`; a teardown caller
+    records a `*-tab-failed` action (and a restart path bails without creating) when `ok` is False,
+    so a `pending-handle` tab that would not close is never reported as 'zero tabs after
+    completion'."""
+
+    def setUp(self):
+        super().setUp()
+        p = mock.patch.object(dispatch, "_load_spec", lambda agent: {"ephemeral": True})
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_finalize_records_tab_failed_not_healthy_when_close_fails(self):
+        """The reviewer's reproduction: pty stop confirmed, but the ghost tab won't close ->
+        `self-teardown-tab-failed`, never a clean `self-teardown`."""
+        state = dispatch.AgentState("agent")
+        state.save_terminal_handle("h1", created_at=time.time(), generation=1)
+        self.terminals = [{"handle": "h1", "title": "triggered-agent:agent", "lastOutputAt": 1}]
+        with mock.patch.object(dispatch, "_reap_ghosts", lambda ws: (0, False)):
+            dispatch.finalize("agent", generation=1)
+        self.assertEqual(self._logged_actions(), ["self-teardown-tab-failed"])
+
+    def test_cleanup_teardown_records_tab_failed_when_close_fails(self):
+        self.terminals = [{"handle": "h1", "title": "✳ Claude Code", "lastOutputAt": 1000}]
+        self.idle = True
+        with mock.patch.object(dispatch, "_reap_ghosts", lambda ws: (0, False)):
+            dispatch.run("agent", cleanup_only=True)
+        self.assertEqual(self._logged_actions(), ["cleanup-teardown-tab-failed"])
+
+    def test_ephemeral_restart_bails_without_creating_when_close_fails(self):
+        self.terminals = [{"handle": "h1", "title": "✳ Claude Code", "lastOutputAt": 1000}]
+        self.idle = True
+        with mock.patch.object(dispatch, "_reap_ghosts", lambda ws: (0, False)):
+            dispatch.run("agent")
+        create_calls = [c for c in self.orca_json_calls if c[:2] == ["terminal", "create"]]
+        self.assertEqual(create_calls, [])
+        self.assertEqual(self._logged_actions(), ["ephemeral-restart-tab-failed"])
+
+    def test_superseded_records_tab_failed_when_close_fails(self):
+        state = dispatch.AgentState("agent")
+        state.save_terminal_handle("replacement", created_at=time.time(), generation=5)
+        self.terminals = [{"handle": "replacement", "title": "triggered-agent:agent", "lastOutputAt": 1}]
+        with mock.patch.object(dispatch, "_reap_ghosts", lambda ws: (0, False)):
+            dispatch.finalize("agent", generation=4)
+        stop_calls = [c for c in self.orca_calls if c[:2] == ["terminal", "stop"]]
+        self.assertEqual(stop_calls, [])  # still never stops the live replacement
+        self.assertEqual(self._logged_actions(), ["self-teardown-superseded-tab-failed"])
+
+
 class EphemeralTwoTickLifecycleTest(unittest.TestCase):
     """Integration-style test (still no network, no real Orca — this file's own convention)
     simulating two sequential curator ticks against an in-memory terminal+tab store that mirrors
@@ -601,7 +701,7 @@ class EphemeralTwoTickLifecycleTest(unittest.TestCase):
                 if status != "ready":
                     del self.tabs[handle]
                     closed += 1
-            return closed
+            return closed, True
 
         p = mock.patch.object(dispatch, "_reap_ghosts", fake_reap_ghosts)
         p.start()
@@ -686,6 +786,28 @@ class EphemeralTwoTickLifecycleTest(unittest.TestCase):
         self.assertEqual(self.tabs, {})
         self.assertEqual(len(self.created_handles), 2)  # no third session was spawned
         self.assertEqual(self._actions(), ["created", "ephemeral-restart", "cleanup-teardown"])
+
+    def test_finalize_with_a_failing_tab_close_leaves_the_ghost_and_reports_tab_failed(self):
+        """PR #95 review B1, round 6: the reviewer reproduced a `session.tabs.close` failure leaving
+        a `pending-handle` tab while `runs.jsonl` still said `self-teardown`. Prove the opposite:
+        when the close fails, the pty is still stopped, the ghost tab visibly LINGERS in the store,
+        and the action is `self-teardown-tab-failed`, not a false healthy `self-teardown`."""
+        dispatch.run("curator")
+        handle = self.created_handles[0]
+        self.assertEqual(list(self.live), [handle])
+        self.assertEqual(self.tabs, {handle: "ready"})
+
+        # the head exits; its finalizer runs, but session.tabs.close fails on the pending tab: model
+        # a reap that closes nothing and reports not-ok (leaving the fixture's tab store untouched)
+        def failing_reap(ws):
+            return 0, False
+
+        with mock.patch.object(dispatch, "_reap_ghosts", failing_reap):
+            dispatch.finalize("curator", generation=1)
+
+        self.assertEqual(self.live, {})                          # pty confirmed gone (stop worked)
+        self.assertEqual(self.tabs, {handle: "pending-handle"})  # but the ghost tab still lingers
+        self.assertEqual(self._actions(), ["created", "self-teardown-tab-failed"])
 
 
 class EphemeralSessionIdentityTest(unittest.TestCase):
@@ -780,7 +902,7 @@ class EphemeralSessionIdentityTest(unittest.TestCase):
                 if status != "ready":
                     del self.tabs[handle]
                     closed += 1
-            return closed
+            return closed, True
 
         p = mock.patch.object(dispatch, "_reap_ghosts", fake_reap_ghosts)
         p.start()

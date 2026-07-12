@@ -454,20 +454,31 @@ def _quiet_seconds(term: dict, now: float) -> float:
     return (now - last / 1000.0) if last else 0.0
 
 
-def _reap_ghosts(ws: str) -> int:
+def _reap_ghosts(ws: str) -> tuple[int, bool]:
     """Close ghost tabs — ones whose pty died but linger in the workspace session store.
+
+    Returns `(closed, ok)`: `closed` is how many ghost tabs were pruned this call; `ok` is True
+    ONLY when the listing succeeded AND every non-ready tab in this workspace closed cleanly. `ok`
+    is False when `session.tabs.listAll` was unavailable (Orca restarting) or any individual
+    `session.tabs.close` raised — in either case a `pending-handle` artifact may still linger in
+    `session.tabs.listAll`. A teardown caller must NOT log a healthy self-teardown/cleanup/restart
+    action while `ok` is False: that would claim "zero tabs after completion" over a ghost it never
+    actually closed (triggered-agents-445, PR #95 review B1, round 6). The top-of-run opportunistic
+    prune ignores `ok` (it just re-reaps next tick); the real teardown paths gate their success
+    action on it and record a `*-tab-failed` action instead when it's False.
 
     `terminal list/stop/close` can't touch these (they only reach live ptys); the persisted
     `tabsByWorktree` keeps them as clutter until `session.tabs.close` prunes them (what the GUI
-    tab-× does). Live tabs are status 'ready'; a dead pty leaves 'pending-handle'. Best-effort:
-    if the RPC is unavailable (orca restarting), skip rather than fail the run.
+    tab-× does). Live tabs are status 'ready'; a dead pty leaves 'pending-handle'.
     """
     try:
         snaps = (orca_rpc.call("session.tabs.listAll").get("result") or {}).get("snapshots", []) or []
     except Exception as e:
+        # Couldn't even list the tabs: we can't claim the workspace is tab-clean, so report not-ok.
         print(f"dispatch: reap skipped ({e})")
-        return 0
+        return 0, False
     closed = 0
+    ok = True
     for snap in snaps:
         if snap.get("worktree", "").split("::", 1)[-1] != ws:
             continue
@@ -477,11 +488,12 @@ def _reap_ghosts(ws: str) -> int:
                     orca_rpc.call("session.tabs.close", {"worktree": snap["worktree"], "tabId": tab["parentTabId"]})
                     closed += 1
                 except Exception as e:
-                    # Not fatal to the run, but must not vanish silently (triggered-agents-445,
-                    # PR #95 review B3): a tab that fails to close is exactly the kind of leftover
-                    # the idempotent-cleanup criterion cares about.
+                    # A tab that fails to close is exactly the leftover the idempotent-cleanup
+                    # criterion cares about (triggered-agents-445, PR #95 review B1): surface it as
+                    # not-ok so the teardown caller records a failure, not a healthy success.
+                    ok = False
                     print(f"dispatch: reap failed to close a tab in {ws} ({e})")
-    return closed
+    return closed, ok
 
 
 def _cleanup_only(agent: str, ws: str, state: AgentState, event: str, terms: list[dict]) -> int:
@@ -516,7 +528,12 @@ def _cleanup_only(agent: str, ws: str, state: AgentState, event: str, terms: lis
                 print(f"dispatch[{agent}]: cleanup could not confirm the workspace is clear of "
                       "stray terminals — leaving it for the next tick")
                 return 0
-            reaped = _reap_ghosts(ws)
+            reaped, ok = _reap_ghosts(ws)
+            if not ok:
+                state.log_run(event, action="cleanup-stray-swept-tab-failed")
+                print(f"dispatch[{agent}]: cleanup — stopped stray terminal(s) but a ghost tab "
+                      "would not close; next tick re-reaps")
+                return 0
             state.log_run(event, action="cleanup-stray-swept")
             print(f"dispatch[{agent}]: cleanup — swept stray unrecognized terminal(s)"
                   f"{f'; reaped {reaped} ghost(s)' if reaped else ''}, no new work to dispatch")
@@ -531,7 +548,12 @@ def _cleanup_only(agent: str, ws: str, state: AgentState, event: str, terms: lis
             print(f"dispatch[{agent}]: cleanup could not confirm the stuck terminal stopped "
                   "— leaving it for the next tick")
             return 0
-        _reap_ghosts(ws)
+        _, ok = _reap_ghosts(ws)
+        if not ok:
+            state.log_run(event, action="cleanup-watchdog-tab-failed")
+            print(f"dispatch[{agent}]: cleanup — stopped stuck terminal but a ghost tab would not "
+                  "close; next tick re-reaps")
+            return 0
         state.log_run(event, action="cleanup-watchdog-stop")
         print(f"dispatch[{agent}]: cleanup — stopped stuck terminal, no new work to dispatch")
         return 0
@@ -543,7 +565,12 @@ def _cleanup_only(agent: str, ws: str, state: AgentState, event: str, terms: lis
         print(f"dispatch[{agent}]: cleanup could not confirm the finished terminal stopped "
               "— leaving it for the next tick")
         return 0
-    _reap_ghosts(ws)
+    _, ok = _reap_ghosts(ws)
+    if not ok:
+        state.log_run(event, action="cleanup-teardown-tab-failed")
+        print(f"dispatch[{agent}]: cleanup — stopped finished terminal but a ghost tab would not "
+              "close; next tick re-reaps")
+        return 0
     state.log_run(event, action="cleanup-teardown")
     print(f"dispatch[{agent}]: cleanup — torn down finished terminal, no new work to dispatch")
     return 0
@@ -590,8 +617,8 @@ def run(agent: str, variant: str | None = None, cleanup_only: bool = False) -> i
                 "is still fresh — no dispatch"
             )
             return 0
-        reaped = _reap_ghosts(ws)  # prune dead-pty tabs so ghosts never accumulate
-        if reaped:
+        reaped, _reap_ok = _reap_ghosts(ws)  # prune dead-pty tabs so ghosts never accumulate;
+        if reaped:                            # opportunistic, so ignore ok here (re-reaps next tick)
             print(f"dispatch[{agent}]: reaped {reaped} ghost tab(s)")
         terms = _agent_terminals(ws, state)
 
@@ -630,7 +657,15 @@ def run(agent: str, variant: str | None = None, cleanup_only: bool = False) -> i
                         print(f"dispatch[{agent}]: could not confirm the workspace is clear of "
                               "stray terminals before creating — leaving it for the next tick")
                         return 0
-                    _reap_ghosts(ws)
+                    _, ok = _reap_ghosts(ws)
+                    if not ok:
+                        # Stopped the stray's pty but a ghost tab wouldn't close: creating a fresh
+                        # session now would leave the workspace above zero tabs, so bail and let the
+                        # next tick re-reap before it creates (review B1, round 6).
+                        state.log_run(event, action="stray-sweep-tab-failed")
+                        print(f"dispatch[{agent}]: swept stray terminal but a ghost tab would not "
+                              "close; not creating this tick, next tick re-reaps")
+                        return 0
             skill, launch, profile = _dispatch_command(agent, variant)
             _ensure_claude_ready(ws)
             _create_terminal(agent, ws, launch, state, profile)
@@ -654,7 +689,14 @@ def run(agent: str, variant: str | None = None, cleanup_only: bool = False) -> i
                 print(f"dispatch[{agent}]: watchdog stop could not confirm the stuck terminal "
                       "is gone — leaving it for the next tick")
                 return 0
-            _reap_ghosts(ws)
+            _, ok = _reap_ghosts(ws)
+            if not ok:
+                # Stopped the stuck pty but its ghost tab wouldn't close: don't spawn a replacement
+                # next to a lingering tab, bail and let the next tick re-reap first (review B1).
+                state.log_run(event, action="watchdog-restart-tab-failed")
+                print(f"dispatch[{agent}]: watchdog stopped the stuck terminal but a ghost tab "
+                      "would not close; not restarting this tick, next tick re-reaps")
+                return 0
             skill, launch, profile = _dispatch_command(agent, variant)
             _ensure_claude_ready(ws)
             _create_terminal(agent, ws, launch, state, profile)
@@ -673,7 +715,16 @@ def run(agent: str, variant: str | None = None, cleanup_only: bool = False) -> i
                 print(f"dispatch[{agent}]: ephemeral teardown could not confirm the finished "
                       "terminal stopped — leaving it for the next tick")
                 return 0
-            reaped = _reap_ghosts(ws)
+            reaped, ok = _reap_ghosts(ws)
+            if not ok:
+                # Stopped the finished pty but its ghost tab wouldn't close: don't start a fresh
+                # session next to a lingering tab, bail and let the next tick re-reap first. The
+                # finished head's own finalizer trailer is the usual teardown path anyway; this
+                # idle-restart branch is a backstop (review B1, round 6).
+                state.log_run(event, action="ephemeral-restart-tab-failed")
+                print(f"dispatch[{agent}]: ephemeral teardown stopped the finished terminal but a "
+                      "ghost tab would not close; not restarting this tick, next tick re-reaps")
+                return 0
             skill, launch, profile = _dispatch_command(agent, variant)
             _ensure_claude_ready(ws)
             _create_terminal(agent, ws, launch, state, profile)
@@ -734,16 +785,28 @@ def _finalize_locked(agent: str, ws: str, state: AgentState, generation: int | N
         this terminal (plus any stray), confirmed via the unfiltered raw count (review B1)."""
     live_generation = state.load_terminal_generation()
     if generation is not None and live_generation is not None and live_generation != generation:
-        reaped = _reap_ghosts(ws)
-        state.log_run("finalize", action="self-teardown-superseded", generation=generation)
+        reaped, ok = _reap_ghosts(ws)
+        action = "self-teardown-superseded" if ok else "self-teardown-superseded-tab-failed"
+        state.log_run("finalize", action=action, generation=generation)
+        tail = "" if ok else " but a ghost tab would not close; next tick re-reaps"
         print(f"dispatch[{agent}]: finalize — terminal already superseded by a newer run"
-              f"{f'; reaped {reaped} ghost(s)' if reaped else ''}")
+              f"{f'; reaped {reaped} ghost(s)' if reaped else ''}{tail}")
         return 0
     if _stop_and_confirm_workspace_empty(ws):
-        _reap_ghosts(ws)
-        state.save_terminal_handle(None)  # the terminal is gone; drop the stale handle record
-        state.log_run("finalize", action="self-teardown", generation=generation)
-        print(f"dispatch[{agent}]: finalize — self-torn-down after head exit")
+        _, ok = _reap_ghosts(ws)
+        if ok:
+            state.save_terminal_handle(None)  # the terminal is gone; drop the stale handle record
+            state.log_run("finalize", action="self-teardown", generation=generation)
+            print(f"dispatch[{agent}]: finalize — self-torn-down after head exit")
+        else:
+            # PTY confirmed gone, but a ghost tab wouldn't close: the run left an artifact in
+            # `session.tabs.listAll`, so this is NOT a healthy teardown (review B1, round 6). The
+            # pty is dead, so a future tick's top-of-run reap re-attempts the close; record the
+            # tab failure rather than a clean self-teardown so the incomplete state is visible.
+            state.save_terminal_handle(None)
+            state.log_run("finalize", action="self-teardown-tab-failed", generation=generation)
+            print(f"dispatch[{agent}]: finalize — stopped the pty but a ghost tab would not close; "
+                  "next tick re-reaps")
     else:
         state.log_run("finalize", action="self-teardown-failed", generation=generation)
         print(f"dispatch[{agent}]: finalize — could not confirm self-teardown; next tick will retry")

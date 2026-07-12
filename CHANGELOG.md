@@ -130,6 +130,27 @@ teardown:
   что non-ephemeral `--cleanup-only` возвращает 0 без `SystemExit` и без единого касания
   state/Orca.
 
+Шестой раунд ревью (PR #95) нашёл, что отказ `session.tabs.close` проглатывался в здоровый teardown:
+
+- `runtime/dispatch.py`: `_reap_ghosts` теперь возвращает `(closed, ok)`. `ok = False`, если
+  `session.tabs.listAll` недоступен или хотя бы один `session.tabs.close` упал — то есть
+  `pending-handle`-вкладка могла остаться в `session.tabs.listAll`. Раньше отказ только печатался, а
+  count возвращался как обычно, и caller писал `self-teardown`/`cleanup-teardown`/`ephemeral-restart`
+  как здоровый, хотя ghost-вкладка завершённого прогона всё ещё висела.
+- все teardown-callers гейтят success-action на `ok`: `finalize` пишет `self-teardown-tab-failed`
+  (и `self-teardown-superseded-tab-failed` в superseded-ветке), `_cleanup_only` —
+  `cleanup-teardown-tab-failed`/`cleanup-watchdog-tab-failed`/`cleanup-stray-swept-tab-failed`.
+  Restart-пути (watchdog-restart, ephemeral-restart, stray-sweep перед созданием) при `ok = False`
+  вообще НЕ поднимают свежий терминал этим тиком (`*-restart-tab-failed`/`stray-sweep-tab-failed`),
+  чтобы не плодить живой процесс рядом с незакрытой ghost-вкладкой; pty уже остановлен, призрак
+  до-реапит top-of-run реап следующего тика. Оппортунистический top-of-run prune `ok` игнорирует.
+- тесты: `ReapGhostsPrimitiveTest` (реальный `_reap_ghosts` против patched `orca_rpc.call`: not-ok
+  при отказе close/listAll, ok при чистом закрытии и при отсутствии ghost-вкладок),
+  `TabReapFailureTest` (finalize/cleanup/ephemeral-restart/superseded логируют `*-tab-failed`, а не
+  success, при `ok = False`; ephemeral-restart не создаёт терминал) и репродукция ревьюера в
+  `EphemeralTwoTickLifecycleTest` — после `finalize` с падающим close pty остановлен, ghost-вкладка
+  ВИДИМО остаётся в сторе, а action `self-teardown-tab-failed`, не `self-teardown`.
+
 ## Куратор: единственный владелец расписания
 
 - `deploy/provision.py` теперь явно управляет флагом `enabled` встроенной Orca-автоматизации по

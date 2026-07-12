@@ -38,7 +38,7 @@ class _DispatchBase(unittest.TestCase):
         p.start()
         self.addCleanup(p.stop)
 
-        p = mock.patch.object(dispatch, "_reap_ghosts", lambda ws: 0)
+        p = mock.patch.object(dispatch, "_reap_ghosts", lambda ws: (0, True))
         p.start()
         self.addCleanup(p.stop)
 
