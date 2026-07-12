@@ -38,9 +38,14 @@ def main(argv=None) -> int:
         from .runtime import dispatch
         # An optional variant name (e.g. the steward's "deep-sweep", triggered-agents-254)
         # selects a second, differently-scheduled mode of the same agent — see automation.toml's
-        # [variants.<name>] table and dispatch.run's docstring.
-        variant = rest[1] if len(rest) > 1 else None
-        return dispatch.run(agent, variant)
+        # [variants.<name>] table and dispatch.run's docstring. `--cleanup-only` (triggered-
+        # agents-445) is ta-gate.sh's call on a precheck skip: no variant, no dispatch, just let
+        # an ephemeral agent's finished/stuck terminal get torn down instead of waiting for a
+        # tick that has real work.
+        dispatch_args = rest[1:]
+        cleanup_only = "--cleanup-only" in dispatch_args
+        variant = next((a for a in dispatch_args if not a.startswith("--")), None)
+        return dispatch.run(agent, variant, cleanup_only=cleanup_only)
     cli = import_module(f"triggered_agents.agents.{agent}.cli")
     return cli.main(rest)
 

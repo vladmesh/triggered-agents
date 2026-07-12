@@ -11,6 +11,7 @@ import os
 import shlex
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -77,7 +78,16 @@ class _DispatchBase(unittest.TestCase):
         p.start()
         self.addCleanup(p.stop)
 
-        p = mock.patch.object(dispatch, "_orca", lambda args: self.orca_calls.append(args))
+        def fake_orca(args):
+            self.orca_calls.append(args)
+            if args[:2] == ["terminal", "stop"]:
+                # Mirrors real Orca: `terminal stop --worktree` kills every live terminal in the
+                # workspace, so `_stop_and_confirm`'s re-list (via `_agent_terminals`) comes back
+                # empty. Every test class here models exactly one workspace, so a stop always
+                # clears the whole fixture list.
+                self.terminals = []
+
+        p = mock.patch.object(dispatch, "_orca", fake_orca)
         p.start()
         self.addCleanup(p.stop)
 
@@ -314,6 +324,142 @@ class EphemeralLifecycleTest(_DispatchBase):
         self.assertEqual(self._logged_actions(), ["created"])
 
 
+class StopConfirmFailureTest(_DispatchBase):
+    """triggered-agents-445, PR #95 review B3: `_orca`'s `terminal stop` doesn't surface its own
+    return code, so every "stop, then create" path must re-list and confirm the workspace is
+    actually clear before spawning a replacement — otherwise a silently-failed stop plus an
+    unconditional create risks two live sessions for one singleton agent. Overrides the shared
+    fixture's stop handling with one that never actually clears `self.terminals`, simulating a
+    stop Orca reports success for but that doesn't really kill the pty."""
+
+    def setUp(self):
+        super().setUp()
+
+        def fake_orca_stop_never_confirms(args):
+            self.orca_calls.append(args)
+            # deliberately does NOT clear self.terminals -- the stop "succeeds" but the
+            # workspace still shows the old terminal on the next `terminal list`
+
+        p = mock.patch.object(dispatch, "_orca", fake_orca_stop_never_confirms)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_watchdog_restart_bails_without_creating(self):
+        self.terminals = [{"handle": "h1", "title": "✳ Claude Code", "lastOutputAt": 1000}]
+        self.idle = False
+        with mock.patch.object(dispatch, "_quiet_seconds", lambda t, now: dispatch.WATCHDOG_SECONDS + 1):
+            dispatch.run("agent")
+        create_calls = [c for c in self.orca_json_calls if c[:2] == ["terminal", "create"]]
+        self.assertEqual(create_calls, [])
+        self.assertEqual(self._logged_actions(), ["watchdog-stop-failed"])
+
+    def test_ephemeral_idle_bails_without_creating(self):
+        with mock.patch.object(dispatch, "_load_spec", lambda agent: {"ephemeral": True}):
+            self.terminals = [{"handle": "h1", "title": "✳ Claude Code", "lastOutputAt": 1000}]
+            self.idle = True
+            dispatch.run("agent")
+        create_calls = [c for c in self.orca_json_calls if c[:2] == ["terminal", "create"]]
+        self.assertEqual(create_calls, [])
+        self.assertEqual(self._logged_actions(), ["ephemeral-stop-failed"])
+
+    def test_red_fallback_bails_without_creating(self):
+        self.terminals = [{"handle": "h1", "title": "✳ Claude Code", "lastOutputAt": 1000}]
+        self.idle = True
+        with mock.patch.object(dispatch, "_reuse_head_is_red", lambda agent, state: True):
+            dispatch.run("agent")
+        create_calls = [c for c in self.orca_json_calls if c[:2] == ["terminal", "create"]]
+        self.assertEqual(create_calls, [])
+        self.assertEqual(self._logged_actions(), ["red-fallback-stop-failed"])
+
+
+class CreateVisibilityGuardTest(_DispatchBase):
+    """triggered-agents-445, PR #95 review B2: a terminal this agent just created can take a
+    moment to show up in `terminal list`. A second dispatch landing in that gap must not read
+    "no terminal visible" as "nothing was ever spawned" and create a duplicate."""
+
+    def test_second_dispatch_within_grace_skips_instead_of_duplicating(self):
+        self.terminals = []
+        dispatch.run("agent")  # tick 1: genuinely nothing there -> creates
+        self.terminals = []    # tick 2 lands before Orca shows the new terminal -- still empty
+        dispatch.run("agent")
+        create_calls = [c for c in self.orca_json_calls if c[:2] == ["terminal", "create"]]
+        self.assertEqual(len(create_calls), 1)  # still just the one from tick 1
+        self.assertEqual(self._logged_actions(), ["created", "recent-create-guard"])
+
+    def test_dispatch_after_grace_expires_creates_again(self):
+        self.terminals = []
+        dispatch.run("agent")
+        later = time.time() + dispatch.CREATE_VISIBILITY_GRACE_S + 1
+        with mock.patch("time.time", lambda: later):
+            self.terminals = []
+            dispatch.run("agent")
+        create_calls = [c for c in self.orca_json_calls if c[:2] == ["terminal", "create"]]
+        self.assertEqual(len(create_calls), 2)
+        self.assertEqual(self._logged_actions(), ["created", "created"])
+
+    def test_first_ever_dispatch_is_not_blocked_by_the_guard(self):
+        self.terminals = []
+        dispatch.run("agent")
+        self.assertEqual(self._logged_actions(), ["created"])
+
+
+class CleanupOnlyTest(_DispatchBase):
+    """triggered-agents-445, PR #95 review B1: `dispatch.run(..., cleanup_only=True)` is
+    `ta-gate.sh`'s call on a precheck skip (no new work). It must never dispatch a skill or
+    create a terminal, but for an ephemeral agent it must still tear down a finished or stuck
+    terminal instead of waiting for a tick that happens to have real work."""
+
+    def setUp(self):
+        super().setUp()
+        p = mock.patch.object(dispatch, "_load_spec", lambda agent: {"ephemeral": True})
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_no_terminal_is_a_pure_noop(self):
+        self.terminals = []
+        dispatch.run("agent", cleanup_only=True)
+        self.assertEqual(self.orca_calls, [])
+        self.assertEqual([c for c in self.orca_json_calls if c[:2] == ["terminal", "create"]], [])
+        self.assertEqual(self._logged_actions(), [])
+
+    def test_idle_finished_terminal_is_torn_down_without_recreating(self):
+        self.terminals = [{"handle": "h1", "title": "✳ Claude Code", "lastOutputAt": 1000}]
+        self.idle = True
+        dispatch.run("agent", cleanup_only=True)
+        stop_calls = [c for c in self.orca_calls if c[:2] == ["terminal", "stop"]]
+        create_calls = [c for c in self.orca_json_calls if c[:2] == ["terminal", "create"]]
+        self.assertEqual(len(stop_calls), 1)
+        self.assertEqual(create_calls, [])
+        self.assertEqual(self._logged_actions(), ["cleanup-teardown"])
+
+    def test_busy_and_fresh_is_left_untouched(self):
+        self.terminals = [{"handle": "h1", "title": "✳ Claude Code", "lastOutputAt": 1000}]
+        self.idle = False
+        with mock.patch.object(dispatch, "_quiet_seconds", lambda t, now: 5.0):
+            dispatch.run("agent", cleanup_only=True)
+        self.assertEqual(self.orca_calls, [])
+        self.assertEqual(self._logged_actions(), [])
+
+    def test_busy_and_stuck_is_stopped_without_recreating(self):
+        self.terminals = [{"handle": "h1", "title": "✳ Claude Code", "lastOutputAt": 1000}]
+        self.idle = False
+        with mock.patch.object(dispatch, "_quiet_seconds", lambda t, now: dispatch.WATCHDOG_SECONDS + 1):
+            dispatch.run("agent", cleanup_only=True)
+        stop_calls = [c for c in self.orca_calls if c[:2] == ["terminal", "stop"]]
+        create_calls = [c for c in self.orca_json_calls if c[:2] == ["terminal", "create"]]
+        self.assertEqual(len(stop_calls), 1)
+        self.assertEqual(create_calls, [])
+        self.assertEqual(self._logged_actions(), ["cleanup-watchdog-stop"])
+
+    def test_non_ephemeral_agent_is_left_completely_untouched(self):
+        with mock.patch.object(dispatch, "_load_spec", lambda agent: {}):
+            self.terminals = [{"handle": "h1", "title": "✳ Claude Code", "lastOutputAt": 1000}]
+            self.idle = True
+            dispatch.run("agent", cleanup_only=True)
+        self.assertEqual(self.orca_calls, [])
+        self.assertEqual(self._logged_actions(), [])
+
+
 class EphemeralTwoTickLifecycleTest(unittest.TestCase):
     """Integration-style test (still no network, no real Orca — this file's own convention)
     simulating two sequential curator ticks against an in-memory terminal+tab store that mirrors
@@ -431,6 +577,30 @@ class EphemeralTwoTickLifecycleTest(unittest.TestCase):
         self.assertEqual(self.sent_texts, [])
 
         self.assertEqual(self._actions(), ["created", "ephemeral-restart"])
+
+    def test_third_tick_with_no_new_work_leaves_literally_zero_terminals_and_tabs(self):
+        """PR #95 review B4: proving "the old terminal was replaced by a new one" on every tick
+        is a weaker claim than the acceptance criterion ("zero terminals/tabs after each
+        completion") — a workspace that always has exactly one live terminal never actually hits
+        zero anywhere in that test. Drive a third tick as `ta-gate.sh` would on a precheck skip
+        (`cleanup_only=True`, no new work for curator) after tick 2 finishes, and assert the
+        workspace is verifiably empty: no live terminal, no tab, of any status."""
+        dispatch.run("curator")
+        self.idle = True
+        dispatch.run("curator")
+        self.assertEqual(len(self.live), 1)
+        self.assertEqual(len(self.tabs), 1)
+
+        # tick 3: precheck found no new work, ta-gate.sh calls cleanup_only instead of a real
+        # dispatch -- the second tick's session already finished (idle), so it gets torn down
+        # and nothing new is created in its place
+        self.idle = True
+        dispatch.run("curator", cleanup_only=True)
+
+        self.assertEqual(self.live, {})
+        self.assertEqual(self.tabs, {})
+        self.assertEqual(len(self.created_handles), 2)  # no third session was spawned
+        self.assertEqual(self._actions(), ["created", "ephemeral-restart", "cleanup-teardown"])
 
 
 class PipelinePauseGateTest(_DispatchBase):
@@ -728,7 +898,12 @@ class StewardReportCardDispatchTest(unittest.TestCase):
         p.start()
         self.addCleanup(p.stop)
 
-        p = mock.patch.object(dispatch, "_orca", lambda args: self.orca_calls.append(args))
+        def fake_orca(args):
+            self.orca_calls.append(args)
+            if args[:2] == ["terminal", "stop"]:
+                self.terminals = []
+
+        p = mock.patch.object(dispatch, "_orca", fake_orca)
         p.start()
         self.addCleanup(p.stop)
 

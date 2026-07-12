@@ -68,11 +68,14 @@ class PrecheckGateTest(unittest.TestCase):
         self.assertEqual(p.returncode, 0)
         self.assertIn("DISPATCHED", p.stdout)
 
-    def test_rc_100_skips_cleanly_without_dispatching(self):
+    def test_rc_100_skips_the_skill_but_still_runs_cleanup(self):
+        """triggered-agents-445: a plain precheck skip must not dispatch a skill turn, but must
+        still let dispatch's cleanup-only pass run — otherwise an ephemeral agent's already-
+        finished terminal would sit until a tick that happens to have real work."""
         p = _run_gate(100)
         self.assertEqual(p.returncode, 0)  # a plain skip must not fail the unit
-        self.assertNotIn("DISPATCHED", p.stdout)
-        self.assertIn("no change, run skipped", p.stdout)
+        self.assertIn("no change, skill dispatch skipped", p.stdout)
+        self.assertIn("DISPATCHED pipeline dispatch --cleanup-only", p.stdout)
 
     def test_rc_one_fails_the_unit_distinctly_from_skip(self):
         p = _run_gate(1)

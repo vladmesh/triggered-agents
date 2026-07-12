@@ -49,6 +49,23 @@ A live terminal never re-resolves its head profile on its own, so every spawn th
 place idle-reuse can learn which resource the warm terminal is actually running against, since
 that can already be a fallback and differ from the agent's static preferred head
 (triggered-agents-275).
+
+Three more invariants, all from PR #95 review (triggered-agents-445):
+
+  * `run(..., cleanup_only=True)` — `ta-gate.sh`'s call on a precheck skip (no new work). Never
+    dispatches a skill; for an ephemeral agent it still runs `_cleanup_only` on a finished/stuck
+    terminal, because `dispatch` (and thus every kill path above) is otherwise never invoked at
+    all on a skip tick — a finished ephemeral run could sit until the next tick that happens to
+    have real work, unbounded if that never comes (review B1).
+  * Every "stop, then create" path (watchdog-restart, ephemeral-restart, red-fallback) verifies
+    the stop actually worked via `_stop_and_confirm` — re-listing terminals rather than trusting
+    `terminal stop`'s exit code — before spawning the replacement, and bails without creating if
+    it can't confirm. Otherwise a silently-failed stop plus an unconditional create risks two live
+    sessions for one singleton agent (review B3).
+  * The "no terminal" branch checks `AgentState.load_terminal_created_at()` against
+    `CREATE_VISIBILITY_GRACE_S` before creating: a terminal this same agent just created may not
+    be visible in `terminal list` yet, and a second dispatch landing in that gap must not read
+    that as "nothing was ever spawned" and create a duplicate (review B2).
 """
 from __future__ import annotations
 
@@ -71,6 +88,11 @@ CLAUDE_JSON = Path(os.environ.get("TA_CLAUDE_JSON", str(Path.home() / ".claude.j
 WATCHDOG_SECONDS = int(os.environ.get("TA_WATCHDOG_SECONDS", "1200"))  # busy + this quiet = stuck
 IDLE_PROBE_MS = 2500        # tui-idle satisfied within this = idle; timeout = busy
 ORCA_TIMEOUT_S = 20         # never let a hung orca call wedge dispatch while it holds the lock
+# How long a just-created terminal gets the benefit of the doubt before "not visible in `terminal
+# list` yet" (triggered-agents-445, PR #95 review B2) is read the same as "nothing was ever
+# spawned". Generous relative to the lag this guards against (Orca registering a brand new pty),
+# tiny relative to any real tick cadence (hourly + jitter).
+CREATE_VISIBILITY_GRACE_S = 60
 
 
 def _orca_json(args: list[str]) -> dict:
@@ -292,8 +314,23 @@ def _create_terminal(agent: str, ws: str, launch: str, state: AgentState, profil
     data = _orca_json(["terminal", "create", "--worktree", f"path:{ws}",
                        "--title", f"triggered-agent:{agent}", "--command", launch])
     term = data.get("terminal", data)
-    state.save_terminal_handle(term.get("handle") or term.get("id"))
+    # created_at only here (never on a plain warm-reuse re-save): see save_terminal_handle's own
+    # docstring and the "no terminal" branch's visibility-gap guard below.
+    state.save_terminal_handle(term.get("handle") or term.get("id"), created_at=time.time())
     state.save_head_profile(profile)
+
+
+def _stop_and_confirm(ws: str, state: AgentState) -> bool:
+    """Stop every live terminal in `ws` and verify the workspace actually went quiet before the
+    caller treats the stop as done. `terminal stop`'s own exit code is not trustworthy enough to
+    gate a fresh spawn on (triggered-agents-445, PR #95 review B3): `_orca` doesn't even look at
+    it, and Orca itself can report success while a pty lingers. `terminal list` (via
+    `_agent_terminals`) is the ground truth every other check in this module already trusts, so
+    re-list and require it to come back empty instead. A caller that gets False back must NOT
+    proceed to `_create_terminal` — that would risk two live sessions for one singleton agent."""
+    _orca(["terminal", "stop", "--worktree", f"path:{ws}"])
+    time.sleep(1.0)
+    return not _agent_terminals(ws, state)
 
 
 def _is_idle(handle: str) -> bool:
@@ -332,16 +369,63 @@ def _reap_ghosts(ws: str) -> int:
                 try:
                     orca_rpc.call("session.tabs.close", {"worktree": snap["worktree"], "tabId": tab["parentTabId"]})
                     closed += 1
-                except Exception:
-                    pass
+                except Exception as e:
+                    # Not fatal to the run, but must not vanish silently (triggered-agents-445,
+                    # PR #95 review B3): a tab that fails to close is exactly the kind of leftover
+                    # the idempotent-cleanup criterion cares about.
+                    print(f"dispatch: reap failed to close a tab in {ws} ({e})")
     return closed
 
 
-def run(agent: str, variant: str | None = None) -> int:
+def _cleanup_only(agent: str, ws: str, state: AgentState, event: str, terms: list[dict]) -> int:
+    """Tear-down-only pass for an ephemeral agent's finished or stuck terminal, run in place of a
+    real dispatch when precheck signalled no new work (triggered-agents-445, PR #95 review B1):
+    `ta-gate.sh` skips `dispatch` entirely on a precheck skip, so without this a finished
+    ephemeral run's PTY/tab would sit until the next tick that happens to have real work —
+    unbounded if that never comes. Never creates a terminal: with nothing new to curate there is
+    no skill to hand a fresh session, and creating one anyway would defeat the whole point of
+    precheck-gating (spend a token for nothing). Non-ephemeral agents (retro/steward) get no
+    extra behavior here — their warm terminal, busy or idle, is left exactly as a precheck skip
+    always left it; that lifecycle is out of scope for this card."""
+    if not terms or not _is_ephemeral(agent):
+        return 0
+    survivor = max(terms, key=lambda t: t.get("lastOutputAt") or 0)
+    if not _is_idle(survivor["handle"]):
+        quiet = _quiet_seconds(survivor, time.time())
+        if quiet <= WATCHDOG_SECONDS:
+            return 0  # still working -- a no-work tick must never touch a live run
+        if not _stop_and_confirm(ws, state):
+            state.log_run(event, action="cleanup-stop-failed")
+            print(f"dispatch[{agent}]: cleanup could not confirm the stuck terminal stopped "
+                  "— leaving it for the next tick")
+            return 0
+        _reap_ghosts(ws)
+        state.log_run(event, action="cleanup-watchdog-stop")
+        print(f"dispatch[{agent}]: cleanup — stopped stuck terminal, no new work to dispatch")
+        return 0
+
+    # idle: the previous run already finished; tear it down and leave the workspace empty, there
+    # is no new work this tick to hand a fresh session to
+    if not _stop_and_confirm(ws, state):
+        state.log_run(event, action="cleanup-stop-failed")
+        print(f"dispatch[{agent}]: cleanup could not confirm the finished terminal stopped "
+              "— leaving it for the next tick")
+        return 0
+    _reap_ghosts(ws)
+    state.log_run(event, action="cleanup-teardown")
+    print(f"dispatch[{agent}]: cleanup — torn down finished terminal, no new work to dispatch")
+    return 0
+
+
+def run(agent: str, variant: str | None = None, cleanup_only: bool = False) -> int:
     """`variant` selects a differently-scheduled mode of the same agent (e.g. the steward's
     "deep-sweep", triggered-agents-254): a different prompt from `_launch_cmd`, and its own
     runs.jsonl event name (instead of the plain "dispatch" every hourly tick logs) so the two
     wake-up kinds stay distinguishable in the agent's own telemetry.
+
+    `cleanup_only` (triggered-agents-445) is `ta-gate.sh`'s call on a precheck skip: no new work,
+    so never dispatch a skill, but still let an ephemeral agent's finished/stuck terminal go
+    through `_cleanup_only` instead of sitting untouched until a tick that has real work.
 
     `_dispatch_command` (not `_launch_cmd` directly) runs only in the three branches below that
     actually put the skill in front of a head (fresh create, watchdog restart, idle reuse) — never
@@ -367,7 +451,21 @@ def run(agent: str, variant: str | None = None) -> int:
         if reaped:
             print(f"dispatch[{agent}]: reaped {reaped} ghost tab(s)")
         terms = _agent_terminals(ws, state)
+
+        if cleanup_only:
+            return _cleanup_only(agent, ws, state, event, terms)
+
         if not terms:
+            # A terminal this same agent just created can take a moment to show up in `terminal
+            # list` (triggered-agents-445, PR #95 review B2). Read that gap the same as "nothing
+            # was ever spawned" and a second dispatch landing inside it would create a duplicate
+            # curator/head — guard on the timestamp `_create_terminal` just recorded instead.
+            last_created = state.load_terminal_created_at()
+            if last_created is not None and (time.time() - last_created) < CREATE_VISIBILITY_GRACE_S:
+                state.log_run(event, action="recent-create-guard")
+                print(f"dispatch[{agent}]: no terminal visible yet but one was created "
+                      f"{time.time() - last_created:.1f}s ago — skipping to avoid a duplicate")
+                return 0
             skill, launch, profile = _dispatch_command(agent, variant)
             _ensure_claude_ready(ws)
             _create_terminal(agent, ws, launch, state, profile)
@@ -383,9 +481,14 @@ def run(agent: str, variant: str | None = None) -> int:
                 print(f"dispatch[{agent}]: agent busy ({int(quiet)}s silent) — left running, no dispatch")
                 return 0
             # busy but silent too long -> stuck: sweep and restart, reaping the ghost the stop
-            # just made right away rather than leaving it for the top of the next run
-            _orca(["terminal", "stop", "--worktree", f"path:{ws}"])
-            time.sleep(1.0)
+            # just made right away rather than leaving it for the top of the next run. Bail
+            # without creating if the stop can't be confirmed -- proceeding anyway risks a second
+            # live session alongside a stuck one that never actually died (review B3).
+            if not _stop_and_confirm(ws, state):
+                state.log_run(event, action="watchdog-stop-failed")
+                print(f"dispatch[{agent}]: watchdog stop could not confirm the stuck terminal "
+                      "is gone — leaving it for the next tick")
+                return 0
             _reap_ghosts(ws)
             skill, launch, profile = _dispatch_command(agent, variant)
             _ensure_claude_ready(ws)
@@ -400,8 +503,11 @@ def run(agent: str, variant: str | None = None) -> int:
         # restart above minus the profile-red gate below (a fresh spawn always re-resolves the
         # head, so there's nothing to divert from).
         if _is_ephemeral(agent):
-            _orca(["terminal", "stop", "--worktree", f"path:{ws}"])
-            time.sleep(1.0)
+            if not _stop_and_confirm(ws, state):
+                state.log_run(event, action="ephemeral-stop-failed")
+                print(f"dispatch[{agent}]: ephemeral teardown could not confirm the finished "
+                      "terminal stopped — leaving it for the next tick")
+                return 0
             reaped = _reap_ghosts(ws)
             skill, launch, profile = _dispatch_command(agent, variant)
             _ensure_claude_ready(ws)
@@ -418,8 +524,11 @@ def run(agent: str, variant: str | None = None) -> int:
         # new one, which would pile up one extra terminal per red tick (triggered-agents-274,
         # triggered-agents-275).
         if _reuse_head_is_red(agent, state):
-            _orca(["terminal", "stop", "--worktree", f"path:{ws}"])
-            time.sleep(1.0)
+            if not _stop_and_confirm(ws, state):
+                state.log_run(event, action="red-fallback-stop-failed")
+                print(f"dispatch[{agent}]: red-fallback stop could not confirm the idle terminal "
+                      "stopped — leaving it for the next tick")
+                return 0
             skill, launch, profile = _dispatch_command(agent, variant)
             _ensure_claude_ready(ws)
             _create_terminal(agent, ws, launch, state, profile)

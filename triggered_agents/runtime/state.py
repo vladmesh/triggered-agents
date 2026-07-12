@@ -91,11 +91,31 @@ class AgentState:
         except json.JSONDecodeError:
             return None
 
-    def save_terminal_handle(self, handle: str | None) -> None:
+    def load_terminal_created_at(self) -> float | None:
+        """When `_create_terminal` last actually spawned a process for this agent (epoch
+        seconds), or None if never recorded — the marker `dispatch.run`'s "no terminal" branch
+        checks before creating another one, since a terminal it just created may not be visible
+        in `terminal list` yet (triggered-agents-445, PR #95 review B2): a second dispatch landing
+        in that visibility gap must not read "no terminal" as "nothing was ever spawned" and
+        create a duplicate."""
+        if not self.terminal_handle_file.is_file():
+            return None
+        try:
+            return json.loads(self.terminal_handle_file.read_text(encoding="utf-8")).get("created_at")
+        except json.JSONDecodeError:
+            return None
+
+    def save_terminal_handle(self, handle: str | None, created_at: float | None = None) -> None:
         """Record the terminal handle from the latest fresh spawn.
 
         Codex can rename its tab away from the explicit `triggered-agent:<name>` title after
-        startup, so title matching alone is not stable enough for singleton reuse."""
+        startup, so title matching alone is not stable enough for singleton reuse.
+
+        `created_at` (epoch seconds) is set only by `_create_terminal` at the moment it actually
+        spawns a process — a plain warm-reuse call (the terminal already existed and is just being
+        re-confirmed as the survivor) passes none, which drops any previously recorded timestamp:
+        by the time reuse runs the terminal is already confirmed visible, so there is nothing left
+        for `load_terminal_created_at`'s visibility-gap check to guard."""
         self.ensure_dir()
         if not handle:
             try:
@@ -103,8 +123,11 @@ class AgentState:
             except FileNotFoundError:
                 pass
             return
+        payload = {"handle": handle}
+        if created_at is not None:
+            payload["created_at"] = created_at
         tmp = self.terminal_handle_file.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps({"handle": handle}, ensure_ascii=False), encoding="utf-8")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
         tmp.replace(self.terminal_handle_file)
 
     def log_run(self, event: str, **fields) -> None:
