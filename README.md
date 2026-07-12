@@ -20,10 +20,11 @@ CLI: `python3 -m triggered_agents <agent> <cmd>` (`harvest`/`advance`/`precheck`
 
 ## Агенты
 
-- **curator** (первый плагин) — единственный writer канона памяти (`panelmem-kb`). Агенты память
+- **curator** (первый плагин) — единственная writer-роль канона памяти. Агенты память
   только читают. Смотрит следы всех голов (парсер на голову), вытаскивает durable-факты,
-  дедупит/суперсидит, коммитит И пушит канон (обычный push, без `--force`) как офф-бокс-бэкап.
-  Индекс не трогает — его ребилдит memory-mcp. Себя не харвестит (`~/triggered-agents` исключён).
+  дедупит/суперсидит и передаёт записи через `secretary memory` protocol. Git-журнал коммитит
+  secretary memory; `panelmem-kb` остаётся read-only fallback. Индекс не трогает — его ребилдит
+  memory-mcp. Себя не харвестит (`~/triggered-agents` исключён).
   Скилл — `.claude/skills/curate`. `ephemeral = true` в `automation.toml` (triggered-agents-445):
   каждый тик — новый provider-процесс без транскрипта прошлого тика, см. «Lifecycle куратора» ниже.
 - **retro** (второй плагин) — ретро-пасс по свежим транскриптам голов (harvest переиспользует

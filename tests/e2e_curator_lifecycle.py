@@ -142,7 +142,7 @@ class CuratorLifecycleE2E(unittest.TestCase):
             "TA_RUNTIME_ENV_FILE": str(root / "role.env"),
             "TA_RUNTIME_PYTHONPATH": str(Path(__file__).resolve().parents[1]),
         }
-        (root / "role.env").write_text("PANELMEM_KB_PAT=test-only\n")
+        (root / "role.env").write_text("TA_SECRETARY_REPO=/home/dev/secretary\n")
         self.env_patch = mock.patch.dict(os.environ, env, clear=False)
         self.env_patch.start()
         self.addCleanup(self.env_patch.stop)

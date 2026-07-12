@@ -18,7 +18,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 RUNTIME_PYTHONPATH = os.environ.get("TA_RUNTIME_PYTHONPATH", str(REPO_ROOT))
 
 BOARD_ENV = ("KANBOARD_URL", "KANBOARD_API_USER", "KANBOARD_API_TOKEN")
-NONSECRET_ENV = ("TA_CODEX_MODE",)
+NONSECRET_ENV = ("TA_CODEX_MODE", "SECRETARY_INSTANCE", "TA_SECRETARY_REPO")
 
 ROLE_ALLOWLIST: dict[str, tuple[str, ...]] = {
     "pipeline": (*BOARD_ENV, *NONSECRET_ENV),
@@ -26,7 +26,7 @@ ROLE_ALLOWLIST: dict[str, tuple[str, ...]] = {
     "reviewer": (*BOARD_ENV, *NONSECRET_ENV),
     "steward": (*BOARD_ENV, *NONSECRET_ENV),
     "retro": (*BOARD_ENV, *NONSECRET_ENV),
-    "curator": ("PANELMEM_KB_PAT", *NONSECRET_ENV),
+    "curator": NONSECRET_ENV,
 }
 
 ROLE_REQUIRED: dict[str, tuple[str, ...]] = {
@@ -35,7 +35,7 @@ ROLE_REQUIRED: dict[str, tuple[str, ...]] = {
     "reviewer": BOARD_ENV,
     "steward": BOARD_ENV,
     "retro": BOARD_ENV,
-    "curator": ("PANELMEM_KB_PAT",),
+    "curator": (),
 }
 
 BOARD_ROLES = {"po", "dispatcher", "worker", "reviewer", "steward", "retro"}
