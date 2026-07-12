@@ -85,20 +85,22 @@ class EnsureAutomationFlagTest(unittest.TestCase):
 
 
 class CuratorSpecScopeTest(unittest.TestCase):
-    """The fix is scoped to curator only (triggered-agents-444): retro/steward keep today's
-    default (Orca's own trigger enabled) since single-scheduler ownership for them is out of
-    scope for this card."""
+    """Agents that declare systemd as sole scheduler keep their Orca trigger disabled."""
 
     def test_curator_disables_its_own_orca_trigger(self):
         spec = tomllib.loads((REPO_ROOT / "triggered_agents" / "agents" / "curator"
                               / "automation.toml").read_text())
         self.assertIs(spec["trigger"]["enabled"], False)
 
-    def test_retro_and_steward_are_untouched(self):
-        for agent in ("retro", "steward"):
-            spec = tomllib.loads((REPO_ROOT / "triggered_agents" / "agents" / agent
-                                  / "automation.toml").read_text())
-            self.assertNotIn("enabled", spec.get("trigger", {}))
+    def test_steward_disables_its_own_orca_trigger(self):
+        spec = tomllib.loads((REPO_ROOT / "triggered_agents" / "agents" / "steward"
+                              / "automation.toml").read_text())
+        self.assertIs(spec["trigger"]["enabled"], False)
+
+    def test_retro_keeps_its_existing_scheduler_contract(self):
+        spec = tomllib.loads((REPO_ROOT / "triggered_agents" / "agents" / "retro"
+                              / "automation.toml").read_text())
+        self.assertNotIn("enabled", spec.get("trigger", {}))
 
 
 if __name__ == "__main__":
