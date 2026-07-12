@@ -136,8 +136,9 @@ def runtime_env(role: str, *, base_env: dict[str, str] | None = None,
 
 
 def apply_runtime_env(role: str, *, env_file: Path | str | None = None, require: bool = True) -> None:
+    env = runtime_env(role, env_file=env_file, require=require)
     os.environ.clear()
-    os.environ.update(runtime_env(role, env_file=env_file, require=require))
+    os.environ.update(env)
 
 
 def wrap_shell_command(role: str, command: str, *, pythonpath: str | None = None,

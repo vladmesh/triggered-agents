@@ -133,6 +133,28 @@ KANBOARD_ADMIN_PASSWORD=admin-password-value
         self.assertEqual(captured["env"]["KANBOARD_API_TOKEN"], "worker-token-value")
         self.assertNotIn("KANBOARD_ADMIN_PASSWORD", captured["env"])
 
+    def test_apply_runtime_env_preserves_safe_ambient_env_before_clearing(self):
+        path = self._env_file("""
+KANBOARD_URL=http://kanboard.invalid/jsonrpc.php
+KANBOARD_API_USER=jsonrpc
+KANBOARD_API_TOKEN=pipeline-token-value
+KANBOARD_ADMIN_PASSWORD=admin-password-value
+""")
+        env = {
+            "PATH": "/usr/bin:/bin",
+            "HOME": "/home/dev",
+            "GH_TOKEN": "parent-gh-token",
+            "TA_RUNTIME_ENV_FILE": str(path),
+        }
+
+        with mock.patch.dict(os.environ, env, clear=True):
+            role_env.apply_runtime_env("pipeline", env_file=path)
+            self.assertEqual(os.environ["PATH"], "/usr/bin:/bin")
+            self.assertEqual(os.environ["HOME"], "/home/dev")
+            self.assertEqual(os.environ["KANBOARD_API_TOKEN"], "pipeline-token-value")
+            self.assertNotIn("KANBOARD_ADMIN_PASSWORD", os.environ)
+            self.assertNotIn("GH_TOKEN", os.environ)
+
 
 if __name__ == "__main__":
     unittest.main()
