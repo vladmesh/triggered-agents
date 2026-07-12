@@ -1,9 +1,12 @@
 """Deep-sweep drift check (triggered-agents-256): live ta-* systemd units plus the installed
 precheck gate script vs. what deploy/provision.py would install right now from the current
 triggered_agents/agents/*/automation.toml specs and repo copy of deploy/ta-gate.sh. Also flags a
-double-schedule (triggered-agents-444): an agent whose ta-<agent>.timer is live on the host while
-the same-named Orca automation still has its own trigger enabled, which would let one hourly tick
-dispatch twice. Detection only, called from the deep-sweep section of
+double-schedule (triggered-agents-444): for an agent whose spec OPTS IN to single-scheduler
+ownership (`[trigger] enabled = false`, e.g. curator), ta-<agent>.timer live on the host while the
+same-named Orca automation still has its own trigger enabled — live state contradicting that
+agent's own canon, which would let one hourly tick dispatch twice. An agent that never made that
+promise (retro, steward) is not checked at all — its Orca automation being enabled is its
+unchanged, intended state, not drift. Detection only, called from the deep-sweep section of
 `.claude/skills/steward/SKILL.md`; filing an Идеи card with the diff is the skill's job, not this
 module's. Auto-healing the drift is explicitly out of scope for this card (a live systemd rewrite
 belongs to a human-reviewed provision run, not an unconditional daily sweep).
@@ -85,11 +88,21 @@ def _orca_automation_states() -> dict[str, bool]:
 
 
 def _double_schedule_drift(automation_states: dict[str, bool]) -> list[dict]:
-    """Flag every agent where BOTH ta-<agent>.timer is live on the host AND the same-named Orca
-    automation still has its own trigger enabled (triggered-agents-444): two independent schedule
-    owners that could both fire the same tick's skill. `automation_states` comes from
-    `_orca_automation_states`; an agent absent from it (query failed, or no automation of that
-    name exists yet) is skipped rather than assumed either way."""
+    """Flag every agent whose spec OPTS IN to single-scheduler ownership (`[trigger] enabled =
+    false`, e.g. curator, triggered-agents-444) but whose live state doesn't match that canon: both
+    ta-<agent>.timer live on the host AND the same-named Orca automation still has its own trigger
+    enabled — two independent schedule owners that could both fire the same tick's skill.
+
+    Deliberately scoped to opt-in agents only, not every agent with a live timer: an agent whose
+    spec never sets `[trigger] enabled = false` (retro, steward) has made no single-scheduler
+    promise in the first place, so its Orca automation being enabled is its unchanged, intended
+    state, not drift. Flagging it anyway would report every retro/steward host as perpetually
+    out-of-sync for a policy that was never asked of them (triggered-agents-444 review fixup) —
+    the blast radius of this check must match the blast radius of the fix, not every agent that
+    happens to share the same timer/automation shape.
+
+    `automation_states` comes from `_orca_automation_states`; an agent absent from it (query
+    failed, or no automation of that name exists yet) is skipped rather than assumed either way."""
     hits = []
     for agent_dir in sorted(provision.AGENTS_DIR.iterdir()):
         spec_path = agent_dir / "automation.toml"
@@ -99,6 +112,8 @@ def _double_schedule_drift(automation_states: dict[str, bool]) -> list[dict]:
         spec = tomllib.loads(spec_path.read_text(encoding="utf-8"))
         if spec.get("dispatcher") or not spec.get("skill"):
             continue  # deterministic agent, no Orca automation at all
+        if spec.get("trigger", {}).get("enabled", True):
+            continue  # never opted into single-scheduler ownership — nothing to check
         if not (SYSTEMD_DIR / f"ta-{agent}.timer").is_file():
             continue
         if automation_states.get(agent):
@@ -107,7 +122,8 @@ def _double_schedule_drift(automation_states: dict[str, bool]) -> list[dict]:
                 "kind": "double-schedule",
                 "diff": (
                     f"ta-{agent}.timer is live on the host AND the Orca automation '{agent}' "
-                    "still has its own trigger enabled — both could fire the same tick's skill. "
+                    "still has its own trigger enabled, though its spec's [trigger] enabled = "
+                    "false — both could fire the same tick's skill. "
                     f"Re-provision (deploy/provision.py {agent}) to reassert --disabled."
                 ),
             })

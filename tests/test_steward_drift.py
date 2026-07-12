@@ -72,6 +72,14 @@ class DriftCheckTest(unittest.TestCase):
         d.mkdir()
         (d / "automation.toml").write_text(_SPEC.format(agent=agent), encoding="utf-8")
 
+    def _write_spec_opted_into_single_scheduler(self, agent: str) -> None:
+        # Real curator canon: `[trigger] enabled = false` (triggered-agents-444) — the
+        # double-schedule check only ever applies to an agent whose own spec makes this promise.
+        d = self.agents_dir / agent
+        d.mkdir()
+        (d / "automation.toml").write_text(
+            _SPEC.format(agent=agent) + "\n[trigger]\nenabled = false\n", encoding="utf-8")
+
     def _expected(self, agent: str) -> tuple[str, str]:
         ws = self.workspaces_root / agent
         service = provision._service_unit(agent, "hourly", ws,
@@ -177,7 +185,7 @@ randomized_delay_sec = 600
         self.assertIn("- old", out)
 
     def _write_synced_curator(self) -> None:
-        self._write_spec("curator")
+        self._write_spec_opted_into_single_scheduler("curator")
         service, timer = self._expected("curator")
         (self.systemd_dir / "ta-curator.service").write_text(service, encoding="utf-8")
         (self.systemd_dir / "ta-curator.timer").write_text(timer, encoding="utf-8")
@@ -216,8 +224,25 @@ randomized_delay_sec = 600
     def test_no_double_schedule_when_timer_was_never_provisioned(self):
         # Spec exists but ta-curator.timer isn't live on the host yet -> reported as "missing"
         # unit drift, never as a double-schedule (there is only one live owner, not two).
-        self._write_spec("curator")
+        self._write_spec_opted_into_single_scheduler("curator")
         self._fake_orca_automations({"curator": True})
+
+        result = drift.check()
+
+        kinds = {h["kind"] for h in result["drift"]}
+        self.assertNotIn("double-schedule", kinds)
+
+    def test_no_double_schedule_for_agent_that_never_opted_in(self):
+        # retro/steward keep today's default (Orca trigger enabled) — out of scope for this card
+        # (triggered-agents-444). A live timer + a live enabled automation for one of them is their
+        # unchanged, intended state, not drift: the check must not flag agents that never promised
+        # single-scheduler ownership in their own spec (review fixup — a prior version of this
+        # check flagged every agent unconditionally and would have misfired on retro/steward).
+        self._write_spec("retro")   # plain _SPEC, no [trigger] section -> not opted in
+        service, timer = self._expected("retro")
+        (self.systemd_dir / "ta-retro.service").write_text(service, encoding="utf-8")
+        (self.systemd_dir / "ta-retro.timer").write_text(timer, encoding="utf-8")
+        self._fake_orca_automations({"retro": True})
 
         result = drift.check()
 
