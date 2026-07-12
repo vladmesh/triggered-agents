@@ -17,11 +17,14 @@ cheap and keeps each helper self-contained.
 from __future__ import annotations
 
 import os
+import time
 
 from ...runtime.kanboard import KanboardError, call
 from . import heads, model, naming, worker
 from .state import STATE
 
+
+DONE_RETENTION_DAYS = 5
 
 
 def board_id() -> int:
@@ -766,6 +769,42 @@ def list_cards(column: str | None = None, project: str | None = None) -> list[di
             continue
         out.append(view)
     return out
+
+
+def close_old_done_cards(now: int | float | None = None,
+                         retention_days: int = DONE_RETENTION_DAYS) -> dict:
+    """Close active Done cards that have spent more than `retention_days` full days there.
+
+    Uses Kanboard's date_moved as the age of the current-column episode. A card without a usable
+    date_moved is left alone because the operation cannot prove it is beyond the retention window.
+    """
+    pid = board_id()
+    done_id = _column_id(pid, "Done")
+    now_ts = int(time.time() if now is None else now)
+    threshold_s = int(retention_days * 24 * 60 * 60)
+    closed = []
+    for task in call("getAllTasks", project_id=pid, status_id=1) or []:
+        if int(task.get("column_id", 0) or 0) != done_id:
+            continue
+        active = task.get("is_active", task.get("status", 1))
+        if active is not None and int(active) != 1:
+            continue
+        try:
+            moved_at = int(task.get("date_moved") or 0)
+        except (TypeError, ValueError):
+            continue
+        if moved_at <= 0 or now_ts - moved_at <= threshold_s:
+            continue
+        ok = call("closeTask", task_id=int(task["id"]))
+        if not ok:
+            raise KanboardError(f"closeTask failed for task {task['id']}")
+        closed.append(task.get("reference") or str(task["id"]))
+    return {
+        "action": "closed-old-done",
+        "closed": closed,
+        "closed_count": len(closed),
+        "retention_days": retention_days,
+    }
 
 
 def show_card(reference: str) -> dict:

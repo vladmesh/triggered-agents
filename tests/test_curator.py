@@ -189,11 +189,17 @@ class PrecheckProtocolTest(unittest.TestCase):
         self.addCleanup(p.stop)
 
     def test_curator_precheck_skip_uses_sentinel(self):
-        with mock.patch.object(curator_cli, "STATE", AgentState("curator-precheck-test")):
+        empty = {"sessions": [], "memory": [], "pending": {}}
+        with mock.patch.object(curator_cli, "STATE", AgentState("curator-precheck-test")), \
+                mock.patch.object(curator_cli.harvest, "harvest", return_value=empty):
             self.assertEqual(curator_cli.cmd_precheck(), PRECHECK_SKIP)
 
     def test_retro_precheck_skip_uses_sentinel(self):
-        with mock.patch.object(retro_cli, "STATE", AgentState("retro-precheck-test")):
+        empty = {"sessions": [], "memory": [], "pending": {}}
+        with mock.patch.object(retro_cli, "STATE", AgentState("retro-precheck-test")), \
+                mock.patch.object(retro_cli.pipeline_ops, "close_old_done_cards",
+                                  return_value={"closed": []}), \
+                mock.patch.object(retro_cli.harvest, "harvest", return_value=empty):
             self.assertEqual(retro_cli.cmd_precheck(), PRECHECK_SKIP)
 
 
