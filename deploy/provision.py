@@ -155,6 +155,13 @@ def ensure_automation(spec: dict, workspace: Path) -> str | None:
         # directly, there is no claude head, so no Orca automation to register.
         log(f"automation skipped (deterministic dispatcher): {name}")
         return None
+    # Whether the automation's OWN rrule trigger is allowed to fire it. Defaults true (the
+    # automation is otherwise vestigial as a scheduler, see ensure_systemd's comment below) so
+    # existing agents keep today's behavior; an agent whose spec sets `[trigger] enabled = false`
+    # (curator, triggered-agents-444) hands sole ownership of its cadence to ta-<name>.timer —
+    # applied on every create AND edit so a stray manual re-enable in the Orca GUI gets reasserted
+    # back to disabled on the next provision, not just set once at creation.
+    orca_trigger_enabled = spec.get("trigger", {}).get("enabled", True)
     common = [
         "--prompt", spec["skill"],
         "--provider", spec["provider"],
@@ -162,6 +169,7 @@ def ensure_automation(spec: dict, workspace: Path) -> str | None:
         "--workspace", f"path:{workspace}",
         "--workspace-mode", "existing",
         "--reuse-session" if spec.get("reuse_session") else "--fresh-session",
+        "--enabled" if orca_trigger_enabled else "--disabled",
     ]
     if spec.get("precheck"):
         common += ["--precheck", spec["precheck"]]
@@ -171,7 +179,7 @@ def ensure_automation(spec: dict, workspace: Path) -> str | None:
         run([ORCA, "automations", "edit", aid, *common])
         log(f"automation edited (id preserved): {name} {aid}")
     else:
-        data = orca_json(["automations", "create", "--name", name, *common, "--enabled"])
+        data = orca_json(["automations", "create", "--name", name, *common])
         aid = (_unwrap(data, "automation") or {}).get("id")
         if not aid:
             raise SystemExit(f"[provision] could not read new automation id for {name}")

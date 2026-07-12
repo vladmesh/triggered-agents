@@ -18,6 +18,12 @@ precheck = "python3 -m triggered_agents curator precheck"
 # Orca's own rrule does not tick in headless `orca serve`; kept for correctness but the real
 # clock is the systemd timer below.
 orca = "hourly"
+# ta-curator.timer is the sole schedule owner (triggered-agents-444): a non-headless orca (its
+# rrule DOES tick there) or a manual re-enable in the GUI must not be able to fire /curate a
+# second time alongside the timer. deploy/provision.py reads this and passes --disabled on every
+# create/edit; `orca automations run <id>` (manual diagnostic run) is unaffected — it dispatches
+# on demand regardless of this flag.
+enabled = false
 
 [systemd]
 # The actual scheduler on this headless box. Unit name is derived as ta-<name>.
