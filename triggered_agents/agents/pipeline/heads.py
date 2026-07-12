@@ -20,6 +20,8 @@ from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 
+from ...runtime import role_env
+
 HEADS_TOML = Path(__file__).with_name("heads.toml")
 
 # The CODEX_HOME a codex head runs under: a dedicated, pipeline-owned home holding codex' ChatGPT
@@ -320,15 +322,15 @@ def load_registry(path: Path = HEADS_TOML) -> Registry:
 
 
 def render_command(profile_id: str, *, role: str, prompt: str, registry: Registry | None = None) -> str:
-    """The full shell command for `orca terminal create --command`: `BOARD_ROLE=<role>` (read by
-    the board-CLI itself, so every adapter gets role-gating for free) followed by the profile's
-    own adapter rendering. This is the batch-compatible path: Codex stays `codex exec` here so
-    singleton agents that cannot deliver a post-start prompt keep their old launch contract.
-    Raises HeadRegistryError on an unknown profile/adapter."""
+    """The full shell command for `orca terminal create --command`.
+
+    The role env wrapper sets BOARD_ROLE and the minimal role-specific runtime env before the
+    adapter command execs. Secret values stay out of the command string Orca stores.
+    """
     reg = registry or load_registry()
     profile = reg.profile(profile_id)
     render = ADAPTERS[profile["adapter"]]
-    return f"BOARD_ROLE={role} {render(profile, prompt=prompt)}"
+    return role_env.wrap_shell_command(role, render(profile, prompt=prompt))
 
 
 def render_launch(profile_id: str, *, role: str, prompt: str, workspace: str | None = None,
@@ -343,7 +345,7 @@ def render_launch(profile_id: str, *, role: str, prompt: str, workspace: str | N
     profile = reg.profile(profile_id)
     if profile["adapter"] == "codex" and _codex_launch_mode(profile) == "tui":
         return LaunchSpec(
-            command=f"BOARD_ROLE={role} {_render_codex_tui(profile, workspace=workspace)}",
+            command=role_env.wrap_shell_command(role, _render_codex_tui(profile, workspace=workspace)),
             initial_prompt=prompt,
             terminal_kind="codex-tui",
         )

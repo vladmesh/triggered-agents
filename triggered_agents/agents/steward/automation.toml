@@ -31,9 +31,8 @@ orca = "hourly"
 # The actual scheduler on this headless box. Unit name is derived as ta-<name>.
 calendar = "hourly"
 randomized_delay_sec = 150   # jitter so the hourly sweep never races curator/board at :00-:03
-# precheck hits Kanboard directly (signals.py), before any claude head is up to source .env
-# itself — same reason the pipeline dispatcher's unit needs this (see pipeline/automation.toml).
-env_file = "/home/dev/control-panel/.env"
+# precheck hits Kanboard directly (signals.py), before any LLM head is up; ta-gate loads the
+# steward allowlist through role-scoped runtime env.
 
 # Second, unconditional mode (triggered-agents-254): once a day the head wakes up with NO
 # precheck gate at all, regardless of whether signals.py found anything — the five signal
@@ -57,4 +56,3 @@ skill = "/steward deep-sweep"
 # spec with its own internal space would get split apart and break).
 calendar = "03:47:00"
 randomized_delay_sec = 600
-env_file = "/home/dev/control-panel/.env"

@@ -179,8 +179,7 @@ def ensure_automation(spec: dict, workspace: Path) -> str | None:
     return aid
 
 
-def _service_unit(agent: str, calendar: str, workspace: Path, _precheck: str,
-                  env_file: str = "") -> str:
+def _service_unit(agent: str, calendar: str, workspace: Path, _precheck: str) -> str:
     # ExecStart is the versioned gate script (deploy/ta-gate.sh, installed at GATE_INSTALL_PATH),
     # run as `ta-gate.sh <agent>`. It calls `<agent> precheck` and branches on the exit-code
     # protocol (0 dispatch / 100 skip / other = fail the unit), then execs `<agent> dispatch`.
@@ -188,7 +187,6 @@ def _service_unit(agent: str, calendar: str, workspace: Path, _precheck: str,
     # trigger=manual and spawns a fresh head every tick, so heads pile up. The driver converges the
     # workspace to one warm claude terminal and reuses it. See runtime/dispatch.py and ta-gate.sh.
     exec_start = f"{GATE_INSTALL_PATH} {agent}"
-    env_line = f"EnvironmentFile={env_file}\n" if env_file else ""
     return f"""[Unit]
 Description=triggered-agents: {agent} {calendar} tick (precheck gate + singleton terminal dispatch)
 Documentation=file:///home/dev/control-panel/docs/ARCHITECTURE.md
@@ -201,7 +199,7 @@ User=dev
 Group=dev
 WorkingDirectory={workspace}
 Environment=HOME=/home/dev
-{env_line}ExecStart={exec_start}
+ExecStart={exec_start}
 """
 
 
@@ -223,14 +221,13 @@ WantedBy=timers.target
 """
 
 
-def _variant_service_unit(agent: str, variant: str, calendar: str, workspace: Path, env_file: str = "") -> str:
+def _variant_service_unit(agent: str, variant: str, calendar: str, workspace: Path) -> str:
     """Unconditional dispatch — no precheck gate at all (triggered-agents-254: the whole point of
     a second, differently-scheduled mode is to wake the head even when the deterministic signals
     stayed quiet, including the case where the signals themselves are blind). ExecStart is the
     script called with a variant arg (`ta-gate.sh <agent> <variant>`), whose two-arg form skips
     precheck entirely and execs `dispatch <variant>` directly; dispatch.py's own busy/idle check
     still protects it from colliding with a live hourly-tick session in the same workspace."""
-    env_line = f"EnvironmentFile={env_file}\n" if env_file else ""
     return f"""[Unit]
 Description=triggered-agents: {agent} {variant} {calendar} unconditional sweep (no precheck gate)
 Documentation=file:///home/dev/control-panel/docs/ARCHITECTURE.md
@@ -243,7 +240,7 @@ User=dev
 Group=dev
 WorkingDirectory={workspace}
 Environment=HOME=/home/dev
-{env_line}ExecStart={GATE_INSTALL_PATH} {agent} {variant}
+ExecStart={GATE_INSTALL_PATH} {agent} {variant}
 """
 
 
@@ -279,23 +276,21 @@ def render_units(agent: str, spec: dict, workspace: Path) -> dict[str, str]:
     service+timer and every `[variants.*]` pair declared in `spec` (the parsed automation.toml).
     Single source of truth for "what SHOULD this agent's units contain right now": ensure_systemd
     below writes exactly this to disk, and steward's drift.py (triggered-agents-256) compares it
-    against what's actually there. Extracting the spec fields (calendar/env_file/delay defaults)
-    a second time in drift.py would let that copy silently diverge from this one — the same
+    against what's actually there. Extracting the spec fields (calendar/delay defaults) a second
+    time in drift.py would let that copy silently diverge from this one — the same
     two-renderers-drift-from-each-other risk the unit *text* builders (_service_unit etc.) already
     avoid by being called from both places instead of reimplemented."""
     sysd = spec.get("systemd", {})
     calendar = sysd.get("calendar", "hourly")
     units = {
-        f"ta-{agent}.service": _service_unit(agent, calendar, workspace, spec.get("precheck", ""),
-                                              sysd.get("env_file", "")),
+        f"ta-{agent}.service": _service_unit(agent, calendar, workspace, spec.get("precheck", "")),
         f"ta-{agent}.timer": _timer_unit(agent, calendar, int(sysd.get("randomized_delay_sec", 0))),
     }
     for variant, vspec in spec.get("variants", {}).items():
         vsysd = vspec.get("systemd", {})
         vcalendar = vsysd.get("calendar", "daily")
         vunit = f"ta-{agent}-{variant}"
-        units[f"{vunit}.service"] = _variant_service_unit(agent, variant, vcalendar, workspace,
-                                                           vsysd.get("env_file", ""))
+        units[f"{vunit}.service"] = _variant_service_unit(agent, variant, vcalendar, workspace)
         units[f"{vunit}.timer"] = _timer_unit(f"{agent} {variant}", vcalendar,
                                               int(vsysd.get("randomized_delay_sec", 0)))
     return units

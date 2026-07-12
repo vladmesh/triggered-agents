@@ -20,6 +20,25 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from triggered_agents.agents.pipeline import heads  # noqa: E402
 
 
+def _parts(cmd: str) -> list[str]:
+    return shlex.split(cmd)
+
+
+def _inner_shell(cmd: str) -> str:
+    parts = _parts(cmd)
+    idx = parts.index("--")
+    assert parts[idx + 1:idx + 3] == ["/bin/sh", "-lc"]
+    return parts[idx + 3]
+
+
+def _assert_role_wrapper(test: unittest.TestCase, cmd: str, role: str) -> None:
+    parts = _parts(cmd)
+    test.assertIn("PYTHONPATH=" + str(Path(__file__).resolve().parents[1]), parts[0])
+    test.assertEqual(parts[1:5], ["python3", "-m", "triggered_agents.runtime.role_env", "exec"])
+    test.assertEqual(parts[parts.index("--role") + 1], role)
+    test.assertNotIn("KANBOARD_API_TOKEN=", cmd)
+
+
 class RealRegistryTest(unittest.TestCase):
     """Against the actual shipped heads.toml — catches drift between its content and what the
     prod defaults (DEFAULT_PROFILE, worker.REVIEWER_HEAD) expect to find there."""
@@ -111,22 +130,24 @@ class RenderClaudeTest(unittest.TestCase):
     def test_renders_claude_binary_with_model_and_dangerous_skip(self):
         cmd = heads.render_command("claude-sonnet", role="worker", prompt="do the thing",
                                    registry=self.reg)
-        self.assertIn("BOARD_ROLE=worker", cmd)
-        self.assertIn("claude --dangerously-skip-permissions --model sonnet", cmd)
-        self.assertIn(repr("do the thing"), cmd)
+        _assert_role_wrapper(self, cmd, "worker")
+        inner = _inner_shell(cmd)
+        self.assertIn("claude --dangerously-skip-permissions --model sonnet", inner)
+        self.assertIn(repr("do the thing"), inner)
 
     def test_role_prefix_changes_with_role(self):
         cmd = heads.render_command("claude-opus", role="reviewer", prompt="review it",
                                    registry=self.reg)
-        self.assertTrue(cmd.startswith("BOARD_ROLE=reviewer "))
-        self.assertIn("--model opus", cmd)
+        _assert_role_wrapper(self, cmd, "reviewer")
+        self.assertIn("--model opus", _inner_shell(cmd))
 
     def test_renders_claude_fable(self):
         cmd = heads.render_command("claude-fable", role="steward", prompt="steward the board",
                                    registry=self.reg)
-        self.assertTrue(cmd.startswith("BOARD_ROLE=steward "))
-        self.assertIn("claude --dangerously-skip-permissions --model fable", cmd)
-        self.assertIn(repr("steward the board"), cmd)
+        _assert_role_wrapper(self, cmd, "steward")
+        inner = _inner_shell(cmd)
+        self.assertIn("claude --dangerously-skip-permissions --model fable", inner)
+        self.assertIn(repr("steward the board"), inner)
 
 
 class RenderHermesTest(unittest.TestCase):
@@ -139,17 +160,20 @@ class RenderHermesTest(unittest.TestCase):
 
     def test_renders_hermes_binary_not_claude(self):
         cmd = heads.render_command("hermes", role="worker", prompt="ping", registry=self.reg)
-        self.assertIn("BOARD_ROLE=worker hermes", cmd)
-        self.assertNotIn("claude", cmd)
-        self.assertNotIn("--dangerously-skip-permissions", cmd)
+        _assert_role_wrapper(self, cmd, "worker")
+        inner = _inner_shell(cmd)
+        self.assertTrue(inner.startswith("hermes"))
+        self.assertNotIn("claude", inner)
+        self.assertNotIn("--dangerously-skip-permissions", inner)
 
     def test_carries_model_provider_and_yolo_flags(self):
         cmd = heads.render_command("hermes", role="worker", prompt="ping", registry=self.reg)
-        self.assertIn("-z " + repr("ping"), cmd)
-        self.assertIn("-m openai/gpt-5.5", cmd)
-        self.assertIn("--provider openrouter", cmd)
-        self.assertIn("--yolo", cmd)
-        self.assertIn("--cli", cmd)
+        inner = _inner_shell(cmd)
+        self.assertIn("-z " + repr("ping"), inner)
+        self.assertIn("-m openai/gpt-5.5", inner)
+        self.assertIn("--provider openrouter", inner)
+        self.assertIn("--yolo", inner)
+        self.assertIn("--cli", inner)
 
 
 class RenderCodexTest(unittest.TestCase):
@@ -169,24 +193,27 @@ class RenderCodexTest(unittest.TestCase):
 
     def test_renders_codex_exec_not_claude_or_hermes(self):
         cmd = heads.render_command("codex", role="worker", prompt="ping", registry=self.reg)
-        self.assertIn("BOARD_ROLE=worker ", cmd)
-        self.assertIn("codex exec", cmd)
-        self.assertNotIn("claude", cmd)
-        self.assertNotIn("hermes", cmd)
+        _assert_role_wrapper(self, cmd, "worker")
+        inner = _inner_shell(cmd)
+        self.assertIn("codex exec", inner)
+        self.assertNotIn("claude", inner)
+        self.assertNotIn("hermes", inner)
 
     def test_pins_codex_home_and_bypass_flags(self):
         cmd = heads.render_command("codex", role="worker", prompt="ping", registry=self.reg)
-        self.assertIn(f"CODEX_HOME={heads.CODEX_HOME} codex exec", cmd)
-        self.assertIn("--dangerously-bypass-approvals-and-sandbox", cmd)
-        self.assertIn("--skip-git-repo-check", cmd)
-        self.assertIn("-m gpt-5.5", cmd)
-        self.assertNotIn("model_reasoning_effort", cmd)
-        self.assertIn(repr("ping"), cmd)
+        inner = _inner_shell(cmd)
+        self.assertIn(f"CODEX_HOME={heads.CODEX_HOME} codex exec", inner)
+        self.assertIn("--dangerously-bypass-approvals-and-sandbox", inner)
+        self.assertIn("--skip-git-repo-check", inner)
+        self.assertIn("-m gpt-5.5", inner)
+        self.assertNotIn("model_reasoning_effort", inner)
+        self.assertIn(repr("ping"), inner)
 
     def test_renders_codex_effort(self):
         cmd = heads.render_command("codex-extra", role="worker", prompt="ping", registry=self.reg)
-        self.assertIn("-m gpt-5.5", cmd)
-        self.assertIn("model_reasoning_effort=\"xhigh\"", cmd)
+        inner = _inner_shell(cmd)
+        self.assertIn("-m gpt-5.5", inner)
+        self.assertIn("model_reasoning_effort=\"xhigh\"", inner)
 
     def test_renders_explicit_catalog_models_without_effort_override(self):
         expected = {
@@ -199,8 +226,9 @@ class RenderCodexTest(unittest.TestCase):
         }
         for profile_id, model in expected.items():
             cmd = heads.render_command(profile_id, role="worker", prompt="ping", registry=self.reg)
-            self.assertIn(f"-m {model}", cmd)
-            self.assertNotIn("model_reasoning_effort", cmd)
+            inner = _inner_shell(cmd)
+            self.assertIn(f"-m {model}", inner)
+            self.assertNotIn("model_reasoning_effort", inner)
 
     def test_profile_codex_home_overrides_pin(self):
         prof = dict(self.reg.profile("codex"), codex_home="/tmp/throwaway-home")
@@ -210,22 +238,24 @@ class RenderCodexTest(unittest.TestCase):
     def test_render_launch_keeps_codex_exec_as_default(self):
         launch = heads.render_launch("codex", role="worker", prompt="ping",
                                      workspace="/ws/fresh", registry=self.reg)
-        self.assertIn("codex exec", launch.command)
-        self.assertNotIn("trust_level", launch.command)
+        self.assertIn("codex exec", _inner_shell(launch.command))
+        self.assertNotIn("trust_level", _inner_shell(launch.command))
         self.assertIsNone(launch.initial_prompt)
         self.assertIsNone(launch.terminal_kind)
 
     def test_render_launch_codex_tui_splits_command_from_prompt(self):
         launch = heads.render_launch("codex-extra-tui", role="worker", prompt="ping",
                                      workspace="/ws/fresh", registry=self.reg)
-        self.assertTrue(launch.command.startswith(f"BOARD_ROLE=worker CODEX_HOME={heads.CODEX_HOME} codex "))
-        self.assertNotIn("codex exec", launch.command)
-        self.assertNotIn(repr("ping"), launch.command)
-        self.assertIn("--dangerously-bypass-approvals-and-sandbox", launch.command)
-        self.assertNotIn("--skip-git-repo-check", launch.command)
-        self.assertIn("-m gpt-5.5", launch.command)
-        self.assertIn("model_reasoning_effort=\"xhigh\"", launch.command)
-        self.assertIn("'projects.\"/ws/fresh\".trust_level=\"trusted\"'", launch.command)
+        _assert_role_wrapper(self, launch.command, "worker")
+        inner = _inner_shell(launch.command)
+        self.assertTrue(inner.startswith(f"CODEX_HOME={heads.CODEX_HOME} codex "))
+        self.assertNotIn("codex exec", inner)
+        self.assertNotIn(repr("ping"), inner)
+        self.assertIn("--dangerously-bypass-approvals-and-sandbox", inner)
+        self.assertNotIn("--skip-git-repo-check", inner)
+        self.assertIn("-m gpt-5.5", inner)
+        self.assertIn("model_reasoning_effort=\"xhigh\"", inner)
+        self.assertIn("'projects.\"/ws/fresh\".trust_level=\"trusted\"'", inner)
         self.assertEqual(launch.initial_prompt, "ping")
         self.assertEqual(launch.terminal_kind, "codex-tui")
 
@@ -233,7 +263,7 @@ class RenderCodexTest(unittest.TestCase):
         launch = heads.render_launch("codex-tui", role="worker", prompt="ping",
                                      workspace="/tmp/work dir/that's \"quoted\"",
                                      registry=self.reg)
-        parts = shlex.split(launch.command)
+        parts = shlex.split(_inner_shell(launch.command))
         conf = parts[parts.index("-c") + 1]
         self.assertEqual(conf,
                          "projects.\"/tmp/work dir/that's \\\"quoted\\\"\".trust_level=\"trusted\"")
@@ -256,7 +286,7 @@ class RenderCodexTest(unittest.TestCase):
 
         launch = heads.render_launch("codex-tui", role="worker", prompt="ping",
                                      workspace=str(worktree), registry=self.reg)
-        parts = shlex.split(launch.command)
+        parts = shlex.split(_inner_shell(launch.command))
         configs = [parts[i + 1] for i, part in enumerate(parts[:-1]) if part == "-c"]
         worktree_key = (
             f"projects.{heads._toml_basic_string(str(worktree.resolve()))}."
@@ -287,9 +317,9 @@ class RenderCodexTest(unittest.TestCase):
         self.assertIn(
             f"projects.{heads._toml_basic_string(str(workspace.resolve()))}."
             "trust_level=\"trusted\"",
-            launch.command,
+            _inner_shell(launch.command),
         )
-        self.assertNotIn(str(outside.resolve()), launch.command)
+        self.assertNotIn(str(outside.resolve()), _inner_shell(launch.command))
 
     def test_render_launch_codex_tui_requires_workspace(self):
         with self.assertRaisesRegex(heads.HeadRegistryError, "requires workspace"):
@@ -299,8 +329,9 @@ class RenderCodexTest(unittest.TestCase):
         with mock.patch.dict(os.environ, {"TA_CODEX_MODE": "tui"}, clear=False):
             launch = heads.render_launch("codex", role="worker", prompt="ping",
                                          workspace="/ws/fresh", registry=self.reg)
-        self.assertNotIn("codex exec", launch.command)
-        self.assertIn("'projects.\"/ws/fresh\".trust_level=\"trusted\"'", launch.command)
+        inner = _inner_shell(launch.command)
+        self.assertNotIn("codex exec", inner)
+        self.assertIn("'projects.\"/ws/fresh\".trust_level=\"trusted\"'", inner)
         self.assertEqual(launch.initial_prompt, "ping")
         self.assertEqual(launch.terminal_kind, "codex-tui")
 

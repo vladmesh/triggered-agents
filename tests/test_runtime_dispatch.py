@@ -8,6 +8,7 @@ match. Warm reuse sends into an already-answered terminal, so it must not re-run
 from __future__ import annotations
 
 import os
+import shlex
 import sys
 import tempfile
 import unittest
@@ -20,6 +21,18 @@ os.environ["TA_PIPELINE_STATE_DIR"] = tempfile.mkdtemp(prefix="ta-runtime-dispat
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # repo root
 
 from triggered_agents.runtime import dispatch  # noqa: E402
+
+
+def _inner_shell(cmd: str) -> str:
+    parts = shlex.split(cmd)
+    idx = parts.index("--")
+    assert parts[idx + 1:idx + 3] == ["/bin/sh", "-lc"]
+    return parts[idx + 3]
+
+
+def _role(cmd: str) -> str:
+    parts = shlex.split(cmd)
+    return parts[parts.index("--role") + 1]
 
 
 class _DispatchBase(unittest.TestCase):
@@ -279,10 +292,11 @@ class LaunchCmdTest(unittest.TestCase):
         with mock.patch.object(pipeline_health, "refresh", lambda: {"openai-sub": "green"}):
             skill, cmd, profile = dispatch._launch_cmd("curator")
         self.assertEqual(skill, "/curate")
-        self.assertIn("BOARD_ROLE=curator", cmd)
-        self.assertIn("codex exec", cmd)
-        self.assertIn("-m gpt-5.5", cmd)
-        self.assertIn("model_reasoning_effort=\"xhigh\"", cmd)
+        self.assertEqual(_role(cmd), "curator")
+        inner = _inner_shell(cmd)
+        self.assertIn("codex exec", inner)
+        self.assertIn("-m gpt-5.5", inner)
+        self.assertIn("model_reasoning_effort=\"xhigh\"", inner)
         self.assertEqual(profile, "codex-curator")
 
     def test_curator_falls_back_to_bare_claude_when_openai_red(self):
@@ -291,7 +305,8 @@ class LaunchCmdTest(unittest.TestCase):
         with mock.patch.object(pipeline_health, "refresh", lambda: {"openai-sub": "red", "claude-sub": "green"}):
             skill, cmd, profile = dispatch._launch_cmd("curator")
         self.assertEqual(skill, "/curate")
-        self.assertEqual(cmd, "BOARD_ROLE=curator claude --dangerously-skip-permissions '/curate'")
+        self.assertEqual(_role(cmd), "curator")
+        self.assertEqual(_inner_shell(cmd), "claude --dangerously-skip-permissions '/curate'")
         self.assertEqual(profile, "claude-default")
 
     def test_steward_head_resolves_through_pipeline_health_and_heads(self):
@@ -300,9 +315,9 @@ class LaunchCmdTest(unittest.TestCase):
         with mock.patch.object(pipeline_health, "refresh", lambda: {"openai-sub": "green"}):
             skill, cmd, profile = dispatch._launch_cmd("steward")
         self.assertEqual(skill, "/steward")
-        self.assertIn("BOARD_ROLE=steward", cmd)
-        self.assertIn("codex exec", cmd)
-        self.assertIn("model_reasoning_effort=\"xhigh\"", cmd)
+        self.assertEqual(_role(cmd), "steward")
+        self.assertIn("codex exec", _inner_shell(cmd))
+        self.assertIn("model_reasoning_effort=\"xhigh\"", _inner_shell(cmd))
         self.assertEqual(profile, "codex-steward")
 
     def test_steward_head_falls_back_to_bare_claude_on_broken_resolution(self):
@@ -311,7 +326,8 @@ class LaunchCmdTest(unittest.TestCase):
         with mock.patch.object(pipeline_health, "refresh", side_effect=RuntimeError("boom")):
             skill, cmd, profile = dispatch._launch_cmd("steward")
         self.assertEqual(skill, "/steward")
-        self.assertEqual(cmd, "claude --dangerously-skip-permissions /steward")
+        self.assertEqual(_role(cmd), "steward")
+        self.assertEqual(_inner_shell(cmd), "claude --dangerously-skip-permissions '/steward'")
         self.assertIsNone(profile)
 
     def test_steward_head_falls_back_to_next_profile_when_resource_red(self):
@@ -321,8 +337,8 @@ class LaunchCmdTest(unittest.TestCase):
         # claude-sub green, resolution lands on claude-fable.
         with mock.patch.object(pipeline_health, "refresh", lambda: {"openai-sub": "red", "claude-sub": "green"}):
             skill, cmd, profile = dispatch._launch_cmd("steward")
-        self.assertIn("BOARD_ROLE=steward", cmd)
-        self.assertIn("--model fable", cmd)
+        self.assertEqual(_role(cmd), "steward")
+        self.assertIn("--model fable", _inner_shell(cmd))
         self.assertEqual(profile, "claude-fable")
 
     def test_steward_deep_sweep_variant_resolves_its_own_skill_through_the_same_head(self):
@@ -331,7 +347,7 @@ class LaunchCmdTest(unittest.TestCase):
         with mock.patch.object(pipeline_health, "refresh", lambda: {"openai-sub": "green"}):
             skill, cmd, profile = dispatch._launch_cmd("steward", "deep-sweep")
         self.assertEqual(skill, "/steward deep-sweep")
-        self.assertIn("BOARD_ROLE=steward", cmd)
+        self.assertEqual(_role(cmd), "steward")
         self.assertEqual(profile, "codex-steward")
 
     def test_steward_head_keeps_original_name_when_the_whole_chain_is_red(self):
@@ -342,7 +358,7 @@ class LaunchCmdTest(unittest.TestCase):
         with mock.patch.object(pipeline_health, "refresh",
                                lambda: {"openai-sub": "red", "claude-sub": "red", "openrouter": "red"}):
             skill, cmd, profile = dispatch._launch_cmd("steward")
-        self.assertIn("codex exec", cmd)
+        self.assertIn("codex exec", _inner_shell(cmd))
         self.assertEqual(profile, "codex-steward")
 
     def test_card_ref_is_appended_to_the_skill_before_rendering(self):
@@ -353,7 +369,7 @@ class LaunchCmdTest(unittest.TestCase):
         with mock.patch.object(pipeline_health, "refresh", lambda: {"openai-sub": "green"}):
             skill, cmd, profile = dispatch._launch_cmd("steward", card_ref="triggered-agents-260")
         self.assertEqual(skill, "/steward --card triggered-agents-260")
-        self.assertIn(repr(skill), cmd)
+        self.assertIn(repr(skill), _inner_shell(cmd))
 
     def test_card_ref_with_deep_sweep_variant(self):
         from triggered_agents.agents.pipeline import health as pipeline_health

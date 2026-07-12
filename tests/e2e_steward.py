@@ -7,7 +7,7 @@ kinds (2026-07-04 design grill) by hand — the "инсценированная 
 criteria ask for — and walks precheck -> scan -> (steward action) -> advance -> quiet again for
 each, plus the Blocked->Ready escalation and Blocked->Done override mechanics the skill leans on.
 
-Prep: source control-panel/.env first so KANBOARD_* are set, then `python3 tests/e2e_steward.py`.
+Run: `python3 tests/e2e_steward.py`. The script loads the steward runtime env itself.
 """
 from __future__ import annotations
 
@@ -20,8 +20,14 @@ import tempfile
 from contextlib import redirect_stdout
 from pathlib import Path
 
-if not os.environ.get("KANBOARD_URL"):
-    print("e2e: KANBOARD_URL unset; source control-panel/.env first, then re-run", file=sys.stderr)
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from triggered_agents.runtime import role_env  # noqa: E402
+
+try:
+    role_env.apply_runtime_env("steward")
+except role_env.RoleEnvError as e:
+    print(f"e2e: {e}", file=sys.stderr)
     raise SystemExit(2)
 
 # Set env BEFORE importing triggered_agents — BOARD_NAME, TA_STATE and TA_WORKSPACES_ROOT are all
@@ -34,8 +40,6 @@ _STATE_DIR = tempfile.mkdtemp(prefix="ta-steward-e2e-")
 os.environ["TA_STATE"] = _STATE_DIR
 _WS_DIR = tempfile.mkdtemp(prefix="ta-steward-e2e-ws-")
 os.environ["TA_WORKSPACES_ROOT"] = _WS_DIR
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # repo root
 
 from triggered_agents.runtime.kanboard import call  # noqa: E402
 from triggered_agents.agents.pipeline import cli as pipeline_cli  # noqa: E402

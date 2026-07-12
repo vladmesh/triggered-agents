@@ -51,7 +51,7 @@ from pathlib import Path
 
 import tomllib
 
-from . import claude_env, orca_rpc
+from . import claude_env, orca_rpc, role_env
 from .state import AgentState
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -163,8 +163,9 @@ def _launch_cmd(agent: str, variant: str | None = None,
     if card_ref:
         skill = f"{skill} --card {card_ref}"
     head = spec.get("head")
+    bare_claude = role_env.wrap_shell_command(agent, f"claude --dangerously-skip-permissions {skill!r}")
     if not head:
-        return skill, f"claude --dangerously-skip-permissions {skill}", None
+        return skill, bare_claude, None
     try:
         from ..agents.pipeline import health as pipeline_health
         from ..agents.pipeline import heads as pipeline_heads
@@ -172,7 +173,7 @@ def _launch_cmd(agent: str, variant: str | None = None,
         resolved = pipeline_health.resolve_head(head, statuses) or head
         return skill, pipeline_heads.render_command(resolved, role=agent, prompt=skill), resolved
     except Exception:
-        return skill, f"claude --dangerously-skip-permissions {skill}", None
+        return skill, bare_claude, None
 
 
 def _steward_report_card(agent: str, variant: str | None) -> str | None:
