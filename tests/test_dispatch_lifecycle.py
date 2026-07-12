@@ -277,13 +277,13 @@ class FinalizerTest(_DispatchBase):
         self.terminals = []
         dispatch.run("agent")
         command = self._created_command()
-        self.assertIn("dispatch --finalize", command)
+        self.assertIn("dispatch --spawn-finalizer", command)
         # the trailer carries the terminal's generation identity (review B2, round 4): first
         # create of this agent in a fresh state dir is generation 1.
-        self.assertIn("--finalize --generation 1", command)
+        self.assertIn("--spawn-finalizer --generation 1", command)
         # `;`, not `&&` -- the trailer must run regardless of the head's own exit code
         self.assertIn("; ", command)
-        self.assertLess(command.index("claude"), command.index("dispatch --finalize"))
+        self.assertLess(command.index("claude"), command.index("dispatch --spawn-finalizer"))
 
     def test_non_ephemeral_create_gets_no_trailer(self):
         with mock.patch.object(dispatch, "_load_spec", lambda agent: {}):
@@ -307,6 +307,51 @@ class FinalizerTest(_DispatchBase):
         dispatch.finalize("agent")
         create_calls = [c for c in self.orca_json_calls if c[:2] == ["terminal", "create"]]
         self.assertEqual(create_calls, [])
+
+    def test_spawn_finalizer_detaches_the_cleanup_helper(self):
+        with mock.patch.object(dispatch.subprocess, "Popen") as popen:
+            rc = dispatch.spawn_finalizer("agent", generation=3)
+        self.assertEqual(rc, 0)
+        command = popen.call_args.args[0]
+        self.assertEqual(command[-5:], ["agent", "dispatch", "--finalize", "--generation", "3"])
+        self.assertTrue(popen.call_args.kwargs["start_new_session"])
+        self.assertEqual(popen.call_args.kwargs["stdin"], dispatch.subprocess.DEVNULL)
+        self.assertEqual(popen.call_args.kwargs["stdout"], dispatch.subprocess.DEVNULL)
+        self.assertEqual(popen.call_args.kwargs["stderr"], dispatch.subprocess.DEVNULL)
+        self.assertEqual(self._logged_actions(), ["self-teardown-helper-started"])
+
+    def test_spawn_finalizer_logs_failure_when_helper_cannot_start(self):
+        with mock.patch.object(dispatch.subprocess, "Popen", side_effect=OSError("no process")):
+            rc = dispatch.spawn_finalizer("agent", generation=3)
+        self.assertEqual(rc, 1)
+        self.assertEqual(self._logged_actions(), ["self-teardown-helper-failed"])
+
+    def test_detached_helper_completes_after_the_terminal_runtime_is_gone(self):
+        """Production semantics: stopping the terminal ends code in that PTY immediately.
+
+        The trailer only queues a detached helper before the PTY disappears. The queued helper then
+        runs `finalize` outside that PTY and can finish terminal confirmation and tab cleanup.
+        Calling finalize directly from the terminal would never reach those checks after stop.
+        """
+        state = dispatch.AgentState("agent")
+        state.save_terminal_handle("h1", created_at=time.time(), generation=1)
+        self.terminals = [{"handle": "h1", "title": "triggered-agent:agent", "lastOutputAt": 1}]
+        external_helpers = []
+
+        def queue_helper(command, **kwargs):
+            self.assertTrue(kwargs["start_new_session"])
+            external_helpers.append(lambda: dispatch.finalize("agent", generation=1))
+            return mock.Mock()
+
+        with mock.patch.object(dispatch.subprocess, "Popen", side_effect=queue_helper):
+            dispatch.spawn_finalizer("agent", generation=1)
+
+        # The terminal has exited, so nothing in it can run. Its detached child still can.
+        self.assertEqual(len(external_helpers), 1)
+        external_helpers.pop()()
+        self.assertEqual(self.terminals, [])
+        self.assertEqual(self._logged_actions(),
+                         ["self-teardown-helper-started", "self-teardown"])
 
     def test_finalize_logs_failure_without_raising_when_stop_not_confirmed(self):
         def fake_orca_never_clears(args):

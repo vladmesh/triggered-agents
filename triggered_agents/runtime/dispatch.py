@@ -28,15 +28,13 @@ curator specifically: its skill writes to shared memory canon off what it reads 
 session, so a stale warm session risks carrying forward context (or a half-finished write) from a
 prior tick into the next one's judgment.
 
-Every one of those kill paths is still only ever REACHED by a future tick's poll — a dispatch.run()
-call noticing, sometime after the fact, that the terminal has gone idle or stuck. For an ephemeral
-agent that isn't good enough on its own (PR #95 review B1, round 3): `_create_terminal` appends a
-`; `-separated self-teardown trailer to the head's own launch command (`_with_finalizer`), so the
-terminal, the instant its head process exits — success, error, or any exit that still reaches the
-shell's next statement — tears itself down via `finalize()` (`dispatch <agent> --finalize`)
-without waiting for anything to poll it. `run()`'s cleanup-only/watchdog/stray-sweep paths remain
-the necessary backstop for the rarer case where a terminal never reaches its own trailer at all (a
-hard kill, host reboot, Orca itself restarting) — not the primary mechanism anymore.
+Every one of those kill paths is still only ever REACHED by a future tick's poll, a dispatch.run()
+call noticing after the fact that the terminal has gone idle or stuck. For an ephemeral agent that
+isn't good enough on its own: `_create_terminal` appends a `; `-separated launcher trailer to the
+head's command. On head exit it starts a detached `finalize()` helper (`dispatch --finalize`) that
+survives the PTY it stops, then confirms terminal removal and closes the parent tab without a poll.
+`run()`'s cleanup-only/watchdog/stray-sweep paths remain the backstop for a terminal that never
+reaches its trailer at all (a hard kill, host reboot, Orca itself restarting).
 
 Why not `orca automations run`: it dispatches trigger=manual and spawns a NEW head every tick
 (reuse only kicks in for scheduled runs, which don't tick headless), so heads piled up.
@@ -101,6 +99,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -122,7 +121,7 @@ ORCA_TIMEOUT_S = 20         # never let a hung orca call wedge dispatch while it
 # spawned". Generous relative to the lag this guards against (Orca registering a brand new pty),
 # tiny relative to any real tick cadence (hourly + jitter).
 CREATE_VISIBILITY_GRACE_S = 60
-# `finalize` (an ephemeral head's own self-teardown trailer) retries the run lock this many times,
+# `finalize` (the detached helper started by an ephemeral head's trailer) retries the run lock this many times,
 # sleeping this long between attempts, before deferring to the next tick (triggered-agents-445,
 # PR #95 review B2, round 4). A live dispatch tick holds the lock only for the length of its own
 # Orca calls, so a short bounded wait lets the finalizer clean up its own completed terminal
@@ -400,21 +399,54 @@ def _raw_terminal_count(ws: str) -> int | None:
 
 
 def _with_finalizer(agent: str, launch: str, generation: int) -> str:
-    """Append a self-teardown trailer to `launch` for an ephemeral agent (triggered-agents-445,
-    PR #95 review B1, round 3): `<head command>; <finalizer>` ties cleanup to the moment the head
-    process itself exits — success, error, or any exit that still lets the shell reach the next
-    statement — rather than only ever being noticed by some future tick's poll. Plain `;` (not
-    `&&`) so the finalizer always runs regardless of the head's own exit code. Every dispatch.run()
-    cleanup path (watchdog, cleanup-only, stray-sweep) remains the necessary backstop for a
-    terminal that never reaches its own trailer at all (a hard kill, host reboot, Orca restart).
+    """Append a detached-cleanup trailer to `launch` for an ephemeral agent.
+
+    The trailer only starts the helper. The helper runs `finalize` in a new session, outside the
+    PTY it will stop, so it can still confirm the terminal is gone and close its parent tab after
+    `terminal stop` kills the original terminal process. Plain `;` (not `&&`) makes the helper run
+    after either a successful or failed head exit. Every dispatch.run() cleanup path (watchdog,
+    cleanup-only, stray-sweep) remains the backstop for a terminal that never reaches its trailer
+    at all (a hard kill, host reboot, Orca restart).
 
     `--generation <n>` carries this terminal's identity (round 4, review B2): the finalizer that
     fires when this exact terminal's head exits must be able to tell whether the workspace's live
     terminal is still its own or a replacement a concurrent tick created, so it never blanket-stops
     a fresh replacement out from under that tick."""
     finalizer = role_env.wrap_shell_command(
-        agent, f"python3 -m triggered_agents {agent} dispatch --finalize --generation {generation}")
+        agent, f"python3 -m triggered_agents {agent} dispatch --spawn-finalizer --generation {generation}")
     return f"{launch}; {finalizer}"
+
+
+def spawn_finalizer(agent: str, generation: int | None = None) -> int:
+    """Start `finalize` outside the ephemeral terminal that requested it.
+
+    This short launcher is the only finalizer code that runs in the head's PTY. The real cleanup
+    gets a fresh session and no terminal file descriptors, so stopping the workspace cannot cut it
+    off before it confirms terminal removal and reaps the parent tab. A failed spawn is telemetry,
+    not a healthy teardown; the regular cleanup paths retry it on a later tick.
+    """
+    if not _is_ephemeral(agent):
+        return 0
+    state = AgentState(agent)
+    command = [sys.executable, "-m", "triggered_agents", agent, "dispatch", "--finalize"]
+    if generation is not None:
+        command += ["--generation", str(generation)]
+    try:
+        subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+            start_new_session=True,
+        )
+    except OSError as exc:
+        state.log_run("finalize", action="self-teardown-helper-failed", generation=generation,
+                      error=str(exc))
+        print(f"dispatch[{agent}]: could not start detached finalizer ({exc}); next tick will retry")
+        return 1
+    state.log_run("finalize", action="self-teardown-helper-started", generation=generation)
+    return 0
 
 
 def _create_terminal(agent: str, ws: str, launch: str, state: AgentState,
@@ -895,14 +927,11 @@ def _finalize_locked(agent: str, ws: str, state: AgentState, generation: int | N
 
 def finalize(agent: str, generation: int | None = None) -> int:
     """Self-teardown for an ephemeral agent's own terminal — the other half of `_with_finalizer`.
-    `_create_terminal` appends `python3 -m triggered_agents <agent> dispatch --finalize
-    --generation <n>` as a `;` trailer to the head's own launch command, so this runs inside the
-    SAME terminal the head just occupied, the instant the head process exits (triggered-agents-445,
-    PR #95 review B1, round 3): teardown is now tied to the completion event itself, not just
-    noticed eventually by a future tick's poll. `dispatch.run`'s cleanup-only/watchdog/stray-sweep
-    paths remain the necessary backstop for a terminal that never reaches its own trailer at all (a
-    hard kill, host reboot, Orca restart) — this function only ever handles the common case: a head
-    that ran to completion, successfully or not.
+    `_create_terminal` appends a `--spawn-finalizer --generation <n>` trailer to the head's launch
+    command. That launcher starts this function in a detached process the instant the head exits,
+    so `terminal stop` cannot kill cleanup halfway through its confirmation and tab reap.
+    `dispatch.run`'s cleanup-only/watchdog/stray-sweep paths remain the backstop for a terminal
+    that never reaches its trailer at all (a hard kill, host reboot, Orca restart).
 
     Takes `state.lock()`, exactly like `run()`, because the teardown stops the whole workspace. On
     contention it no longer abandons cleanup outright (round 4, review B2): a live tick holds the
