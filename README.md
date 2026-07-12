@@ -24,7 +24,8 @@ CLI: `python3 -m triggered_agents <agent> <cmd>` (`harvest`/`advance`/`precheck`
   только читают. Смотрит следы всех голов (парсер на голову), вытаскивает durable-факты,
   дедупит/суперсидит, коммитит И пушит канон (обычный push, без `--force`) как офф-бокс-бэкап.
   Индекс не трогает — его ребилдит memory-mcp. Себя не харвестит (`~/triggered-agents` исключён).
-  Скилл — `.claude/skills/curate`.
+  Скилл — `.claude/skills/curate`. `ephemeral = true` в `automation.toml` (triggered-agents-445):
+  каждый тик — новый provider-процесс без транскрипта прошлого тика, см. «Lifecycle куратора» ниже.
 - **retro** (второй плагин) — ретро-пасс по свежим транскриптам голов (harvest переиспользует
   куратора) плюс memory-mcp `search-log.jsonl`: ищет фейлы (ответ по факту из panelmem без
   `memory_search` и с ошибкой, повтор известной ошибки, зацикливание, пустая сессия). Выход —
@@ -37,6 +38,36 @@ CLI: `python3 -m triggered_agents <agent> <cmd>` (`harvest`/`advance`/`precheck`
 привязанная к нему (`reuseSession`, свой `provider`/`prompt`/`precheck`). Скилл выбирается промптом.
 Реальные часы — systemd-таймер (`orca automations run <id>`); встроенный rrule в headless serve не
 тикает. Дизайн и инварианты — `control-panel/docs/ARCHITECTURE.md` и `docs/backlog.md`.
+
+## Lifecycle куратора
+
+Владелец жизненного цикла терминала — `triggered_agents/runtime/dispatch.py` (singleton-драйвер,
+общий для curator/retro/steward, вызывается из `ta-<agent>.timer` через `ta-gate.sh`). Для агента
+с `ephemeral = true` в `automation.toml` (сейчас только curator) он не переиспользует тёплый
+терминал через `/clear`: каждый тик, заставший терминал idle (прошлый прогон завершился, успешно
+или с ошибкой) или busy дольше `WATCHDOG_SECONDS` (завис), останавливает весь воркспейс (`terminal
+stop --worktree`), сразу же реапит осиротевший tab (`session.tabs.close` через `_reap_ghosts`) и
+поднимает свежий процесс `claude` — без `--resume`/`--continue`, то есть без транскрипта и
+контекста прошлого тика. retro/steward таким флагом не помечены и продолжают тёплый reuse — это
+отдельное решение, не часть triggered-agents-445.
+
+Диагностика зависшего прогона куратора:
+
+1. `state/curator/runs.jsonl` (или `TA_STATE/curator/runs.jsonl` на хосте) — последняя запись:
+   `action` показывает, что сделал последний тик (`created`/`ephemeral-restart`/`busy-skip`/
+   `watchdog-restart`/...), `ts` — когда.
+2. `orca terminal list --worktree path:<curator-воркспейс> --json` — живой терминал должен быть
+   максимум один, с заголовком `triggered-agent:curator`. Больше одного или заголовок, оставшийся
+   на дефолте шелла (`dev@host: ...`), — сам по себе аномалия (см. `_ensure_claude_ready` в
+   `dispatch.py` про терминал, зависший на онбординге).
+3. Если терминал есть, но не отвечает дольше `WATCHDOG_SECONDS` (по умолчанию 1200s,
+   `TA_WATCHDOG_SECONDS`) — следующий тик сам остановит его и поднимет свежий; вручную дожимать не
+   нужно, watchdog идемпотентен.
+4. Если после нескольких тиков в воркспейсе всё ещё видны лишние терминалы или `pending-handle`
+   вкладки в `session.tabs.listAll` — это не жизнеспособное штатное состояние: `dispatch.run`
+   гарантированно сводит их к нулю на каждом idle/stuck тике, так что расхождение указывает на
+   баг в самом драйвере или на ручное вмешательство в обход `ta-curator.timer` (см. предупреждение
+   про единственного владельца расписания выше).
 
 ## Pipeline Validate
 

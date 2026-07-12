@@ -6,6 +6,7 @@ its worktree, reused across ticks. On a trigger (after precheck passes, under th
   * no agent terminal          -> create one running the agent's resolved head profile
   * one idle agent terminal    -> `/clear` it and re-send <skill> (warm reuse, kills nothing)
   * ...unless its head is red  -> stop it, start a fresh one on the resolved fallback instead
+  * ...unless agent is ephemeral -> stop + tear down instead, start a fresh one (see below)
   * it's busy and fresh        -> leave it working, dispatch nothing
   * it's busy but stuck        -> watchdog: stop the workspace and start one fresh
 
@@ -16,6 +17,16 @@ kill paths (watchdog, a red idle head, closing legacy duplicates) do leave ghost
 first reaps them via `session.tabs.close` (`_reap_ghosts`) — the one lever that reaches the
 session store; the `terminal` CLI can't. Together: steady state creates none, and any stray gets
 swept next tick.
+
+An agent whose automation.toml sets `ephemeral = true` (curator, triggered-agents-445) opts out
+of warm reuse entirely: `_is_ephemeral` gates the idle branch above `_reuse_head_is_red`, so an
+idle terminal is always stopped and replaced rather than `/clear`-ed, and a stuck one is already
+stopped+replaced by the watchdog branch regardless of this flag. Both kill paths now reap their
+own ghost tab immediately (not just at the top of the next run), so a completed/stuck/errored
+ephemeral run never leaves its PTY or tab behind for someone else to notice. This matters for
+curator specifically: its skill writes to shared memory canon off what it reads from its own
+session, so a stale warm session risks carrying forward context (or a half-finished write) from a
+prior tick into the next one's judgment.
 
 Why not `orca automations run`: it dispatches trigger=manual and spawns a NEW head every tick
 (reuse only kicks in for scheduled runs, which don't tick headless), so heads piled up.
@@ -196,6 +207,21 @@ def _steward_report_card(agent: str, variant: str | None) -> str | None:
     return card["reference"]
 
 
+def _is_ephemeral(agent: str) -> bool:
+    """Whether `agent`'s automation.toml opts out of warm terminal reuse (curator,
+    triggered-agents-445): every tick that finds its terminal idle, or busy-but-stuck past the
+    watchdog, tears the whole workspace down and starts a brand new `claude` process instead of
+    `/clear`-ing the live one — no provider session or transcript ever survives past the tick
+    that produced it. Best-effort like every other spec read in this module: a spec with no
+    `ephemeral` field, a missing automation.toml (e.g. a test's synthetic agent name), or any
+    parse failure all default to the existing warm-reuse behavior rather than breaking dispatch.
+    """
+    try:
+        return bool(_load_spec(agent).get("ephemeral"))
+    except Exception:
+        return False
+
+
 def _dispatch_command(agent: str, variant: str | None) -> tuple[str, str, str | None]:
     """(skill, launch, resolved head profile) for a dispatch about to actually reach the head —
     the one spot that also creates the steward's report card, so every real dispatch (fresh
@@ -356,14 +382,33 @@ def run(agent: str, variant: str | None = None) -> int:
                 state.log_run(event, action="busy-skip")
                 print(f"dispatch[{agent}]: agent busy ({int(quiet)}s silent) — left running, no dispatch")
                 return 0
-            # busy but silent too long -> stuck: sweep and restart (makes a ghost, but rare)
+            # busy but silent too long -> stuck: sweep and restart, reaping the ghost the stop
+            # just made right away rather than leaving it for the top of the next run
             _orca(["terminal", "stop", "--worktree", f"path:{ws}"])
             time.sleep(1.0)
+            _reap_ghosts(ws)
             skill, launch, profile = _dispatch_command(agent, variant)
             _ensure_claude_ready(ws)
             _create_terminal(agent, ws, launch, state, profile)
             state.log_run(event, action="watchdog-restart")
             print(f"dispatch[{agent}]: busy but stuck ({int(quiet)}s silent) — watchdog restart -> {skill}")
+            return 0
+
+        # idle: an ephemeral agent (curator, triggered-agents-445) never reuses a warm terminal —
+        # the previous run just finished (successfully or not), so tear its terminal + tab down
+        # and start the next tick on a brand new provider session, same shape as the watchdog
+        # restart above minus the profile-red gate below (a fresh spawn always re-resolves the
+        # head, so there's nothing to divert from).
+        if _is_ephemeral(agent):
+            _orca(["terminal", "stop", "--worktree", f"path:{ws}"])
+            time.sleep(1.0)
+            reaped = _reap_ghosts(ws)
+            skill, launch, profile = _dispatch_command(agent, variant)
+            _ensure_claude_ready(ws)
+            _create_terminal(agent, ws, launch, state, profile)
+            state.log_run(event, action="ephemeral-restart")
+            tail = f"; reaped {reaped} ghost(s)" if reaped else ""
+            print(f"dispatch[{agent}]: ephemeral — torn down finished terminal, fresh session -> {skill}{tail}")
             return 0
 
         # idle: a warm terminal keeps whatever profile it was spawned with, so a resource that's

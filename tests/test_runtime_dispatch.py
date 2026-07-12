@@ -241,6 +241,198 @@ class DispatchRunTest(_DispatchBase):
         self.assertEqual(len(create_calls), 1)
 
 
+class EphemeralLifecycleTest(_DispatchBase):
+    """triggered-agents-445: an agent whose spec sets `ephemeral = true` (curator) must never
+    take the /clear-and-reuse path. An idle terminal means the previous tick's provider session
+    already finished (successfully or not), so the whole workspace is torn down and replaced with
+    a fresh one instead of being `/clear`-ed and re-sent into."""
+
+    def setUp(self):
+        super().setUp()
+        p = mock.patch.object(dispatch, "_load_spec", lambda agent: {"ephemeral": True})
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_idle_ephemeral_tears_down_instead_of_clear_reuse(self):
+        self.terminals = [{"handle": "h1", "title": "✳ Claude Code", "lastOutputAt": 1000}]
+        self.idle = True
+        dispatch.run("agent")
+        self.assertEqual(self.ready_calls, ["/ws/agent"])
+        stop_calls = [c for c in self.orca_calls if c[:2] == ["terminal", "stop"]]
+        create_calls = [c for c in self.orca_json_calls if c[:2] == ["terminal", "create"]]
+        sent = [c for c in self.orca_calls if c[:2] == ["terminal", "send"]]
+        self.assertEqual(len(stop_calls), 1)
+        self.assertEqual(len(create_calls), 1)
+        self.assertEqual(sent, [])  # never /clear, never sent into the old terminal
+        self.assertEqual(self._logged_actions(), ["ephemeral-restart"])
+
+    def test_idle_ephemeral_reaps_the_ghost_it_just_made(self):
+        """Teardown must reap its own ghost right away, not leave it for the top of the next
+        run — otherwise `session.tabs.listAll` would still show the finished run's tab for up to
+        a whole tick interval."""
+        self.terminals = [{"handle": "h1", "title": "✳ Claude Code", "lastOutputAt": 1000}]
+        self.idle = True
+        reap_calls = []
+        with mock.patch.object(dispatch, "_reap_ghosts", lambda ws: reap_calls.append(ws) or 1):
+            dispatch.run("agent")
+        # top-of-run reap, then the ephemeral branch's own reap right after the stop
+        self.assertEqual(reap_calls, ["/ws/agent", "/ws/agent"])
+
+    def test_idle_ephemeral_bypasses_the_red_head_check(self):
+        """A fresh spawn always re-resolves the head profile, so ephemeral teardown has nothing
+        to divert from — it must not even consult `_reuse_head_is_red`."""
+        self.terminals = [{"handle": "h1", "title": "✳ Claude Code", "lastOutputAt": 1000}]
+        self.idle = True
+        with mock.patch.object(dispatch, "_reuse_head_is_red") as red_check:
+            dispatch.run("agent")
+        red_check.assert_not_called()
+
+    def test_busy_and_fresh_still_skips_without_touching_the_running_terminal(self):
+        """Concurrency: a second tick landing while the first is still working must not spawn a
+        second head or kill the still-running one, ephemeral or not."""
+        self.terminals = [{"handle": "h1", "title": "✳ Claude Code", "lastOutputAt": 1000}]
+        self.idle = False
+        with mock.patch.object(dispatch, "_quiet_seconds", lambda t, now: 5.0):
+            dispatch.run("agent")
+        self.assertEqual(self.ready_calls, [])
+        self.assertEqual(self.orca_calls, [])
+        self.assertEqual(self._logged_actions(), ["busy-skip"])
+
+    def test_busy_and_stuck_watchdog_restart_reaps_immediately(self):
+        self.terminals = [{"handle": "h1", "title": "✳ Claude Code", "lastOutputAt": 1000}]
+        self.idle = False
+        reap_calls = []
+        with mock.patch.object(dispatch, "_quiet_seconds", lambda t, now: dispatch.WATCHDOG_SECONDS + 1), \
+             mock.patch.object(dispatch, "_reap_ghosts", lambda ws: reap_calls.append(ws) or 1):
+            dispatch.run("agent")
+        self.assertEqual(reap_calls, ["/ws/agent", "/ws/agent"])
+        self.assertEqual(self._logged_actions(), ["watchdog-restart"])
+
+    def test_fresh_create_when_no_terminal_is_unaffected_by_ephemeral(self):
+        self.terminals = []
+        dispatch.run("agent")
+        self.assertEqual(self._logged_actions(), ["created"])
+
+
+class EphemeralTwoTickLifecycleTest(unittest.TestCase):
+    """Integration-style test (still no network, no real Orca — this file's own convention)
+    simulating two sequential curator ticks against an in-memory terminal+tab store that mirrors
+    real Orca semantics closely enough to prove triggered-agents-445's actual contract: every
+    tick's provider session is a brand new process, never `/clear`-reused, and the run that just
+    finished leaves neither a live terminal nor a lingering session tab for the next tick to
+    inherit."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self._state_patch = mock.patch("triggered_agents.runtime.state.STATE_ROOT", Path(self.tmp.name))
+        self._state_patch.start()
+        self.addCleanup(self._state_patch.stop)
+
+        self.ws = "/ws/curator"
+        self.idle = True
+        self._next_handle = 0
+        self.live: dict[str, dict] = {}     # handle -> terminal dict; a "stop" empties this
+        self.tabs: dict[str, str] = {}      # handle -> "ready" | "pending-handle"
+        self.sent_texts: list[tuple[str, str]] = []  # every `terminal send`, proves /clear never fires
+        self.created_handles: list[str] = []
+
+        p = mock.patch.object(dispatch, "_load_spec", lambda agent: {"ephemeral": True})
+        p.start()
+        self.addCleanup(p.stop)
+        p = mock.patch.object(dispatch, "_launch_cmd",
+                              lambda agent, variant=None: ("/curate", "claude ... /curate", "fake-profile"))
+        p.start()
+        self.addCleanup(p.stop)
+        p = mock.patch.object(dispatch, "_workspace", lambda agent: self.ws)
+        p.start()
+        self.addCleanup(p.stop)
+        p = mock.patch.object(dispatch, "_ensure_claude_ready", lambda ws: None)
+        p.start()
+        self.addCleanup(p.stop)
+        p = mock.patch("time.sleep", lambda s: None)
+        p.start()
+        self.addCleanup(p.stop)
+
+        def fake_orca_json(args):
+            if args[:2] == ["terminal", "list"]:
+                return {"terminals": list(self.live.values())}
+            if args[:2] == ["terminal", "wait"]:
+                return {"wait": {"satisfied": self.idle}}
+            if args[:2] == ["terminal", "create"]:
+                self._next_handle += 1
+                handle = f"term-{self._next_handle}"
+                term = {"handle": handle, "title": "triggered-agent:curator", "lastOutputAt": 1000}
+                self.live[handle] = term
+                self.tabs[handle] = "ready"
+                self.created_handles.append(handle)
+                return {"terminal": term}
+            return {}
+
+        p = mock.patch.object(dispatch, "_orca_json", fake_orca_json)
+        p.start()
+        self.addCleanup(p.stop)
+
+        def fake_orca(args):
+            if args[:2] == ["terminal", "stop"]:
+                # kills every live terminal in this workspace; each one's tab lingers as a ghost
+                for handle in list(self.live.keys()):
+                    del self.live[handle]
+                    self.tabs[handle] = "pending-handle"
+            elif args[:2] == ["terminal", "send"]:
+                handle = args[args.index("--terminal") + 1]
+                text = args[args.index("--text") + 1]
+                self.sent_texts.append((handle, text))
+
+        p = mock.patch.object(dispatch, "_orca", fake_orca)
+        p.start()
+        self.addCleanup(p.stop)
+
+        def fake_reap_ghosts(ws):
+            closed = 0
+            for handle, status in list(self.tabs.items()):
+                if status != "ready":
+                    del self.tabs[handle]
+                    closed += 1
+            return closed
+
+        p = mock.patch.object(dispatch, "_reap_ghosts", fake_reap_ghosts)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def _actions(self):
+        import json
+
+        runs = dispatch.AgentState("curator").dir / "runs.jsonl"
+        return [json.loads(line)["action"] for line in runs.read_text(encoding="utf-8").splitlines()]
+
+    def test_two_sequential_ticks_never_share_a_session_and_leave_no_artifacts(self):
+        dispatch.run("curator")
+        self.assertEqual(len(self.created_handles), 1)
+        first_handle = self.created_handles[0]
+        self.assertEqual(list(self.live), [first_handle])
+        self.assertEqual(self.tabs, {first_handle: "ready"})
+
+        # the first tick's session "finishes": its terminal is idle again by the next tick
+        self.idle = True
+        dispatch.run("curator")
+
+        self.assertEqual(len(self.created_handles), 2)
+        second_handle = self.created_handles[1]
+        self.assertNotEqual(first_handle, second_handle)  # distinct provider session identifiers
+
+        # the finished run's own terminal/tab are gone -- only the fresh one for tick 2 remains
+        self.assertEqual(list(self.live), [second_handle])
+        self.assertEqual(self.tabs, {second_handle: "ready"})
+
+        # no /clear, no send of any kind into a reused terminal -- no context marker survives
+        # from tick 1 into tick 2; each tick's skill only ever arrives via `terminal create
+        # --command`, never `terminal send`
+        self.assertEqual(self.sent_texts, [])
+
+        self.assertEqual(self._actions(), ["created", "ephemeral-restart"])
+
+
 class PipelinePauseGateTest(_DispatchBase):
     """triggered-agents-281: steward/curator/retro dispatch must not spend a token while the
     pipeline is paused, in either mode — none of them carry an in-flight card the way a worker/
