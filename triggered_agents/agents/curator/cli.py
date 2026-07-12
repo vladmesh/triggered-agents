@@ -5,11 +5,11 @@ Flow the agent follows each run:
                                      Claude/Hermes/Codex session turns and changed
                                      personal-memory files on stdout, and the pending
                                      watermark cached on disk.
-  2. agent extracts durable facts, dedups via panelmem memory_search, writes .md to
-     panelmem-kb, commits+pushes the canon.
+  2. agent extracts durable facts, dedups via memory_search, writes each accepted fact
+     through `python3 -m triggered_agents curator memory-write`.
   3. `python3 -m triggered_agents curator advance`  -> moves the watermark past step 1.
 
-Two-phase so a crash before the canon commit re-harvests instead of dropping turns.
+Two-phase so a crash before the memory commit re-harvests instead of dropping turns.
 `harvest --json` emits the structured batch; `sessions` lists discovered sources;
 `status` shows the watermark; `precheck` exits PRECHECK_SKIP (100) when there is nothing new, so
 the systemd gate can skip the run without spinning up a head.
@@ -22,6 +22,12 @@ from pathlib import Path
 
 from ...runtime.state import PRECHECK_SKIP, AgentState
 from . import discover, harvest
+from .memory_protocol import (
+    MemoryProtocolError,
+    MemoryWriteRequest,
+    default_secretary_instance,
+    write_fact,
+)
 
 STATE = AgentState("curator")
 
@@ -82,6 +88,49 @@ def cmd_status() -> int:
     return 0
 
 
+def cmd_memory_write(argv: list[str]) -> int:
+    import argparse
+
+    parser = argparse.ArgumentParser(prog="python3 -m triggered_agents curator memory-write")
+    parser.add_argument("--instance", default=str(default_secretary_instance()))
+    parser.add_argument("--data-dir")
+    parser.add_argument("--actor", required=True)
+    parser.add_argument("--scope", required=True)
+    parser.add_argument("--slug", required=True)
+    parser.add_argument("--file", required=True)
+    parser.add_argument("--source")
+    parser.add_argument("--tags", default="")
+    parser.add_argument("--pinned", action="store_true")
+    parser.add_argument("--supersedes", default="")
+    parser.add_argument("--secretary-repo")
+    ns = parser.parse_args(argv)
+
+    request = MemoryWriteRequest(
+        instance=Path(ns.instance),
+        actor=ns.actor,
+        scope=ns.scope,
+        slug=ns.slug,
+        fact_file=Path(ns.file),
+        source=ns.source,
+        tags=ns.tags,
+        pinned=ns.pinned,
+        supersedes=ns.supersedes,
+        data_dir=Path(ns.data_dir) if ns.data_dir else None,
+        secretary_repo=Path(ns.secretary_repo) if ns.secretary_repo else None,
+    )
+    try:
+        result = write_fact(STATE, request)
+    except MemoryProtocolError as exc:
+        STATE.log_run("memory_write", result="error", actor=ns.actor, scope=ns.scope, slug=ns.slug,
+                      error=exc.payload.get("error"), commit=exc.payload.get("commit"))
+        print(json.dumps(exc.payload, ensure_ascii=False, sort_keys=True), file=sys.stderr)
+        return 1
+    STATE.log_run("memory_write", result="ok", actor=ns.actor, scope=ns.scope, slug=ns.slug,
+                  commit=result.get("commit"), fact=result.get("fact"))
+    print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
 def main(argv=None) -> int:
     argv = list(argv or [])
     cmd = argv[0] if argv else "help"
@@ -95,6 +144,8 @@ def main(argv=None) -> int:
         return cmd_sessions()
     if cmd == "status":
         return cmd_status()
+    if cmd == "memory-write":
+        return cmd_memory_write(argv[1:])
     print(__doc__)
     return 0 if cmd in ("help", "-h", "--help") else 2
 

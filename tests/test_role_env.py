@@ -32,7 +32,6 @@ KANBOARD_API_TOKEN=worker-token-value
 KANBOARD_ADMIN_USER=admin
 KANBOARD_ADMIN_PASSWORD=admin-password-value
 SECRETARY_AGE_IDENTITY=age-secret-value
-PANELMEM_KB_PAT=panelmem-pat-value
 TA_CODEX_MODE=tui
 """)
         base = {
@@ -53,19 +52,22 @@ TA_CODEX_MODE=tui
         self.assertNotIn("PANELMEM_KB_PAT", env)
         self.assertNotIn("GH_TOKEN", env)
 
-    def test_curator_gets_panelmem_pat_without_board_credentials(self):
+    def test_curator_gets_secretary_protocol_config_without_board_credentials(self):
         path = self._env_file("""
 KANBOARD_URL=http://kanboard.invalid/jsonrpc.php
 KANBOARD_API_USER=jsonrpc
 KANBOARD_API_TOKEN=board-token-value
-PANELMEM_KB_PAT=panelmem-pat-value
+SECRETARY_INSTANCE=/home/dev/secretary-instance
+TA_SECRETARY_REPO=/home/dev/secretary
 TA_CODEX_MODE=exec
 """)
         env = role_env.runtime_env("curator", base_env={"PATH": "/bin"}, env_file=path, require=True)
 
         self.assertNotIn("BOARD_ROLE", env)
-        self.assertEqual(env["PANELMEM_KB_PAT"], "panelmem-pat-value")
+        self.assertEqual(env["SECRETARY_INSTANCE"], "/home/dev/secretary-instance")
+        self.assertEqual(env["TA_SECRETARY_REPO"], "/home/dev/secretary")
         self.assertEqual(env["TA_CODEX_MODE"], "exec")
+        self.assertNotIn("PANELMEM_KB_PAT", env)
         self.assertNotIn("KANBOARD_URL", env)
         self.assertNotIn("KANBOARD_API_TOKEN", env)
 
