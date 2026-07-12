@@ -18,7 +18,7 @@ os.environ.setdefault("TA_PIPELINE_STATE_DIR", tempfile.mkdtemp(prefix="ta-dispa
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # repo root
 
-from triggered_agents.runtime import dispatch  # noqa: E402
+from triggered_agents.runtime import dispatch, finalizer  # noqa: E402
 from tests._dispatch_fixtures import _DispatchBase  # noqa: E402
 
 
@@ -309,19 +309,19 @@ class FinalizerTest(_DispatchBase):
         self.assertEqual(create_calls, [])
 
     def test_spawn_finalizer_detaches_the_cleanup_helper(self):
-        with mock.patch.object(dispatch.subprocess, "Popen") as popen:
+        with mock.patch.object(finalizer.subprocess, "Popen") as popen:
             rc = dispatch.spawn_finalizer("agent", generation=3)
         self.assertEqual(rc, 0)
         command = popen.call_args.args[0]
         self.assertEqual(command[-5:], ["agent", "dispatch", "--finalize", "--generation", "3"])
         self.assertTrue(popen.call_args.kwargs["start_new_session"])
-        self.assertEqual(popen.call_args.kwargs["stdin"], dispatch.subprocess.DEVNULL)
-        self.assertEqual(popen.call_args.kwargs["stdout"], dispatch.subprocess.DEVNULL)
-        self.assertEqual(popen.call_args.kwargs["stderr"], dispatch.subprocess.DEVNULL)
+        self.assertEqual(popen.call_args.kwargs["stdin"], finalizer.subprocess.DEVNULL)
+        self.assertEqual(popen.call_args.kwargs["stdout"], finalizer.subprocess.DEVNULL)
+        self.assertEqual(popen.call_args.kwargs["stderr"], finalizer.subprocess.DEVNULL)
         self.assertEqual(self._logged_actions(), ["self-teardown-helper-started"])
 
     def test_spawn_finalizer_logs_failure_when_helper_cannot_start(self):
-        with mock.patch.object(dispatch.subprocess, "Popen", side_effect=OSError("no process")):
+        with mock.patch.object(finalizer.subprocess, "Popen", side_effect=OSError("no process")):
             rc = dispatch.spawn_finalizer("agent", generation=3)
         self.assertEqual(rc, 1)
         self.assertEqual(self._logged_actions(), ["self-teardown-helper-failed"])
@@ -343,7 +343,7 @@ class FinalizerTest(_DispatchBase):
             external_helpers.append(lambda: dispatch.finalize("agent", generation=1))
             return mock.Mock()
 
-        with mock.patch.object(dispatch.subprocess, "Popen", side_effect=queue_helper):
+        with mock.patch.object(finalizer.subprocess, "Popen", side_effect=queue_helper):
             dispatch.spawn_finalizer("agent", generation=1)
 
         # The terminal has exited, so nothing in it can run. Its detached child still can.
