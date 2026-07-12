@@ -450,6 +450,30 @@ class CleanupOnlyTest(_DispatchBase):
         self.assertEqual(self.orca_json_calls, [])
         self.assertEqual(self._logged_actions(), [])
 
+    def test_non_ephemeral_cleanup_only_is_a_noop_even_with_the_run_lock_held(self):
+        """triggered-agents-445, PR #95 review B1 (round 5): the non-ephemeral no-op must sit BEFORE
+        `state.lock()`, not inside it. ta-gate.sh calls `--cleanup-only` on every precheck skip for
+        every agent, so if a deterministic retro/steward helper (or a stale lock) already holds the
+        run lock, acquiring it here would raise `SystemExit: another run holds the lock` and turn a
+        quiet skip that used to print-and-exit-0 into a failed unit. Hold the lock and prove the
+        skip still returns 0 without touching state/Orca."""
+        import os
+
+        with mock.patch.object(dispatch, "_load_spec", lambda agent: {}):
+            state = dispatch.AgentState("agent")
+            state.ensure_dir()
+            fd = os.open(state.lockfile, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.write(fd, b"99999")
+            os.close(fd)
+            try:
+                rc = dispatch.run("agent", cleanup_only=True)  # must NOT raise SystemExit
+            finally:
+                state.lockfile.unlink()
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.orca_calls, [])
+        self.assertEqual(self.orca_json_calls, [])
+        self.assertEqual(self._logged_actions(), [])
+
 
 class RawListFailureTest(_DispatchBase):
     """triggered-agents-445, PR #95 review B1 (round 4): a failed or timed-out `terminal list` must

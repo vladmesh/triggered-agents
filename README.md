@@ -95,10 +95,13 @@ ephemeral-агента до нуля (`cleanup-teardown`/`cleanup-watchdog-stop`
 
 Этот же флаг для НЕ-ephemeral агента (retro/steward) и для `pipeline` (детерминированный
 диспетчер, не эта singleton-driver машинерия вовсе) — гарантированный no-op: `dispatch.run`
-проверяет `_is_ephemeral(agent)` в самом начале, ДО единого Orca/board-вызова (ни `terminal list`,
-ни ghost-реап, ни lookup steward-репорта), а `__main__.main`'s pipeline-ветка явно возвращает `0`
-на `--cleanup-only`, не доходя до `dispatcher.tick()`. И то, и другое важно: без первого проверка
-у retro/steward превратила бы их тихий skip в реальные Orca-вызовы, каких раньше не было; без
+проверяет `_is_ephemeral(agent)` в самом начале, ДО конструирования `AgentState` и взятия
+`state.lock()`, не говоря уже про Orca/board-вызовы (ни `terminal list`, ни ghost-реап, ни lookup
+steward-репорта), а `__main__.main`'s pipeline-ветка явно возвращает `0` на `--cleanup-only`, не
+доходя до `dispatcher.tick()`. И то, и другое важно: без первого проверка у retro/steward
+превратила бы их тихий skip либо в реальные Orca-вызовы, каких раньше не было, либо — если их лок
+уже держит детерминированный helper (или остался stale) — в `SystemExit: another run holds the
+lock`, потому что `--cleanup-only` теперь дёргается на КАЖДОМ precheck-skip любого агента; без
 второго pipeline на каждом quiet-тике (раз в 3 минуты) гонял бы полный reconcile/advance/validate/
 claim вместо честного «нечего делать».
 

@@ -66,9 +66,12 @@ More invariants, all from PR #95 review rounds (triggered-agents-445):
     dispatches a skill; for an ephemeral agent it still runs `_cleanup_only` on a finished/stuck
     terminal, because `dispatch` (and thus every kill path above) is otherwise never invoked at
     all on a skip tick — a finished ephemeral run could sit until the next tick that happens to
-    have real work, unbounded if that never comes (round 1 review B1). It bails immediately, before
-    any Orca call, for a non-ephemeral agent (retro/steward): their lifecycle is out of scope, so
-    their precheck-skip stays the exact zero-Orca-calls no-op it always was (round 2 review B2).
+    have real work, unbounded if that never comes (round 1 review B1). It bails immediately for a
+    non-ephemeral agent (retro/steward) — before even constructing `AgentState` or taking
+    `state.lock()`, let alone any Orca/board call: their lifecycle is out of scope, so their
+    precheck-skip stays the exact zero-side-effect no-op it always was, and a shared gate calling
+    `--cleanup-only` on every skip can never turn their quiet tick into a lock-contention
+    `SystemExit` (round 2 review B2, hardened round 5 review B1).
     `triggered_agents/__main__.py`'s `pipeline` special case (a deterministic dispatcher with no
     terminal at all) treats `--cleanup-only` the same way, never calling `dispatcher.tick()`
     (round 2 review B1) — a shared gate script means every agent it dispatches to, including a
@@ -560,6 +563,17 @@ def run(agent: str, variant: str | None = None, cleanup_only: bool = False) -> i
     actually put the skill in front of a head (fresh create, watchdog restart, idle reuse) — never
     on a busy-skip, so a tick that dispatches nothing never creates the steward's report card
     either (triggered-agents-255)."""
+    if cleanup_only and not _is_ephemeral(agent):
+        # A non-ephemeral agent (retro/steward) has no terminal/PTY lifecycle for this pass to
+        # clean up -- their warm-reuse lifecycle is out of scope for triggered-agents-445. Bail
+        # BEFORE constructing AgentState or taking `state.lock()` (round 5 review B1), let alone
+        # any pause check / ghost reap / `terminal list` / steward report lookup: ta-gate.sh calls
+        # `--cleanup-only` on every precheck skip for EVERY agent, so acquiring the run lock here
+        # would turn a quiet skip that used to print-and-exit-0 into `SystemExit: another run holds
+        # the lock` the instant a deterministic helper is running (or a stale lock is left behind).
+        # `_is_ephemeral` only reads automation.toml, not the lock/Orca/board. This keeps their
+        # precheck skip the exact zero-side-effect no-op it always was before this card.
+        return 0
     ws = _workspace(agent)
     state = AgentState(agent)
     event = variant or "dispatch"
@@ -567,14 +581,6 @@ def run(agent: str, variant: str | None = None, cleanup_only: bool = False) -> i
         if _pipeline_paused():
             state.log_run(event, action="paused")
             print(f"dispatch[{agent}]: pipeline paused — no dispatch")
-            return 0
-        if cleanup_only and not _is_ephemeral(agent):
-            # A non-ephemeral agent (retro/steward) has no terminal/PTY lifecycle for this pass
-            # to clean up -- their warm-reuse lifecycle is out of scope for triggered-agents-445.
-            # Bail before touching anything (no ghost reap, no `terminal list`, no steward report
-            # lookup) so a precheck skip stays the exact zero-Orca-calls no-op it always was
-            # (PR #95 review B2): ta-gate.sh now calls `--cleanup-only` on every skip for every
-            # agent, and this must not grow their blast radius just because curator needed it.
             return 0
         active_report = _fresh_steward_report_in_progress(agent, time.time())
         if active_report:

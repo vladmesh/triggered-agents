@@ -117,6 +117,19 @@ teardown:
   терминалов/вкладок после КАЖДОГО завершения (через собственный finalize головы, с её
   generation).
 
+Пятый раунд ревью (PR #95) нашёл, что no-op для non-ephemeral агента стоял ВНУТРИ `state.lock()`:
+
+- `runtime/dispatch.py`: проверка `cleanup_only and not _is_ephemeral(agent)` поднята в самое
+  начало `run()`, ДО конструирования `AgentState` и взятия `state.lock()`. Раньше `--cleanup-only`,
+  который `ta-gate.sh` шлёт на КАЖДОМ precheck-skip любого агента, для retro/steward сначала входил
+  в `with state.lock()`, а no-op стоял уже за ним — если лок держал активный детерминированный
+  helper (или остался stale), тихий skip падал `SystemExit: another run holds the lock` вместо
+  прежнего print-and-exit-0. `_is_ephemeral` читает только automation.toml, не лок/Orca/board.
+- тест `tests/test_dispatch_lifecycle.py::CleanupOnlyTest::
+  test_non_ephemeral_cleanup_only_is_a_noop_even_with_the_run_lock_held` — держит лок и проверяет,
+  что non-ephemeral `--cleanup-only` возвращает 0 без `SystemExit` и без единого касания
+  state/Orca.
+
 ## Куратор: единственный владелец расписания
 
 - `deploy/provision.py` теперь явно управляет флагом `enabled` встроенной Orca-автоматизации по
