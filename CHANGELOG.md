@@ -151,6 +151,19 @@ teardown:
   `EphemeralTwoTickLifecycleTest` — после `finalize` с падающим close pty остановлен, ghost-вкладка
   ВИДИМО остаётся в сторе, а action `self-teardown-tab-failed`, не `self-teardown`.
 
+Седьмой раунд ревью (PR #95) нашёл, что шестой закрыл не все ветки: create-путь «нет живого
+терминала» не перепроверял `ok` top-of-run реапа.
+
+- `runtime/dispatch.py`: ветка `not terms` для ephemeral-агента теперь при `ok = False` top-of-run
+  реапа логирует `reap-tab-failed` и НЕ создаёт свежий терминал. Сценарий: прошлый прогон завершился,
+  `finalize` убил pty, но `session.tabs.close` упал — `pending-handle`-вкладка осталась. На
+  следующем тике живого терминала уже нет (`_agent_terminals`/`_raw_terminal_count` пусты), и
+  раньше create-ветка спокойно поднимала нового куратора рядом с призраком завершённого. Теперь она
+  бэйлит так же, как restart-пути; призрак до-реапит top-of-run реап следующего тика.
+- тесты: `TabReapFailureTest::test_fresh_create_bails_when_top_of_run_reap_failed` (repro ревьюера:
+  `terms=[]`, `raw=0`, `_reap_ghosts=(0, False)` → `reap-tab-failed`, ноль create) и
+  `test_fresh_create_proceeds_when_top_of_run_reap_is_clean` (чистый реап create не блокирует).
+
 ## Куратор: единственный владелец расписания
 
 - `deploy/provision.py` теперь явно управляет флагом `enabled` встроенной Orca-автоматизации по

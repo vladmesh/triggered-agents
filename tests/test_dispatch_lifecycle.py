@@ -610,6 +610,29 @@ class TabReapFailureTest(_DispatchBase):
         self.assertEqual(create_calls, [])
         self.assertEqual(self._logged_actions(), ["ephemeral-restart-tab-failed"])
 
+    def test_fresh_create_bails_when_top_of_run_reap_failed(self):
+        """PR #95 review B1, round 7: the reviewer's remaining gap. A prior run's PTY is gone but
+        its `pending-handle` tab wouldn't close, so `_agent_terminals` and `_raw_terminal_count`
+        both read empty while `session.tabs.listAll` still holds the ghost. The no-live-terminal
+        create path must NOT start a fresh curator next to that ghost — it bails on the failed
+        top-of-run reap the same way the restart paths do, rather than logging `created`."""
+        self.terminals = []  # no live terminal (the finished run's pty is gone), raw count is 0
+        with mock.patch.object(dispatch, "_reap_ghosts", lambda ws: (0, False)):
+            dispatch.run("agent")
+        create_calls = [c for c in self.orca_json_calls if c[:2] == ["terminal", "create"]]
+        self.assertEqual(create_calls, [])
+        self.assertEqual(self._logged_actions(), ["reap-tab-failed"])
+
+    def test_fresh_create_proceeds_when_top_of_run_reap_is_clean(self):
+        """Complement: a clean top-of-run reap (no lingering ghost) must not block a legitimate
+        fresh create."""
+        self.terminals = []
+        with mock.patch.object(dispatch, "_reap_ghosts", lambda ws: (0, True)):
+            dispatch.run("agent")
+        create_calls = [c for c in self.orca_json_calls if c[:2] == ["terminal", "create"]]
+        self.assertEqual(len(create_calls), 1)
+        self.assertEqual(self._logged_actions(), ["created"])
+
     def test_superseded_records_tab_failed_when_close_fails(self):
         state = dispatch.AgentState("agent")
         state.save_terminal_handle("replacement", created_at=time.time(), generation=5)

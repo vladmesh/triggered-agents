@@ -617,8 +617,8 @@ def run(agent: str, variant: str | None = None, cleanup_only: bool = False) -> i
                 "is still fresh — no dispatch"
             )
             return 0
-        reaped, _reap_ok = _reap_ghosts(ws)  # prune dead-pty tabs so ghosts never accumulate;
-        if reaped:                            # opportunistic, so ignore ok here (re-reaps next tick)
+        reaped, reap_ok = _reap_ghosts(ws)  # prune dead-pty tabs so ghosts never accumulate
+        if reaped:
             print(f"dispatch[{agent}]: reaped {reaped} ghost tab(s)")
         terms = _agent_terminals(ws, state)
 
@@ -637,6 +637,20 @@ def run(agent: str, variant: str | None = None, cleanup_only: bool = False) -> i
                       f"{time.time() - last_created:.1f}s ago — skipping to avoid a duplicate")
                 return 0
             if _is_ephemeral(agent):
+                if not reap_ok:
+                    # The top-of-run reap could NOT confirm this workspace is free of ghost tabs (a
+                    # session.tabs.close failed, or session.tabs.listAll was unavailable). The live
+                    # PTY of the finished run may be gone (so `_agent_terminals`/`_raw_terminal_count`
+                    # read empty), but its `pending-handle` tab still lingers in
+                    # session.tabs.listAll. Creating a fresh session now would leave that artifact
+                    # sitting right next to a brand new curator — the exact "zero tabs after
+                    # completion" breach (triggered-agents-445, PR #95 review B1, round 7). Bail; the
+                    # next tick re-reaps before it creates. Restart paths above already do this;
+                    # this is the same guard for the no-live-terminal create path.
+                    state.log_run(event, action="reap-tab-failed")
+                    print(f"dispatch[{agent}]: a ghost tab would not close (or tab list "
+                          "unavailable) — not creating a fresh session this tick, next tick re-reaps")
+                    return 0
                 raw = _raw_terminal_count(ws)
                 if raw is None:
                     # The raw list itself failed (round 4, review B1): "unknown", not "zero". We
