@@ -127,7 +127,7 @@ def recover(ref: str, pr: str, card: dict, rec: dict | None, records: dict, stat
         return _update(ref, pr, rec, base, branch, result, base_sha, clear_review)
     if kind in ("conflict", "dirty"):
         return _conflict(ref, pr, card, rec, records, save_cards, refresh_worker_task, result, base,
-                         base_sha, attempts, clear_review, notify_rework, block_rework)
+                         base_sha, head_sha, attempts, clear_review, notify_rework, block_rework)
     scrubbed = worker.scrub_secrets(result.get("reason") or "(без деталей)")
     STATE.log_run("validate", reference=ref, result=f"merge-{kind}", level="warn", pr=pr,
                   base_sha=base_sha, attempts=attempts, error=scrubbed)
@@ -163,8 +163,8 @@ def _update(ref: str, pr: str, rec: dict, base: str, branch: str, result: dict, 
 
 
 def _conflict(ref: str, pr: str, card: dict, rec: dict, records: dict, save_cards,
-              refresh_worker_task, result: dict, base: str, base_sha: str, attempts: int,
-              clear_review, notify_rework, block_rework) -> bool:
+              refresh_worker_task, result: dict, base: str, base_sha: str, head_sha: str,
+              attempts: int, clear_review, notify_rework, block_rework) -> bool:
     """A text conflict (or a worktree with uncommitted worker code) can't be merged mechanically —
     hand the card back to the SAME worker in its existing workspace to resolve it, exactly like a
     CI-red return, but with the conflicting files and base SHA spelled out and an instruction to
@@ -187,10 +187,10 @@ def _conflict(ref: str, pr: str, card: dict, rec: dict, records: dict, save_card
     ops.add_comment(
         "dispatcher", ref,
         f"Требуется ручное разрешение расхождения с базой. {detail}{files_note}\n"
-        f"База: `{base}` (sha `{base_sha or '?'}`). Карточка возвращена в In progress: в своей "
-        f"ветке сделай `git fetch origin {base} && git merge origin/{base}`, разреши конфликт, "
-        f"прогони проверки, запушь merge-коммит (без rebase/force-push) и снова report done. "
-        f"PR: {pr}")
+        f"База: `{base}` (sha `{base_sha or '?'}`), head PR: `{head_sha or '?'}`. Карточка "
+        f"возвращена в In progress: в своей ветке сделай "
+        f"`git fetch origin {base} && git merge origin/{base}`, разреши конфликт, прогони "
+        f"проверки, запушь merge-коммит (без rebase/force-push) и снова report done. PR: {pr}")
     ops.move_card("dispatcher", ref, model.IN_PROGRESS)
     clear_review(rec)
     rec["comment_baseline"] = len(ops.show_card(ref)["comments"])
