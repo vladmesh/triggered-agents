@@ -1,10 +1,12 @@
 """Deep-sweep drift check (triggered-agents-256): live ta-* systemd units plus the installed
 precheck gate script vs. what deploy/provision.py would install right now from the current
-triggered_agents/agents/*/automation.toml specs and repo copy of deploy/ta-gate.sh. Detection only,
-called from the deep-sweep section of `.claude/skills/steward/SKILL.md`; filing an Идеи card with
-the diff is the skill's job, not this module's. Auto-healing the drift is explicitly out of scope
-for this card (a live systemd rewrite belongs to a human-reviewed provision run, not an
-unconditional daily sweep).
+triggered_agents/agents/*/automation.toml specs and repo copy of deploy/ta-gate.sh. Also flags a
+double-schedule (triggered-agents-444): an agent whose ta-<agent>.timer is live on the host while
+the same-named Orca automation still has its own trigger enabled, which would let one hourly tick
+dispatch twice. Detection only, called from the deep-sweep section of
+`.claude/skills/steward/SKILL.md`; filing an Идеи card with the diff is the skill's job, not this
+module's. Auto-healing the drift is explicitly out of scope for this card (a live systemd rewrite
+belongs to a human-reviewed provision run, not an unconditional daily sweep).
 
 Reuses deploy/provision.py's own unit-string builders (_service_unit/_timer_unit/
 _variant_service_unit) instead of reimplementing the rendering: two independently maintained
@@ -69,6 +71,49 @@ def _diff(live: str, expected: str, artifact: str) -> str:
         fromfile=f"{artifact} (live)", tofile=f"{artifact} (expected from current checkout)"))
 
 
+def _orca_automation_states() -> dict[str, bool]:
+    """{Orca automation name: its own `enabled` flag} for every live automation. Best-effort: a
+    query failure (orca unreachable) yields {}, so the double-schedule check below treats every
+    agent as "can't verify" and reports nothing rather than guessing at a false positive/negative.
+    """
+    try:
+        data = provision.orca_json(["automations", "list"])
+    except Exception:
+        return {}
+    automations = provision._unwrap(data, "automations") or []
+    return {a["name"]: bool(a.get("enabled")) for a in automations if a.get("name")}
+
+
+def _double_schedule_drift(automation_states: dict[str, bool]) -> list[dict]:
+    """Flag every agent where BOTH ta-<agent>.timer is live on the host AND the same-named Orca
+    automation still has its own trigger enabled (triggered-agents-444): two independent schedule
+    owners that could both fire the same tick's skill. `automation_states` comes from
+    `_orca_automation_states`; an agent absent from it (query failed, or no automation of that
+    name exists yet) is skipped rather than assumed either way."""
+    hits = []
+    for agent_dir in sorted(provision.AGENTS_DIR.iterdir()):
+        spec_path = agent_dir / "automation.toml"
+        if not spec_path.is_file():
+            continue
+        agent = agent_dir.name
+        spec = tomllib.loads(spec_path.read_text(encoding="utf-8"))
+        if spec.get("dispatcher") or not spec.get("skill"):
+            continue  # deterministic agent, no Orca automation at all
+        if not (SYSTEMD_DIR / f"ta-{agent}.timer").is_file():
+            continue
+        if automation_states.get(agent):
+            hits.append({
+                "unit": f"ta-{agent}.timer + orca:{agent}",
+                "kind": "double-schedule",
+                "diff": (
+                    f"ta-{agent}.timer is live on the host AND the Orca automation '{agent}' "
+                    "still has its own trigger enabled — both could fire the same tick's skill. "
+                    f"Re-provision (deploy/provision.py {agent}) to reassert --disabled."
+                ),
+            })
+    return hits
+
+
 def check() -> dict:
     """{"in_sync": bool, "drift": [{"unit", "kind", "diff"}, ...]}. The "unit" field may hold a
     unit filename or an installed script path. `kind`:
@@ -79,7 +124,10 @@ def check() -> dict:
                    removed by hand without touching the source).
       "extra"   -> the unit lives on the host, no spec calls for it any more (a decommissioned
                    agent/variant whose unit was never torn down, the ta-board class, 2026-07-04).
-    Sorted by artifact name for a deterministic report."""
+      "double-schedule" -> ta-<agent>.timer is live AND the same-named Orca automation's own
+                   trigger is enabled (triggered-agents-444) — two schedule owners, not just a
+                   stale artifact; see _double_schedule_drift.
+    Sorted by artifact name for a deterministic report, double-schedule hits appended after."""
     expected = _expected_artifacts()
     live = _live_artifacts()
     drift = []
@@ -92,6 +140,7 @@ def check() -> dict:
             drift.append({"unit": unit, "kind": "missing", "diff": _diff("", exp, unit)})
         elif exp != got:
             drift.append({"unit": unit, "kind": "content", "diff": _diff(got, exp, unit)})
+    drift.extend(_double_schedule_drift(_orca_automation_states()))
     return {"in_sync": not drift, "drift": drift}
 
 

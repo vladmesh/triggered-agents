@@ -53,6 +53,14 @@ class DriftCheckTest(unittest.TestCase):
         self._patch(provision, "GATE_INSTALL_PATH", self.gate_install)
         self._patch(drift, "SYSTEMD_DIR", self.systemd_dir)
         self._patch(pipeline_worker, "AGENTS_ROOT", self.workspaces_root)
+        # Real orca is never reachable/relevant in these tests; default to "no automations known"
+        # so the double-schedule check (triggered-agents-444) stays quiet unless a test opts in
+        # below via self._fake_orca_automations({...}).
+        self._patch(provision, "orca_json", lambda args: {"result": {"automations": []}})
+
+    def _fake_orca_automations(self, states: dict) -> None:
+        automations = [{"name": name, "enabled": enabled} for name, enabled in states.items()]
+        self._patch(provision, "orca_json", lambda args: {"result": {"automations": automations}})
 
     def _patch(self, target, attr, value) -> None:
         p = mock.patch.object(target, attr, value)
@@ -167,6 +175,86 @@ randomized_delay_sec = 600
         self.assertIn("ta-curator.service", out)
         self.assertIn("content", out)
         self.assertIn("- old", out)
+
+    def _write_synced_curator(self) -> None:
+        self._write_spec("curator")
+        service, timer = self._expected("curator")
+        (self.systemd_dir / "ta-curator.service").write_text(service, encoding="utf-8")
+        (self.systemd_dir / "ta-curator.timer").write_text(timer, encoding="utf-8")
+
+    def test_double_schedule_drift_when_timer_live_and_automation_still_enabled(self):
+        # triggered-agents-444: ta-curator.timer on the host AND the Orca automation "curator"
+        # still enabled — one hourly tick could dispatch /curate twice.
+        self._write_synced_curator()
+        self._fake_orca_automations({"curator": True})
+
+        result = drift.check()
+
+        self.assertFalse(result["in_sync"])
+        hits = [h for h in result["drift"] if h["kind"] == "double-schedule"]
+        self.assertEqual(len(hits), 1)
+        self.assertIn("curator", hits[0]["unit"])
+
+    def test_no_double_schedule_when_automation_is_disabled(self):
+        self._write_synced_curator()
+        self._fake_orca_automations({"curator": False})
+
+        result = drift.check()
+
+        self.assertTrue(result["in_sync"])
+        self.assertEqual(result["drift"], [])
+
+    def test_no_double_schedule_when_automation_state_is_unknown(self):
+        # orca query failed or returned nothing for this name -> don't guess, stay quiet.
+        self._write_synced_curator()
+        # no _fake_orca_automations call -> setUp default (empty automations list) applies
+
+        result = drift.check()
+
+        self.assertTrue(result["in_sync"])
+
+    def test_no_double_schedule_when_timer_was_never_provisioned(self):
+        # Spec exists but ta-curator.timer isn't live on the host yet -> reported as "missing"
+        # unit drift, never as a double-schedule (there is only one live owner, not two).
+        self._write_spec("curator")
+        self._fake_orca_automations({"curator": True})
+
+        result = drift.check()
+
+        kinds = {h["kind"] for h in result["drift"]}
+        self.assertNotIn("double-schedule", kinds)
+
+    def test_no_double_schedule_for_deterministic_dispatcher_agent(self):
+        # A dispatcher-style agent (e.g. pipeline) never gets an Orca automation at all; an
+        # unrelated automation happening to share its name must not be misread as a double owner.
+        d = self.agents_dir / "pipeline"
+        d.mkdir()
+        (d / "automation.toml").write_text("""
+name = "pipeline"
+dispatcher = true
+precheck = "python3 -m triggered_agents pipeline precheck"
+
+[systemd]
+calendar = "*:0/3:00"
+randomized_delay_sec = 20
+""", encoding="utf-8")
+        service = provision._service_unit("pipeline", "*:0/3:00", self.workspaces_root / "pipeline", "")
+        timer = provision._timer_unit("pipeline", "*:0/3:00", 20)
+        (self.systemd_dir / "ta-pipeline.service").write_text(service, encoding="utf-8")
+        (self.systemd_dir / "ta-pipeline.timer").write_text(timer, encoding="utf-8")
+        self._fake_orca_automations({"pipeline": True})
+
+        result = drift.check()
+
+        kinds = {h["kind"] for h in result["drift"]}
+        self.assertNotIn("double-schedule", kinds)
+
+    def test_orca_automation_states_returns_empty_on_query_failure(self):
+        def _boom(_args):
+            raise RuntimeError("orca unreachable")
+        self._patch(provision, "orca_json", _boom)
+
+        self.assertEqual(drift._orca_automation_states(), {})
 
 
 if __name__ == "__main__":
