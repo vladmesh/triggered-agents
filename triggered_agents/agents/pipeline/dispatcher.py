@@ -50,6 +50,7 @@ from . import (
 from .state import STATE
 # Re-exported so dispatcher.<NAME> keeps resolving for existing callers/tests — validate.py owns
 # these now (its layer-3 rework/spawn/stall caps), dispatcher just orchestrates the tick.
+from .merge_recovery import MERGE_RECOVERY_ATTEMPTS  # noqa: F401
 from .validate import (  # noqa: F401
     CI_PENDING_STALL_SECONDS, REVIEW_RETURN_CAP, REVIEW_SPAWN_ATTEMPTS, VALIDATE_STALL_ATTEMPTS,
 )
