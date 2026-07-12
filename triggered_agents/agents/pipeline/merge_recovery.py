@@ -45,7 +45,9 @@ def merge_base_into_branch(workspace: str, base_branch: str, branch: str) -> dic
         "fetch-failed" / "push-failed" / "error"   the named git step failed; "reason" carries why
     Every failure path leaves the worktree exactly as found: a conflict is `git merge --abort`ed and
     a dirty tree is never touched, so a half-done or racing worker never loses uncommitted code
-    (AC6). Distinct results so the journal can tell a conflict from a fetch/merge/push failure. The
+    (AC6). The worktree is checked/moved onto `branch` before the merge so a worker that left it on
+    main or detached never has the base merged into the wrong checkout or a stale PR branch pushed
+    (B2). Distinct results so the journal can tell a conflict from a fetch/merge/push failure. The
     caller scrubs "reason"/"conflict_files" before any board comment."""
     git = worker._git
     try:
@@ -54,6 +56,15 @@ def merge_base_into_branch(workspace: str, base_branch: str, branch: str) -> dic
             return {"result": "error", "reason": (dirty.stderr or dirty.stdout).strip() or "git status failed"}
         if dirty.stdout.strip():
             return {"result": "dirty", "reason": "worktree has uncommitted changes"}
+        cur = git(workspace, ["rev-parse", "--abbrev-ref", "HEAD"])
+        if cur.returncode != 0:
+            return {"result": "error", "reason": (cur.stderr or cur.stdout).strip() or "rev-parse failed"}
+        if cur.stdout.strip() != branch:   # worker left it on main/another branch/detached HEAD
+            checkout = git(workspace, ["checkout", branch])
+            if checkout.returncode != 0:
+                return {"result": "error",
+                        "reason": f"worktree not on {branch} and checkout failed: "
+                                  f"{(checkout.stderr or checkout.stdout).strip()}"}
         before = git(workspace, ["rev-parse", "HEAD"])
         if before.returncode != 0:
             return {"result": "error", "reason": (before.stderr or before.stdout).strip() or "not a git worktree"}
@@ -112,12 +123,23 @@ def recover(ref: str, pr: str, card: dict, rec: dict | None, records: dict, stat
         STATE.log_run("validate", reference=ref, result="merge-recovery-settled", pr=pr,
                       base_sha=base_sha, head_sha=head_sha)
         return False
+    # The base to merge is the PR's ACTUAL base ref (poll_pr's base_branch / GitHub baseRefName),
+    # never a card-derived guess (B1): a card whose worker opened the PR against the wrong base
+    # (e.g. main instead of sprint/NNN) must not have the card's expected base merged into a branch
+    # that will land somewhere else — recovery keeps the PR consistent with the branch it actually
+    # targets, and the card/PR base mismatch is still caught by validate_review.review_green's own
+    # base guard before any merge. Missing base_branch (gh gave us mergeability but no base ref) is
+    # not something to guess at — wait a tick, like a gh blip.
+    base = status.get("base_branch") or ""
+    if not base:
+        STATE.log_run("validate", reference=ref, result="merge-recovery-no-base", level="warn",
+                      pr=pr, merge_state=merge_state)
+        return False
     attempts = int(state.get("attempts", 0)) if same_base else 0
     if attempts >= MERGE_RECOVERY_ATTEMPTS:
         return _block(ref, pr, rec, records, base_sha, attempts, merge_state, clear_review)
 
     branch = naming.worker_branch(ref)
-    base = worker.resolve_base_branch(card.get("project") or "", card.get("base_branch") or "")
     result = merge_base_into_branch(workspace, base, branch)
     attempts += 1
     rec["merge_recovery"] = {"base": base_sha, "attempts": attempts}

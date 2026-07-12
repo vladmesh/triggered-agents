@@ -786,15 +786,14 @@ def _failed_log(item: dict, lines: int = _GH_LOG_TAIL_LINES) -> str | None:
 def poll_pr(pr_url: str) -> dict | None:
     """Poll a PR's merge state and CI rollup via gh. Returns
         {"merged": bool, "state": str, "rollup": "SUCCESS"|"FAILURE"|"PENDING"|"NONE",
-         "failed_job": str|None, "failed_log": str|None,
-         "mergeable": "CLEAN"|"BEHIND"|"CONFLICTING"|"UNKNOWN",
-         "head_sha": str|None, "base_sha": str|None}
+         "failed_job": str|None, "failed_log": str|None, "head_sha": str|None, "base_sha": str|None,
+         "mergeable": "CLEAN"|"BEHIND"|"CONFLICTING"|"UNKNOWN", "base_branch": str|None}
     or None when gh cannot answer (missing, error, PR gone) — an unknown to retry, not a verdict.
-    `mergeable` is the base-freshness/mergeability signal (model.merge_status), kept apart from
-    `rollup` (CI): the two answer different questions and a conflicting PR often has no CI at all.
-    The failed job's log is fetched only on FAILURE, so a green/pending poll is a single gh call."""
-    data = _gh_json(["pr", "view", pr_url, "--json",
-                     "state,mergedAt,statusCheckRollup,mergeable,mergeStateStatus,headRefOid,baseRefOid"])
+    `mergeable` (model.merge_status) is the base-freshness signal, apart from `rollup` (CI);
+    `base_branch` is the PR's ACTUAL base ref — recovery merges the base the PR really targets, not
+    a card guess. Failed-job log is fetched only on FAILURE."""
+    data = _gh_json(["pr", "view", pr_url, "--json", "state,mergedAt,statusCheckRollup,mergeable,"
+                     "mergeStateStatus,headRefOid,baseRefOid,baseRefName"])
     if not isinstance(data, dict):
         return None
     rollup, failed = _rollup(data.get("statusCheckRollup") or [])
@@ -807,6 +806,7 @@ def poll_pr(pr_url: str) -> dict | None:
         "mergeable": model.merge_status(data.get("mergeable"), data.get("mergeStateStatus")),
         "head_sha": data.get("headRefOid") or None,
         "base_sha": data.get("baseRefOid") or None,
+        "base_branch": data.get("baseRefName") or None,
     }
     if failed is not None:
         out["failed_job"] = failed.get("name") or failed.get("context") or "?"

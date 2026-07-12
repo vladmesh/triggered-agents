@@ -2068,9 +2068,11 @@ class MergeRecoveryTest(_DispatcherBase):
         self.assertEqual(self._column(ref), "Validate")
         return ref
 
-    def _status(self, mergeable, rollup="NONE", base_sha="base1", head_sha="head1", **kw):
+    def _status(self, mergeable, rollup="NONE", base_sha="base1", head_sha="head1",
+                base_branch="main", **kw):
         s = {"merged": False, "state": "OPEN", "rollup": rollup, "failed_job": None,
-             "failed_log": None, "mergeable": mergeable, "base_sha": base_sha, "head_sha": head_sha}
+             "failed_log": None, "mergeable": mergeable, "base_sha": base_sha, "head_sha": head_sha,
+             "base_branch": base_branch}
         s.update(kw)
         return s
 
@@ -2128,6 +2130,26 @@ class MergeRecoveryTest(_DispatcherBase):
         self.assertIn("merge базы", self._markers(ref))
         self.assertTrue(any(r["event"] == "validate" and r.get("result") == "merge-updated"
                             for r in self._runs()))
+
+    def test_merges_the_actual_pr_base_not_a_card_guess(self):
+        # B1: recovery must merge the base the PR ACTUALLY targets (poll_pr's base_branch), never a
+        # card-derived guess — a PR opened against a different base must not get another base merged
+        # into its head branch.
+        ref = self._to_validate()
+        self.worker.merge_base_result = {"result": "updated", "head": "mh"}
+        self.worker.pr_status = self._status("BEHIND", rollup="NONE", base_branch="release/9")
+        dispatcher.tick()
+        self.assertEqual(self.worker.merge_base_calls,
+                         [(dispatcher._load_cards()[ref]["workspace"], "release/9",
+                           naming.worker_branch(ref))])
+
+    def test_missing_pr_base_ref_waits_without_merging(self):
+        ref = self._to_validate()
+        self.worker.pr_status = self._status("BEHIND", rollup="NONE", base_branch=None)
+        dispatcher.tick()
+        self.assertEqual(self._column(ref), "Validate")
+        self.assertEqual(self.worker.merge_base_calls, [])
+        self.assertTrue(any(r.get("result") == "merge-recovery-no-base" for r in self._runs()))
 
     def test_behind_update_reruns_layer1_and_never_reuses_the_old_green(self):
         ref = self._to_validate()
