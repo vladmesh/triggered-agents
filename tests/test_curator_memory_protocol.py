@@ -157,6 +157,63 @@ class CuratorMemoryProtocolTest(unittest.TestCase):
         self.assertEqual(len(retry_calls), 1)
         self.assertIn("commit", retry_calls[0])
 
+    def test_already_exists_clears_proposal_and_returns_skip(self):
+        def runner(args, **kwargs):
+            if "propose" in args:
+                return _completed({
+                    "ok": True,
+                    "op": "propose",
+                    "propose_id": "proposal-4",
+                    "fact": "triggered-agents/protocol-fact",
+                })
+            return _completed({
+                "ok": False,
+                "op": "commit",
+                "error": "validation",
+                "message": "memory fact already exists: triggered-agents/protocol-fact",
+            }, returncode=2)
+
+        result = memory_protocol.write_fact(self.state, self.request, runner=runner)
+
+        self.assertEqual(result["op"], "skip")
+        self.assertEqual(result["reason"], "already_exists")
+        self.assertEqual(result["fact"], "triggered-agents/protocol-fact")
+        self.assertEqual(list((self.state.dir / "memory_protocol").glob("*.json")), [])
+
+    def test_terminal_validation_error_discards_poisoned_proposal(self):
+        def runner(args, **kwargs):
+            if "propose" in args:
+                return _completed({"ok": True, "op": "propose", "propose_id": "proposal-5"})
+            return _completed({
+                "ok": False,
+                "op": "commit",
+                "error": "validation",
+                "message": "proposal not found: proposal-5",
+            }, returncode=2)
+
+        with self.assertRaises(memory_protocol.MemoryProtocolError):
+            memory_protocol.write_fact(self.state, self.request, runner=runner)
+
+        self.assertEqual(list((self.state.dir / "memory_protocol").glob("*.json")), [])
+
+    def test_runtime_commit_error_keeps_proposal_for_retry(self):
+        def runner(args, **kwargs):
+            if "propose" in args:
+                return _completed({"ok": True, "op": "propose", "propose_id": "proposal-6"})
+            return subprocess.CompletedProcess(
+                args=args,
+                returncode=1,
+                stdout="",
+                stderr="secretary unavailable",
+            )
+
+        with self.assertRaises(memory_protocol.MemoryProtocolError):
+            memory_protocol.write_fact(self.state, self.request, runner=runner)
+
+        saved = list((self.state.dir / "memory_protocol").glob("*.json"))
+        self.assertEqual(len(saved), 1)
+        self.assertIn("proposal-6", saved[0].read_text(encoding="utf-8"))
+
     def test_runtime_config_does_not_expose_old_panelmem_write_path(self):
         repo = Path(__file__).resolve().parents[1]
         skill = (repo / ".claude" / "skills" / "curate" / "SKILL.md").read_text(encoding="utf-8")

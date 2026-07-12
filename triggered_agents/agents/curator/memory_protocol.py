@@ -67,7 +67,16 @@ def write_fact(
     else:
         propose_id = str(saved["propose_id"])
 
-    result = _run_memory_json(runner, _commit_args(request, propose_id), request)
+    try:
+        result = _run_memory_json(runner, _commit_args(request, propose_id), request)
+    except MemoryProtocolError as exc:
+        action = _terminal_commit_action(exc.payload)
+        if action == "already_exists":
+            _unlink(state_path)
+            return _already_exists_result(request, propose_id, saved)
+        if action == "discard":
+            _unlink(state_path)
+        raise
     _unlink(state_path)
     return result
 
@@ -132,6 +141,36 @@ def _run_memory_json(runner: Runner, args: list[str], request: MemoryWriteReques
     return payload
 
 
+def _terminal_commit_action(payload: dict) -> str | None:
+    error = payload.get("error")
+    message = str(payload.get("message") or "")
+    if error == "validation" and message.startswith("memory fact already exists:"):
+        return "already_exists"
+    if error in {"validation", "permission"}:
+        return "discard"
+    return None
+
+
+def _already_exists_result(
+    request: MemoryWriteRequest,
+    propose_id: str,
+    saved: dict | None,
+) -> dict:
+    fact = _fact_id(request)
+    if saved and isinstance(saved.get("fact"), str):
+        fact = str(saved["fact"])
+    return {
+        "ok": True,
+        "op": "skip",
+        "reason": "already_exists",
+        "fact": fact,
+        "actor": request.actor,
+        "source": request.source or request.actor,
+        "changed_facts": [],
+        "propose_id": propose_id,
+    }
+
+
 def _secretary_env(secretary_repo: Path | None) -> dict[str, str]:
     env = dict(os.environ)
     repo = secretary_repo or Path(os.environ.get("TA_SECRETARY_REPO", str(DEFAULT_SECRETARY_REPO)))
@@ -146,6 +185,10 @@ def _state_path(state: AgentState, scope: str, slug: str) -> Path:
     scope_part = _scope_dir(scope)
     name = f"{scope_part}__{_clean_slug(slug)}.json"
     return state.dir / "memory_protocol" / name
+
+
+def _fact_id(request: MemoryWriteRequest) -> str:
+    return f"{_scope_dir(request.scope)}/{_clean_slug(request.slug)}"
 
 
 def _scope_dir(scope: str) -> str:
