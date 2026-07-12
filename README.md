@@ -56,20 +56,38 @@ stop --worktree`), **проверяет** через повторный `termina
 решение, не часть triggered-agents-445.
 
 `ta-gate.sh` дёргает `dispatch` только когда precheck сигналит `rc=0` (есть новые сессии для
-куратора); на `rc=100` (skip — новых сессий нет) он вместо простого `exit 0` вызывает
-`dispatch --cleanup-only`. Без этого second call завершённый ephemeral-прогон мог бы провисеть
-сколь угодно долго: `dispatch` (а значит и все kill-пути внутри него) иначе не вызывался бы вовсе,
-пока не найдётся тик с реальной новой работой. `--cleanup-only` никогда не создаёт терминал и не
-трогает ещё работающий (busy-fresh) — только доводит уже finished/stuck терминал ephemeral-агента
-до нуля (`cleanup-teardown`/`cleanup-watchdog-stop` в `runs.jsonl`) и оставляет воркспейс пустым до
-следующего реального диспатча.
+куратора); на `rc=100` (skip — новых сессий нет) он для ЛЮБОГО агента вместо простого `exit 0`
+вызывает `dispatch --cleanup-only`. Без этого second call завершённый ephemeral-прогон мог бы
+провисеть сколь угодно долго: `dispatch` (а значит и все kill-пути внутри него) иначе не вызывался
+бы вовсе, пока не найдётся тик с реальной новой работой. `--cleanup-only` никогда не создаёт
+терминал и не трогает ещё работающий (busy-fresh) — только доводит уже finished/stuck терминал
+ephemeral-агента до нуля (`cleanup-teardown`/`cleanup-watchdog-stop` в `runs.jsonl`) и оставляет
+воркспейс пустым до следующего реального диспатча.
+
+Этот же флаг для НЕ-ephemeral агента (retro/steward) и для `pipeline` (детерминированный
+диспетчер, не эта singleton-driver машинерия вовсе) — гарантированный no-op: `dispatch.run`
+проверяет `_is_ephemeral(agent)` в самом начале, ДО единого Orca/board-вызова (ни `terminal list`,
+ни ghost-реап, ни lookup steward-репорта), а `__main__.main`'s pipeline-ветка явно возвращает `0`
+на `--cleanup-only`, не доходя до `dispatcher.tick()`. И то, и другое важно: без первого проверка
+у retro/steward превратила бы их тихий skip в реальные Orca-вызовы, каких раньше не было; без
+второго pipeline на каждом quiet-тике (раз в 3 минуты) гонял бы полный reconcile/advance/validate/
+claim вместо честного «нечего делать».
+
+Cleanup для curator также сводит к нулю накопившийся «сирота»-терминал, которого `_agent_terminals`
+не узнаёт по title/handle (например, застрявший на дефолтном шелл-заголовке хвост старого
+инцидента): и обычная ветка «нет терминала» перед созданием, и `--cleanup-only` при пустом
+распознанном списке дополнительно проверяют `_raw_terminal_count` — сырой, нефильтрованный
+`terminal list` для воркспейса — и, если там что-то есть, останавливают и реапят ВСЮ рабочую
+папку (`_stop_and_confirm_workspace_empty`) прежде чем создавать новый терминал или объявлять
+воркспейс чистым.
 
 Диагностика зависшего прогона куратора:
 
 1. `state/curator/runs.jsonl` (или `TA_STATE/curator/runs.jsonl` на хосте) — последняя запись:
    `action` показывает, что сделал последний тик (`created`/`ephemeral-restart`/`busy-skip`/
    `watchdog-restart`/`cleanup-teardown`/`cleanup-watchdog-stop`/`recent-create-guard`/
-   `*-stop-failed`/...), `ts` — когда.
+   `stray-sweep-failed`/`cleanup-stray-swept`/`cleanup-stray-sweep-failed`/`*-stop-failed`/...),
+   `ts` — когда.
 2. `orca terminal list --worktree path:<curator-воркспейс> --json` — живой терминал должен быть
    максимум один, с заголовком `triggered-agent:curator`. Больше одного или заголовок, оставшийся
    на дефолте шелла (`dev@host: ...`), — сам по себе аномалия (см. `_ensure_claude_ready` в

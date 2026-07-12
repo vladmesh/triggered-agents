@@ -50,22 +50,37 @@ place idle-reuse can learn which resource the warm terminal is actually running 
 that can already be a fallback and differ from the agent's static preferred head
 (triggered-agents-275).
 
-Three more invariants, all from PR #95 review (triggered-agents-445):
+More invariants, all from PR #95 review rounds (triggered-agents-445):
 
   * `run(..., cleanup_only=True)` — `ta-gate.sh`'s call on a precheck skip (no new work). Never
     dispatches a skill; for an ephemeral agent it still runs `_cleanup_only` on a finished/stuck
     terminal, because `dispatch` (and thus every kill path above) is otherwise never invoked at
     all on a skip tick — a finished ephemeral run could sit until the next tick that happens to
-    have real work, unbounded if that never comes (review B1).
+    have real work, unbounded if that never comes (round 1 review B1). It bails immediately, before
+    any Orca call, for a non-ephemeral agent (retro/steward): their lifecycle is out of scope, so
+    their precheck-skip stays the exact zero-Orca-calls no-op it always was (round 2 review B2).
+    `triggered_agents/__main__.py`'s `pipeline` special case (a deterministic dispatcher with no
+    terminal at all) treats `--cleanup-only` the same way, never calling `dispatcher.tick()`
+    (round 2 review B1) — a shared gate script means every agent it dispatches to, including a
+    skill-less deterministic one, must understand the flag as "there is nothing to do here".
   * Every "stop, then create" path (watchdog-restart, ephemeral-restart, red-fallback) verifies
     the stop actually worked via `_stop_and_confirm` — re-listing terminals rather than trusting
     `terminal stop`'s exit code — before spawning the replacement, and bails without creating if
     it can't confirm. Otherwise a silently-failed stop plus an unconditional create risks two live
-    sessions for one singleton agent (review B3).
+    sessions for one singleton agent (round 1 review B3).
   * The "no terminal" branch checks `AgentState.load_terminal_created_at()` against
     `CREATE_VISIBILITY_GRACE_S` before creating: a terminal this same agent just created may not
     be visible in `terminal list` yet, and a second dispatch landing in that gap must not read
-    that as "nothing was ever spawned" and create a duplicate (review B2).
+    that as "nothing was ever spawned" and create a duplicate (round 1 review B2).
+  * Both the "no terminal" branch and `_cleanup_only`, when `_agent_terminals` recognizes nothing,
+    still check `_raw_terminal_count` — Orca's unfiltered terminal list for the workspace — and
+    sweep (`_stop_and_confirm_workspace_empty` + `_reap_ghosts`) before creating or declaring the
+    workspace clean. `_agent_terminals`'s title/handle filter can miss a genuinely live stray (an
+    orphan stuck on the shell's default title), which would otherwise survive every tick forever —
+    recognized as "empty" and either left alone (cleanup) or piled on top of with a fresh terminal
+    (create). `_stop_and_confirm_workspace_empty` (not the narrower `_stop_and_confirm`) verifies
+    via the same unfiltered `_raw_terminal_count`, since the filtered view would "confirm" success
+    on a stray it could never recognize either way, stopped or not (round 2 review B3).
 """
 from __future__ import annotations
 
@@ -310,6 +325,23 @@ def _agent_terminals(ws: str, state: AgentState | None = None) -> list[dict]:
     ]
 
 
+def _raw_terminal_count(ws: str) -> int:
+    """Every live terminal Orca reports for `ws`, unfiltered by title/handle — unlike
+    `_agent_terminals`, this also counts a stray terminal the recognition filter would otherwise
+    miss entirely: an orphan stuck on the shell's default title from a past incident (found live
+    in the curator workspace once already, see `_ensure_claude_ready`'s docstring), or one that
+    simply predates this agent's `triggered-agent:<name>` title convention. An ephemeral agent's
+    "no terminal" branch and `_cleanup_only` both need this to actually converge accumulated live
+    orphans to zero instead of quietly creating a new terminal alongside one they can't see
+    (triggered-agents-445, PR #95 review B3). Best-effort: an Orca hiccup here should not block
+    the tick, so it reads as "nothing to sweep" rather than raising."""
+    try:
+        return len(_orca_json(["terminal", "list", "--worktree", f"path:{ws}", "--limit", "50"])
+                   .get("terminals", []) or [])
+    except (RuntimeError, subprocess.TimeoutExpired):
+        return 0
+
+
 def _create_terminal(agent: str, ws: str, launch: str, state: AgentState, profile: str | None) -> None:
     data = _orca_json(["terminal", "create", "--worktree", f"path:{ws}",
                        "--title", f"triggered-agent:{agent}", "--command", launch])
@@ -327,10 +359,27 @@ def _stop_and_confirm(ws: str, state: AgentState) -> bool:
     it, and Orca itself can report success while a pty lingers. `terminal list` (via
     `_agent_terminals`) is the ground truth every other check in this module already trusts, so
     re-list and require it to come back empty instead. A caller that gets False back must NOT
-    proceed to `_create_terminal` — that would risk two live sessions for one singleton agent."""
+    proceed to `_create_terminal` — that would risk two live sessions for one singleton agent.
+
+    Only correct for a terminal `_agent_terminals` actually recognized in the first place (every
+    call site here is stopping the terminal that branch just matched as the survivor). For a
+    stray `_agent_terminals` never recognized to begin with, use `_stop_and_confirm_workspace_
+    empty` instead — the filtered view here would "confirm" success on a stray it could never see
+    either way, stop or no stop."""
     _orca(["terminal", "stop", "--worktree", f"path:{ws}"])
     time.sleep(1.0)
     return not _agent_terminals(ws, state)
+
+
+def _stop_and_confirm_workspace_empty(ws: str) -> bool:
+    """Stop every live terminal in `ws` and verify via Orca's UNFILTERED terminal list
+    (`_raw_terminal_count`) that the workspace is truly empty — for the stray-sweep paths only
+    (triggered-agents-445, PR #95 review B3, round 2). `_stop_and_confirm`'s own re-check goes
+    through `_agent_terminals`'s title/handle recognition filter, which would trivially read as
+    "confirmed empty" for a stray it could never recognize in the first place, stopped or not."""
+    _orca(["terminal", "stop", "--worktree", f"path:{ws}"])
+    time.sleep(1.0)
+    return _raw_terminal_count(ws) == 0
 
 
 def _is_idle(handle: str) -> bool:
@@ -384,10 +433,26 @@ def _cleanup_only(agent: str, ws: str, state: AgentState, event: str, terms: lis
     ephemeral run's PTY/tab would sit until the next tick that happens to have real work —
     unbounded if that never comes. Never creates a terminal: with nothing new to curate there is
     no skill to hand a fresh session, and creating one anyway would defeat the whole point of
-    precheck-gating (spend a token for nothing). Non-ephemeral agents (retro/steward) get no
-    extra behavior here — their warm terminal, busy or idle, is left exactly as a precheck skip
-    always left it; that lifecycle is out of scope for this card."""
-    if not terms or not _is_ephemeral(agent):
+    precheck-gating (spend a token for nothing). Only ever called for an ephemeral agent — `run()`
+    bails before this for a non-ephemeral one (retro/steward): their warm terminal, busy or idle,
+    stays exactly as a precheck skip always left it; that lifecycle is out of scope for this
+    card, and touching it here would spend Orca calls their skip path never used to make
+    (PR #95 review B2)."""
+    if not terms:
+        # `_agent_terminals`'s title/handle filter can miss a stray live terminal that isn't
+        # recognized as this agent's own (review B3) -- sweep the whole workspace so accumulated
+        # live orphans actually converge to zero on a no-work tick instead of surviving every
+        # "nothing recognized" cleanup forever.
+        if _raw_terminal_count(ws) > 0:
+            if not _stop_and_confirm_workspace_empty(ws):
+                state.log_run(event, action="cleanup-stray-sweep-failed")
+                print(f"dispatch[{agent}]: cleanup could not confirm the workspace is clear of "
+                      "stray terminals — leaving it for the next tick")
+                return 0
+            reaped = _reap_ghosts(ws)
+            state.log_run(event, action="cleanup-stray-swept")
+            print(f"dispatch[{agent}]: cleanup — swept stray unrecognized terminal(s)"
+                  f"{f'; reaped {reaped} ghost(s)' if reaped else ''}, no new work to dispatch")
         return 0
     survivor = max(terms, key=lambda t: t.get("lastOutputAt") or 0)
     if not _is_idle(survivor["handle"]):
@@ -439,6 +504,14 @@ def run(agent: str, variant: str | None = None, cleanup_only: bool = False) -> i
             state.log_run(event, action="paused")
             print(f"dispatch[{agent}]: pipeline paused — no dispatch")
             return 0
+        if cleanup_only and not _is_ephemeral(agent):
+            # A non-ephemeral agent (retro/steward) has no terminal/PTY lifecycle for this pass
+            # to clean up -- their warm-reuse lifecycle is out of scope for triggered-agents-445.
+            # Bail before touching anything (no ghost reap, no `terminal list`, no steward report
+            # lookup) so a precheck skip stays the exact zero-Orca-calls no-op it always was
+            # (PR #95 review B2): ta-gate.sh now calls `--cleanup-only` on every skip for every
+            # agent, and this must not grow their blast radius just because curator needed it.
+            return 0
         active_report = _fresh_steward_report_in_progress(agent, time.time())
         if active_report:
             state.log_run(event, action="active-report-skip", reference=active_report["reference"])
@@ -466,6 +539,18 @@ def run(agent: str, variant: str | None = None, cleanup_only: bool = False) -> i
                 print(f"dispatch[{agent}]: no terminal visible yet but one was created "
                       f"{time.time() - last_created:.1f}s ago — skipping to avoid a duplicate")
                 return 0
+            if _is_ephemeral(agent) and _raw_terminal_count(ws) > 0:
+                # `_agent_terminals` recognized nothing, but Orca still lists a live terminal in
+                # this workspace -- a stray it can't match by title/handle (an orphan from a past
+                # incident, review B3). An ephemeral workspace's whole point is converging to at
+                # most one terminal, so sweep it before creating rather than piling a fresh
+                # session on top of an orphan that would otherwise run forever.
+                if not _stop_and_confirm_workspace_empty(ws):
+                    state.log_run(event, action="stray-sweep-failed")
+                    print(f"dispatch[{agent}]: could not confirm the workspace is clear of stray "
+                          "terminals before creating — leaving it for the next tick")
+                    return 0
+                _reap_ghosts(ws)
             skill, launch, profile = _dispatch_command(agent, variant)
             _ensure_claude_ready(ws)
             _create_terminal(agent, ws, launch, state, profile)

@@ -36,6 +36,28 @@
 - `README.md` — раздел «Lifecycle куратора» расширен: `--cleanup-only`-путь, `_stop_and_confirm`,
   новые `action`-значения в `runs.jsonl`, обновлённая диагностика зависшего прогона.
 
+Второй раунд ревью (PR #95) нашёл, что `--cleanup-only`, отправляемый теперь на КАЖДОМ
+precheck-skip любого агента, задел два соседних, вне-скоуп пути, и что cleanup куратора не видел
+часть живых orphan-терминалов:
+
+- `triggered_agents/__main__.py`: pipeline-ветка (детерминированный диспетчер, без terminal/PTY
+  вовсе) раньше игнорировала `--cleanup-only` и на каждом quiet-тике (раз в 3 минуты) всё равно
+  гоняла полный `dispatcher.tick()` — теперь на `--cleanup-only` она сразу возвращает `0`.
+- `runtime/dispatch.py`: `run()` для НЕ-ephemeral агента (retro/steward) с `cleanup_only=True`
+  теперь выходит ДО первого Orca/board-вызова — раньше ghost-реап и `terminal list` успевали
+  выполниться до собственной no-op проверки `_cleanup_only`, то есть их precheck-skip перестал
+  быть тем же нулевым по Orca-вызовам no-op, каким был до этой карточки.
+- `_agent_terminals`'s фильтр по title/handle может не узнать реально живой сирота-терминал
+  (застрявший на дефолтном шелл-заголовке хвост старого инцидента) — и ветка «нет терминала», и
+  `--cleanup-only` при пустом распознанном списке теперь дополнительно проверяют
+  `_raw_terminal_count` (сырой `terminal list`, без фильтра) и подметают воркспейс целиком
+  (`_stop_and_confirm_workspace_empty`) прежде чем создавать новый терминал или объявлять cleanup
+  завершённым — иначе такой сирота пережил бы вообще любое число тиков.
+- `tests/test_runtime_dispatch.py` разнесён: общая fixture `_DispatchBase` переехала в
+  `tests/_dispatch_fixtures.py`, ephemeral/cleanup-only/stray-sweep/two-tick тесты — в новый
+  `tests/test_dispatch_lifecycle.py` (файл на главной ветке уже был 640 строк, а с первым раундом
+  правок вырос за 1000).
+
 ## Куратор: единственный владелец расписания
 
 - `deploy/provision.py` теперь явно управляет флагом `enabled` встроенной Orca-автоматизации по
