@@ -359,13 +359,19 @@ def _ensure_claude_ready(ws: str) -> None:
         print(f"dispatch: claude config prep failed ({e})")
 
 
-def _agent_terminals(ws: str, state: AgentState | None = None) -> list[dict]:
+def _agent_terminals(ws: str, state: AgentState | None = None) -> list[dict] | None:
     """Live terminals in the workspace running this singleton agent.
 
     New spawns get an explicit `triggered-agent:<name>` title. The legacy `Claude` match keeps
     already-warm Claude terminals reusable until they are naturally restarted. Codex may rename
     its tab back to the shell cwd after startup, so the latest saved Orca handle is also accepted."""
-    terms = _orca_json(["terminal", "list", "--worktree", f"path:{ws}", "--limit", "50"]).get("terminals", []) or []
+    try:
+        terms = _orca_json(["terminal", "list", "--worktree", f"path:{ws}", "--limit", "50"]).get("terminals", []) or []
+    except Exception as exc:
+        # An unreadable list is not an empty workspace. Every caller treats None as a deferred
+        # decision so an Orca hiccup cannot turn into a second curator or a healthy teardown.
+        print(f"dispatch: terminal list unavailable for {ws} ({exc})")
+        return None
     saved_handle = state.load_terminal_handle() if state else None
     return [
         t for t in terms
@@ -526,9 +532,14 @@ def _stop_and_confirm(ws: str, state: AgentState) -> bool:
     stray `_agent_terminals` never recognized to begin with, use `_stop_and_confirm_workspace_
     empty` instead — the filtered view here would "confirm" success on a stray it could never see
     either way, stop or no stop."""
-    _orca(["terminal", "stop", "--worktree", f"path:{ws}"])
-    time.sleep(1.0)
-    return not _agent_terminals(ws, state)
+    try:
+        _orca(["terminal", "stop", "--worktree", f"path:{ws}"])
+        time.sleep(1.0)
+        terms = _agent_terminals(ws, state)
+    except Exception as exc:
+        print(f"dispatch: terminal stop/confirm failed for {ws} ({exc})")
+        return False
+    return terms == []  # None means the confirmation list was unavailable, not empty
 
 
 def _stop_and_confirm_workspace_empty(ws: str) -> bool:
@@ -542,9 +553,13 @@ def _stop_and_confirm_workspace_empty(ws: str) -> bool:
     returns None, not 0) is NOT a confirmation: the caller must treat it as "could not confirm the
     stop worked" and leave the terminal for the next tick, never log a healthy teardown over a pty
     that may still be live (triggered-agents-445, PR #95 review B1, round 4)."""
-    _orca(["terminal", "stop", "--worktree", f"path:{ws}"])
-    time.sleep(1.0)
-    return _raw_terminal_count(ws) == 0  # None (list failed) != 0 -> not confirmed
+    try:
+        _orca(["terminal", "stop", "--worktree", f"path:{ws}"])
+        time.sleep(1.0)
+        return _raw_terminal_count(ws) == 0  # None (list failed) != 0 -> not confirmed
+    except Exception as exc:
+        print(f"dispatch: terminal stop/confirm failed for {ws} ({exc})")
+        return False
 
 
 def _is_idle(handle: str) -> bool:
@@ -600,6 +615,22 @@ def _reap_ghosts(ws: str) -> tuple[int, bool]:
                     # not-ok so the teardown caller records a failure, not a healthy success.
                     ok = False
                     print(f"dispatch: reap failed to close a tab in {ws} ({e})")
+    if not ok:
+        return closed, False
+    # A successful close RPC is only an acknowledgement, not proof that the tab left Orca's
+    # session store. Re-list before reporting a clean teardown; otherwise an accepted-but-lost
+    # close could let the next curator start beside the same pending tab.
+    try:
+        after = (orca_rpc.call("session.tabs.listAll").get("result") or {}).get("snapshots", []) or []
+    except Exception as e:
+        print(f"dispatch: reap confirmation skipped ({e})")
+        return closed, False
+    for snap in after:
+        if snap.get("worktree", "").split("::", 1)[-1] != ws:
+            continue
+        if any(tab.get("status") != "ready" for tab in snap.get("tabs", []) or []):
+            print(f"dispatch: reap could not confirm all ghost tabs closed in {ws}")
+            return closed, False
     return closed, ok
 
 
@@ -728,6 +759,10 @@ def run(agent: str, variant: str | None = None, cleanup_only: bool = False) -> i
         if reaped:
             print(f"dispatch[{agent}]: reaped {reaped} ghost tab(s)")
         terms = _agent_terminals(ws, state)
+        if terms is None:
+            state.log_run(event, action="terminal-list-failed")
+            print(f"dispatch[{agent}]: terminal list unavailable: deferring lifecycle decision")
+            return 0
 
         if cleanup_only:
             return _cleanup_only(agent, ws, state, event, terms)
