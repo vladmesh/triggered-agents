@@ -18,7 +18,7 @@ os.environ.setdefault("TA_PIPELINE_STATE_DIR", tempfile.mkdtemp(prefix="ta-dispa
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # repo root
 
-from triggered_agents.runtime import dispatch  # noqa: E402
+from triggered_agents.runtime import dispatch, finalizer  # noqa: E402
 from tests._dispatch_fixtures import _DispatchBase  # noqa: E402
 
 
@@ -309,19 +309,19 @@ class FinalizerTest(_DispatchBase):
         self.assertEqual(create_calls, [])
 
     def test_spawn_finalizer_detaches_the_cleanup_helper(self):
-        with mock.patch.object(dispatch.subprocess, "Popen") as popen:
+        with mock.patch.object(finalizer.subprocess, "Popen") as popen:
             rc = dispatch.spawn_finalizer("agent", generation=3)
         self.assertEqual(rc, 0)
         command = popen.call_args.args[0]
         self.assertEqual(command[-5:], ["agent", "dispatch", "--finalize", "--generation", "3"])
         self.assertTrue(popen.call_args.kwargs["start_new_session"])
-        self.assertEqual(popen.call_args.kwargs["stdin"], dispatch.subprocess.DEVNULL)
-        self.assertEqual(popen.call_args.kwargs["stdout"], dispatch.subprocess.DEVNULL)
-        self.assertEqual(popen.call_args.kwargs["stderr"], dispatch.subprocess.DEVNULL)
+        self.assertEqual(popen.call_args.kwargs["stdin"], finalizer.subprocess.DEVNULL)
+        self.assertEqual(popen.call_args.kwargs["stdout"], finalizer.subprocess.DEVNULL)
+        self.assertEqual(popen.call_args.kwargs["stderr"], finalizer.subprocess.DEVNULL)
         self.assertEqual(self._logged_actions(), ["self-teardown-helper-started"])
 
     def test_spawn_finalizer_logs_failure_when_helper_cannot_start(self):
-        with mock.patch.object(dispatch.subprocess, "Popen", side_effect=OSError("no process")):
+        with mock.patch.object(finalizer.subprocess, "Popen", side_effect=OSError("no process")):
             rc = dispatch.spawn_finalizer("agent", generation=3)
         self.assertEqual(rc, 1)
         self.assertEqual(self._logged_actions(), ["self-teardown-helper-failed"])
@@ -343,7 +343,7 @@ class FinalizerTest(_DispatchBase):
             external_helpers.append(lambda: dispatch.finalize("agent", generation=1))
             return mock.Mock()
 
-        with mock.patch.object(dispatch.subprocess, "Popen", side_effect=queue_helper):
+        with mock.patch.object(finalizer.subprocess, "Popen", side_effect=queue_helper):
             dispatch.spawn_finalizer("agent", generation=1)
 
         # The terminal has exited, so nothing in it can run. Its detached child still can.
@@ -566,6 +566,34 @@ class RawListFailureTest(_DispatchBase):
         self.assertEqual(self._logged_actions(), ["cleanup-stray-check-failed"])
 
 
+class TerminalLifecycleFailureTest(_DispatchBase):
+    """A failed terminal RPC defers cleanup/create rather than treating it as an empty list or
+    a completed stop. The next tick owns the retry once Orca answers again."""
+
+    def setUp(self):
+        super().setUp()
+        p = mock.patch.object(dispatch, "_load_spec", lambda agent: {"ephemeral": True})
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_unreadable_filtered_list_defers_without_creating(self):
+        self.terminals = []
+        with mock.patch.object(dispatch, "_orca_json", side_effect=RuntimeError("list unavailable")):
+            dispatch.run("agent")
+        creates = [c for c in self.orca_json_calls if c[:2] == ["terminal", "create"]]
+        self.assertEqual(creates, [])
+        self.assertEqual(self._logged_actions(), ["terminal-list-failed"])
+
+    def test_stop_exception_is_not_a_confirmed_teardown(self):
+        self.terminals = [{"handle": "h1", "title": "✳ Claude Code", "lastOutputAt": 1000}]
+        self.idle = True
+        with mock.patch.object(dispatch, "_orca", side_effect=RuntimeError("stop unavailable")):
+            dispatch.run("agent")
+        creates = [c for c in self.orca_json_calls if c[:2] == ["terminal", "create"]]
+        self.assertEqual(creates, [])
+        self.assertEqual(self._logged_actions(), ["ephemeral-stop-failed"])
+
+
 class ReapGhostsPrimitiveTest(unittest.TestCase):
     """triggered-agents-445, PR #95 review B1 (round 6): `_reap_ghosts` itself must report whether
     every ghost tab actually closed. Standalone (not `_DispatchBase`, which stubs `_reap_ghosts`
@@ -594,6 +622,21 @@ class ReapGhostsPrimitiveTest(unittest.TestCase):
             self.assertEqual(dispatch._reap_ghosts("/ws/agent"), (0, False))
 
     def test_is_ok_when_every_close_succeeds(self):
+        listed = 0
+
+        def fake_rpc(method, params=None):
+            nonlocal listed
+            if method == "session.tabs.listAll":
+                listed += 1
+                return {"result": {"snapshots": [
+                    {"worktree": "env::/ws/agent",
+                     "tabs": ([] if listed > 1 else [{"status": "pending-handle", "parentTabId": "t1"}])}]}}
+            return {"result": {}}
+
+        with mock.patch.object(dispatch.orca_rpc, "call", fake_rpc):
+            self.assertEqual(dispatch._reap_ghosts("/ws/agent"), (1, True))
+
+    def test_close_acknowledgement_without_removal_is_not_ok(self):
         def fake_rpc(method, params=None):
             if method == "session.tabs.listAll":
                 return {"result": {"snapshots": [
@@ -602,7 +645,7 @@ class ReapGhostsPrimitiveTest(unittest.TestCase):
             return {"result": {}}
 
         with mock.patch.object(dispatch.orca_rpc, "call", fake_rpc):
-            self.assertEqual(dispatch._reap_ghosts("/ws/agent"), (1, True))
+            self.assertEqual(dispatch._reap_ghosts("/ws/agent"), (1, False))
 
     def test_is_ok_when_there_are_no_ghost_tabs(self):
         def fake_rpc(method, params=None):
