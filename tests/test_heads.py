@@ -1,11 +1,11 @@
 """Unit tests for triggered_agents.agents.pipeline.heads — the head registry (heads.toml) and its
-command adapters. No I/O beyond reading the real heads.toml (or a tempfile one for the malformed-
-registry cases), no orca, no network.
+command adapters. No orca, no network; filesystem I/O is limited to temp registry/git fixtures.
 """
 from __future__ import annotations
 
 import os
 import shlex
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -237,6 +237,59 @@ class RenderCodexTest(unittest.TestCase):
         conf = parts[parts.index("-c") + 1]
         self.assertEqual(conf,
                          "projects.\"/tmp/work dir/that's \\\"quoted\\\"\".trust_level=\"trusted\"")
+
+    def test_render_launch_codex_tui_trusts_linked_worktree_repo_root(self):
+        tmp = tempfile.TemporaryDirectory(prefix="ta-heads-linked-worktree-")
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name) / "repo"
+        worktree = Path(tmp.name) / "linked"
+        root.mkdir()
+        subprocess.run(["git", "-C", str(root), "init", "-q"], check=True)
+        subprocess.run(["git", "-C", str(root), "config", "user.email", "test@example.invalid"],
+                       check=True)
+        subprocess.run(["git", "-C", str(root), "config", "user.name", "Test"], check=True)
+        (root / "README.md").write_text("fixture\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(root), "add", "README.md"], check=True)
+        subprocess.run(["git", "-C", str(root), "commit", "-q", "-m", "fixture"], check=True)
+        subprocess.run(["git", "-C", str(root), "worktree", "add", "-q", str(worktree), "HEAD"],
+                       check=True)
+
+        launch = heads.render_launch("codex-tui", role="worker", prompt="ping",
+                                     workspace=str(worktree), registry=self.reg)
+        parts = shlex.split(launch.command)
+        configs = [parts[i + 1] for i, part in enumerate(parts[:-1]) if part == "-c"]
+        worktree_key = (
+            f"projects.{heads._toml_basic_string(str(worktree.resolve()))}."
+            "trust_level=\"trusted\""
+        )
+        root_key = (
+            f"projects.{heads._toml_basic_string(str(root.resolve()))}.trust_level=\"trusted\""
+        )
+        self.assertNotEqual(worktree.resolve(), root.resolve())
+        self.assertIn(worktree_key, configs)
+        self.assertIn(root_key, configs)
+        self.assertNotIn("projects.\"*\".trust_level=\"trusted\"", configs)
+
+    def test_render_launch_codex_tui_ignores_non_repo_common_dir(self):
+        tmp = tempfile.TemporaryDirectory(prefix="ta-heads-bad-gitdir-")
+        self.addCleanup(tmp.cleanup)
+        workspace = Path(tmp.name) / "ws"
+        git_dir = Path(tmp.name) / "external-gitdir"
+        outside = Path(tmp.name) / "outside"
+        workspace.mkdir()
+        git_dir.mkdir()
+        outside.mkdir()
+        (workspace / ".git").write_text(f"gitdir: {git_dir}\n", encoding="utf-8")
+        (git_dir / "commondir").write_text(str(outside), encoding="utf-8")
+
+        launch = heads.render_launch("codex-tui", role="worker", prompt="ping",
+                                     workspace=str(workspace), registry=self.reg)
+        self.assertIn(
+            f"projects.{heads._toml_basic_string(str(workspace.resolve()))}."
+            "trust_level=\"trusted\"",
+            launch.command,
+        )
+        self.assertNotIn(str(outside.resolve()), launch.command)
 
     def test_render_launch_codex_tui_requires_workspace(self):
         with self.assertRaisesRegex(heads.HeadRegistryError, "requires workspace"):
