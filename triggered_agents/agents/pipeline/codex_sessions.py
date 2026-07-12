@@ -9,8 +9,8 @@ Two hard rules, both from review 373:
 - A malformed session file (broken UTF-8, JSON that is not an object, non-dict payload)
   is skipped, never raised: this code runs inside every dispatcher tick, and one bad
   .jsonl must not abort the tick for every card. Same tolerant posture as the curator's
-  session_meta reader (agents/curator/discover.py), kept separate because curator and
-  pipeline read different CODEX_HOMEs.
+  session_meta reader (agents/curator/discover.py), kept separate because liveness and
+  transcript harvesting have different filtering and failure semantics.
 - The scan only visits the freshest dated day dirs (sessions/YYYY/MM/DD/...): a watchdog
   poll cares about heads alive right now, and a long-lived CODEX_HOME accumulates years
   of rollouts that a per-tick rglob would keep re-reading.
