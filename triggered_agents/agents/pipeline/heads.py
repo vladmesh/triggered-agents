@@ -24,15 +24,13 @@ from ...runtime import role_env
 
 HEADS_TOML = Path(__file__).with_name("heads.toml")
 
-# The CODEX_HOME a codex head runs under: a dedicated, pipeline-owned home holding codex' ChatGPT
-# login (auth.json), the memory MCP server, and the global AGENTS.md (style/git rules + the
-# memory_search mandate). Deliberately NOT Orca's codex-runtime home — that one regenerates
-# config.toml on every session start and silently drops the [mcp_servers.*] entry, so the memory
-# tool would vanish; this dedicated home is stable across sessions (verified: mcp_servers survives
-# codex' own trust-write). Pinned explicitly (not left to terminal-env inheritance) so the probe
-# process — a plain `pipeline probe` subprocess, not an orca-spawned terminal — hits the same home.
-# Env-overridable so an e2e can point at a throwaway home. health.probe_openai_sub imports this.
-CODEX_HOME = os.environ.get("TA_CODEX_HOME", "/home/dev/.codex-pipeline")
+# The CODEX_HOME shared by Orca-managed Codex sessions and pipeline heads. One physical home keeps
+# auth refresh, MCP, skills, hooks, and quota probes on the same state. Pinned explicitly because
+# the health probe is a plain subprocess rather than an Orca terminal. Env-overridable so tests can
+# use a throwaway home.
+CODEX_HOME = os.environ.get(
+    "TA_CODEX_HOME", "/home/dev/.config/orca/codex-runtime-home/home"
+)
 
 # The profile a card gets when it names no head at all. New work defaults to Codex; legacy cards
 # with explicit claude-* metadata keep using that exact profile until a PO updates them.

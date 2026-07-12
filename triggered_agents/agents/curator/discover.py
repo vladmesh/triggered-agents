@@ -31,8 +31,7 @@ HERMES_HOME = Path(os.environ.get("TA_HERMES_HOME_DIR", str(Path.home() / ".herm
 HERMES_STATE_DB = HERMES_HOME / "state.db"
 HERMES_MEMORY_DIR = HERMES_HOME / "memories"
 
-# Orca-managed Codex home. Pipeline-Codex uses /home/dev/.codex-pipeline, but
-# interactive Orca-Codex heads write transcripts under this managed runtime home.
+# Orca-managed Codex home shared by interactive Orca heads and pipeline Codex heads.
 # Overridable in tests for the same reason as CLAUDE_PROJECTS/HERMES_HOME.
 CODEX_SESSIONS = Path(os.environ.get(
     "TA_CODEX_SESSIONS_DIR",
