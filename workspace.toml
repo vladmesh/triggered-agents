@@ -22,6 +22,8 @@ install = []
 commands = []
 
 [smoke]
-# Юниты — stdlib unittest, без сети и Orca; быстрые, поэтому и есть smoke.
-command = "python3 -m unittest discover -s tests"
+# Юниты — stdlib unittest, без сети и Orca. Production может задавать
+# TA_CODEX_MODE=tui через systemd env; тесты режима сами выставляют его явно и
+# не должны превращать остальные mock-based spawn tests в реальные TUI launches.
+command = "env -u TA_CODEX_MODE python3 -m unittest discover -s tests"
 timeout_seconds = 120
