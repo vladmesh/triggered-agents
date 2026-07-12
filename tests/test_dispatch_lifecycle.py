@@ -278,6 +278,9 @@ class FinalizerTest(_DispatchBase):
         dispatch.run("agent")
         command = self._created_command()
         self.assertIn("dispatch --finalize", command)
+        # the trailer carries the terminal's generation identity (review B2, round 4): first
+        # create of this agent in a fresh state dir is generation 1.
+        self.assertIn("--finalize --generation 1", command)
         # `;`, not `&&` -- the trailer must run regardless of the head's own exit code
         self.assertIn("; ", command)
         self.assertLess(command.index("claude"), command.index("dispatch --finalize"))
@@ -321,10 +324,12 @@ class FinalizerTest(_DispatchBase):
         self.assertEqual(self.orca_calls, [])
         self.assertEqual(self._logged_actions(), [])
 
-    def test_finalize_backs_off_on_lock_contention_instead_of_racing_a_live_tick(self):
-        """A concurrent dispatch.run() already holding the lock is already handling this
-        workspace's own teardown/create -- finalize must not also stop it, which could kill a
-        replacement terminal that tick just created moments earlier."""
+    def test_finalize_defers_when_a_live_tick_holds_the_lock_for_the_whole_window(self):
+        """triggered-agents-445, PR #95 review B2, round 4: a tick wedged on the lock for the whole
+        bounded retry window means it is itself actively working this workspace -- finalize must NOT
+        stop anything (a blanket stop could kill a replacement that tick created) and must hand off
+        cleanly rather than raise. `time.sleep` is a no-op in the fixture, so the retry loop runs
+        instantly and lands on the deferred branch."""
         import os
 
         state = dispatch.AgentState("agent")
@@ -333,11 +338,54 @@ class FinalizerTest(_DispatchBase):
         os.write(fd, b"12345")
         os.close(fd)
         try:
-            with self.assertRaises(SystemExit):
-                dispatch.finalize("agent")
+            rc = dispatch.finalize("agent")  # no SystemExit: deferred, not abandoned
         finally:
             state.lockfile.unlink()
+        self.assertEqual(rc, 0)
         self.assertEqual(self.orca_calls, [])
+        self.assertEqual(self._logged_actions(), ["self-teardown-deferred"])
+
+    def test_finalize_supersedes_without_stopping_a_replacement(self):
+        """The core B2 fix: a late finalizer carrying an OLD generation, arriving after a concurrent
+        tick already replaced this agent's terminal (a newer generation is now recorded), must never
+        blanket-stop the workspace -- that would kill the live replacement. It only reaps its own
+        ghost tab."""
+        state = dispatch.AgentState("agent")
+        state.save_terminal_handle("replacement", created_at=time.time(), generation=5)
+        self.terminals = [{"handle": "replacement", "title": "triggered-agent:agent", "lastOutputAt": 1}]
+        reap_calls = []
+        with mock.patch.object(dispatch, "_reap_ghosts", lambda ws: reap_calls.append(ws) or 0):
+            dispatch.finalize("agent", generation=4)
+        stop_calls = [c for c in self.orca_calls if c[:2] == ["terminal", "stop"]]
+        self.assertEqual(stop_calls, [])                  # replacement never stopped
+        self.assertEqual(self.terminals, [{"handle": "replacement",
+                                           "title": "triggered-agent:agent", "lastOutputAt": 1}])
+        self.assertEqual(reap_calls, ["/ws/agent"])       # own ghost still reaped
+        self.assertEqual(self._logged_actions(), ["self-teardown-superseded"])
+
+    def test_finalize_stops_when_its_generation_is_still_current(self):
+        """The complement: when the workspace's live terminal is still this finalizer's own
+        generation, it does tear it down."""
+        state = dispatch.AgentState("agent")
+        state.save_terminal_handle("h1", created_at=time.time(), generation=7)
+        self.terminals = [{"handle": "h1", "title": "triggered-agent:agent", "lastOutputAt": 1}]
+        with mock.patch.object(dispatch, "_reap_ghosts", lambda ws: 0):
+            dispatch.finalize("agent", generation=7)
+        stop_calls = [c for c in self.orca_calls if c[:2] == ["terminal", "stop"]]
+        self.assertEqual(len(stop_calls), 1)
+        self.assertEqual(self._logged_actions(), ["self-teardown"])
+
+    def test_finalize_reports_failure_when_raw_list_is_unavailable(self):
+        """triggered-agents-445, PR #95 review B1, round 4: if the confirm re-list itself fails
+        (`_raw_terminal_count` returns None, not 0), finalize must log a failure and let the next
+        tick retry -- never a healthy self-teardown over a pty that may still be live."""
+        state = dispatch.AgentState("agent")
+        state.save_terminal_handle("h1", created_at=time.time(), generation=1)
+        self.terminals = [{"handle": "h1", "title": "triggered-agent:agent", "lastOutputAt": 1}]
+        with mock.patch.object(dispatch, "_raw_terminal_count", lambda ws: None), \
+             mock.patch.object(dispatch, "_reap_ghosts", lambda ws: 0):
+            dispatch.finalize("agent", generation=1)
+        self.assertEqual(self._logged_actions(), ["self-teardown-failed"])
 
 
 class CleanupOnlyTest(_DispatchBase):
@@ -401,6 +449,52 @@ class CleanupOnlyTest(_DispatchBase):
         self.assertEqual(self.orca_calls, [])
         self.assertEqual(self.orca_json_calls, [])
         self.assertEqual(self._logged_actions(), [])
+
+
+class RawListFailureTest(_DispatchBase):
+    """triggered-agents-445, PR #95 review B1 (round 4): a failed or timed-out `terminal list` must
+    read as "unknown", never as "zero terminals". `_raw_terminal_count` returns None on failure;
+    every confirmation/decision path treats None distinctly from 0 so an Orca hiccup can't confirm a
+    teardown that didn't happen or declare a workspace clean it couldn't actually read."""
+
+    def setUp(self):
+        super().setUp()
+        p = mock.patch.object(dispatch, "_load_spec", lambda agent: {"ephemeral": True})
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_raw_terminal_count_returns_none_on_list_error(self):
+        def boom(args):
+            raise RuntimeError("orca unreachable")
+
+        with mock.patch.object(dispatch, "_orca_json", boom):
+            self.assertIsNone(dispatch._raw_terminal_count("/ws/agent"))
+
+    def test_stop_and_confirm_workspace_empty_is_false_when_list_unknown(self):
+        with mock.patch.object(dispatch, "_raw_terminal_count", lambda ws: None), \
+             mock.patch.object(dispatch, "_orca", lambda args: None):
+            self.assertFalse(dispatch._stop_and_confirm_workspace_empty("/ws/agent"))
+
+    def test_stop_and_confirm_workspace_empty_true_only_on_real_zero(self):
+        with mock.patch.object(dispatch, "_raw_terminal_count", lambda ws: 0), \
+             mock.patch.object(dispatch, "_orca", lambda args: None):
+            self.assertTrue(dispatch._stop_and_confirm_workspace_empty("/ws/agent"))
+
+    def test_create_branch_bails_when_raw_count_unknown(self):
+        """`_agent_terminals` recognized nothing, but the raw list failed -- can't rule out a stray,
+        so don't pile a fresh session on top of a workspace we couldn't read."""
+        self.terminals = []
+        with mock.patch.object(dispatch, "_raw_terminal_count", lambda ws: None):
+            dispatch.run("agent")
+        create_calls = [c for c in self.orca_json_calls if c[:2] == ["terminal", "create"]]
+        self.assertEqual(create_calls, [])
+        self.assertEqual(self._logged_actions(), ["stray-check-failed"])
+
+    def test_cleanup_only_bails_when_raw_count_unknown(self):
+        self.terminals = []
+        with mock.patch.object(dispatch, "_raw_terminal_count", lambda ws: None):
+            dispatch.run("agent", cleanup_only=True)
+        self.assertEqual(self._logged_actions(), ["cleanup-stray-check-failed"])
 
 
 class EphemeralTwoTickLifecycleTest(unittest.TestCase):
@@ -535,9 +629,10 @@ class EphemeralTwoTickLifecycleTest(unittest.TestCase):
         self.assertEqual(list(self.live), [handle])
         self.assertEqual(self.tabs, {handle: "ready"})
 
-        # the head process exits; its own launch command's trailer runs finalize() -- no
-        # dispatch.run() tick is involved at all
-        dispatch.finalize("curator")
+        # the head process exits; its own launch command's trailer runs finalize() with the
+        # generation the trailer carries (the first create is generation 1) -- no dispatch.run()
+        # tick is involved at all
+        dispatch.finalize("curator", generation=1)
 
         self.assertEqual(self.live, {})
         self.assertEqual(self.tabs, {})
@@ -567,6 +662,147 @@ class EphemeralTwoTickLifecycleTest(unittest.TestCase):
         self.assertEqual(self.tabs, {})
         self.assertEqual(len(self.created_handles), 2)  # no third session was spawned
         self.assertEqual(self._actions(), ["created", "ephemeral-restart", "cleanup-teardown"])
+
+
+class EphemeralSessionIdentityTest(unittest.TestCase):
+    """triggered-agents-445, PR #95 review B3 (round 4): the acceptance criterion is stronger than
+    "two ticks used different fake terminal handles". It requires two sequential curator runs to use
+    DISTINCT provider/session identifiers, NO context marker from the first run to reach the second,
+    and ZERO terminals/tabs after EACH completion — not just eventually.
+
+    This models an in-memory Orca that mints a fresh provider session id and an empty context store
+    on every `terminal create`, and a head that stamps a marker into its own session's context. The
+    only path that could carry a marker forward is warm reuse (`terminal send` a `/clear` into the
+    SAME terminal/session), which an ephemeral agent must never take — so proving the session ids
+    differ, the second session's context never contains the first's marker, and `terminal send`
+    never fired is the criterion itself, not a proxy. Each run's completion is driven by the head's
+    own `finalize` trailer (with the generation that trailer carries), and the workspace is asserted
+    empty after each one."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self._state_patch = mock.patch("triggered_agents.runtime.state.STATE_ROOT", Path(self.tmp.name))
+        self._state_patch.start()
+        self.addCleanup(self._state_patch.stop)
+
+        self.ws = "/ws/curator"
+        self.idle = True
+        self._seq = 0
+        self.live: dict[str, dict] = {}          # handle -> terminal dict
+        self.tabs: dict[str, str] = {}           # handle -> "ready" | "pending-handle"
+        self.session_of: dict[str, str] = {}     # handle -> provider session id
+        self.context: dict[str, set] = {}        # session id -> markers the head wrote into it
+        self.sent_texts: list[tuple[str, str]] = []
+        self.created_handles: list[str] = []
+
+        for target, repl in [
+            ("_load_spec", lambda agent: {"ephemeral": True}),
+            ("_launch_cmd", lambda agent, variant=None: ("/curate", "claude ... /curate", "fake-profile")),
+            ("_workspace", lambda agent: self.ws),
+            ("_ensure_claude_ready", lambda ws: None),
+        ]:
+            p = mock.patch.object(dispatch, target, repl)
+            p.start()
+            self.addCleanup(p.stop)
+        p = mock.patch("time.sleep", lambda s: None)
+        p.start()
+        self.addCleanup(p.stop)
+
+        def fake_orca_json(args):
+            if args[:2] == ["terminal", "list"]:
+                return {"terminals": list(self.live.values())}
+            if args[:2] == ["terminal", "wait"]:
+                return {"wait": {"satisfied": self.idle}}
+            if args[:2] == ["terminal", "create"]:
+                # a fresh process => a brand new provider session with an empty context store,
+                # exactly what launching `claude` anew (never `/clear`-reusing) gives you
+                self._seq += 1
+                handle = f"term-{self._seq}"
+                session = f"sess-{self._seq}"
+                self.live[handle] = {"handle": handle, "title": "triggered-agent:curator", "lastOutputAt": 1000}
+                self.tabs[handle] = "ready"
+                self.session_of[handle] = session
+                self.context[session] = set()
+                self.created_handles.append(handle)
+                return {"terminal": self.live[handle]}
+            return {}
+
+        p = mock.patch.object(dispatch, "_orca_json", fake_orca_json)
+        p.start()
+        self.addCleanup(p.stop)
+
+        def fake_orca(args):
+            if args[:2] == ["terminal", "stop"]:
+                for handle in list(self.live.keys()):
+                    del self.live[handle]
+                    self.tabs[handle] = "pending-handle"
+            elif args[:2] == ["terminal", "send"]:
+                handle = args[args.index("--terminal") + 1]
+                text = args[args.index("--text") + 1]
+                self.sent_texts.append((handle, text))
+                # model warm reuse honestly: a `/clear` into a live terminal keeps its provider
+                # session (and thus its identity) -- only wipes the visible transcript. If the
+                # ephemeral path ever regressed into reuse, the session id would repeat and this
+                # test's distinct-id assertion would catch it.
+
+        p = mock.patch.object(dispatch, "_orca", fake_orca)
+        p.start()
+        self.addCleanup(p.stop)
+
+        def fake_reap_ghosts(ws):
+            closed = 0
+            for handle, status in list(self.tabs.items()):
+                if status != "ready":
+                    del self.tabs[handle]
+                    closed += 1
+            return closed
+
+        p = mock.patch.object(dispatch, "_reap_ghosts", fake_reap_ghosts)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def _run_and_stamp_marker(self):
+        """One curator run: dispatch creates the terminal, then simulate the head stamping a marker
+        into its own provider session's context. Returns (session_id, marker)."""
+        dispatch.run("curator")
+        handle = self.created_handles[-1]
+        session = self.session_of[handle]
+        marker = f"context-marker-{session}"
+        self.context[session].add(marker)
+        return session, marker
+
+    def test_two_runs_use_distinct_sessions_with_no_marker_transfer_and_zero_after_each(self):
+        # --- run 1 ---
+        session1, marker1 = self._run_and_stamp_marker()
+        self.assertEqual(len(self.live), 1)
+        self.assertEqual(list(self.tabs.values()), ["ready"])
+
+        # head 1 exits -> its own trailer runs finalize with the generation it carries (gen 1)
+        dispatch.finalize("curator", generation=1)
+        self.assertEqual(self.live, {})   # zero terminals after the FIRST completion
+        self.assertEqual(self.tabs, {})   # zero tabs after the FIRST completion
+
+        # --- run 2 ---
+        session2, marker2 = self._run_and_stamp_marker()
+        self.assertEqual(len(self.live), 1)
+        self.assertEqual(list(self.tabs.values()), ["ready"])
+
+        # head 2 exits -> finalize with gen 2
+        dispatch.finalize("curator", generation=2)
+        self.assertEqual(self.live, {})   # zero terminals after the SECOND completion
+        self.assertEqual(self.tabs, {})   # zero tabs after the SECOND completion
+
+        # distinct provider/session identifiers
+        self.assertNotEqual(session1, session2)
+
+        # no context marker from run 1 ever reached run 2's session
+        self.assertNotIn(marker1, self.context[session2])
+        self.assertEqual(self.context[session2], {marker2})
+
+        # the skill only ever arrived via `terminal create --command`; nothing was ever sent into a
+        # reused terminal, so there was no `/clear`-and-reuse that could carry context forward
+        self.assertEqual(self.sent_texts, [])
 
 
 if __name__ == "__main__":

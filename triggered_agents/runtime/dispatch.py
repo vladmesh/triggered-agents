@@ -118,6 +118,14 @@ ORCA_TIMEOUT_S = 20         # never let a hung orca call wedge dispatch while it
 # spawned". Generous relative to the lag this guards against (Orca registering a brand new pty),
 # tiny relative to any real tick cadence (hourly + jitter).
 CREATE_VISIBILITY_GRACE_S = 60
+# `finalize` (an ephemeral head's own self-teardown trailer) retries the run lock this many times,
+# sleeping this long between attempts, before deferring to the next tick (triggered-agents-445,
+# PR #95 review B2, round 4). A live dispatch tick holds the lock only for the length of its own
+# Orca calls, so a short bounded wait lets the finalizer clean up its own completed terminal
+# instead of abandoning it the instant it sees contention — while a tick genuinely wedged on the
+# lock still hands teardown off rather than spinning forever.
+FINALIZE_LOCK_ATTEMPTS = 4
+FINALIZE_LOCK_RETRY_S = 2.0
 
 
 def _orca_json(args: list[str]) -> dict:
@@ -335,7 +343,7 @@ def _agent_terminals(ws: str, state: AgentState | None = None) -> list[dict]:
     ]
 
 
-def _raw_terminal_count(ws: str) -> int:
+def _raw_terminal_count(ws: str) -> int | None:
     """Every live terminal Orca reports for `ws`, unfiltered by title/handle — unlike
     `_agent_terminals`, this also counts a stray terminal the recognition filter would otherwise
     miss entirely: an orphan stuck on the shell's default title from a past incident (found live
@@ -343,36 +351,54 @@ def _raw_terminal_count(ws: str) -> int:
     simply predates this agent's `triggered-agent:<name>` title convention. An ephemeral agent's
     "no terminal" branch and `_cleanup_only` both need this to actually converge accumulated live
     orphans to zero instead of quietly creating a new terminal alongside one they can't see
-    (triggered-agents-445, PR #95 review B3). Best-effort: an Orca hiccup here should not block
-    the tick, so it reads as "nothing to sweep" rather than raising."""
+    (triggered-agents-445, PR #95 review B3).
+
+    Returns None — "unknown", NOT zero — when the list call itself fails or times out
+    (triggered-agents-445, PR #95 review B1, round 4). A confirmation path
+    (`_stop_and_confirm_workspace_empty`) must never read an Orca hiccup as "confirmed empty" and
+    log a healthy teardown over a terminal/tab that is actually still there; a pre-create/cleanup
+    check must not create on top of, or declare clean, a workspace whose real contents it couldn't
+    read. Every caller distinguishes the three cases (0 / >0 / None) explicitly."""
     try:
         return len(_orca_json(["terminal", "list", "--worktree", f"path:{ws}", "--limit", "50"])
                    .get("terminals", []) or [])
     except (RuntimeError, subprocess.TimeoutExpired):
-        return 0
+        return None
 
 
-def _with_finalizer(agent: str, launch: str) -> str:
+def _with_finalizer(agent: str, launch: str, generation: int) -> str:
     """Append a self-teardown trailer to `launch` for an ephemeral agent (triggered-agents-445,
     PR #95 review B1, round 3): `<head command>; <finalizer>` ties cleanup to the moment the head
     process itself exits — success, error, or any exit that still lets the shell reach the next
     statement — rather than only ever being noticed by some future tick's poll. Plain `;` (not
     `&&`) so the finalizer always runs regardless of the head's own exit code. Every dispatch.run()
     cleanup path (watchdog, cleanup-only, stray-sweep) remains the necessary backstop for a
-    terminal that never reaches its own trailer at all (a hard kill, host reboot, Orca restart)."""
-    finalizer = role_env.wrap_shell_command(agent, f"python3 -m triggered_agents {agent} dispatch --finalize")
+    terminal that never reaches its own trailer at all (a hard kill, host reboot, Orca restart).
+
+    `--generation <n>` carries this terminal's identity (round 4, review B2): the finalizer that
+    fires when this exact terminal's head exits must be able to tell whether the workspace's live
+    terminal is still its own or a replacement a concurrent tick created, so it never blanket-stops
+    a fresh replacement out from under that tick."""
+    finalizer = role_env.wrap_shell_command(
+        agent, f"python3 -m triggered_agents {agent} dispatch --finalize --generation {generation}")
     return f"{launch}; {finalizer}"
 
 
 def _create_terminal(agent: str, ws: str, launch: str, state: AgentState, profile: str | None) -> None:
+    generation = None
     if _is_ephemeral(agent):
-        launch = _with_finalizer(agent, launch)
+        # Stamp a fresh monotonic generation and bake it into the terminal's own self-teardown
+        # trailer, so a finalizer firing after this terminal's head exits can prove the workspace's
+        # current terminal is still this one before stopping it (review B2, round 4).
+        generation = state.next_terminal_generation()
+        launch = _with_finalizer(agent, launch, generation)
     data = _orca_json(["terminal", "create", "--worktree", f"path:{ws}",
                        "--title", f"triggered-agent:{agent}", "--command", launch])
     term = data.get("terminal", data)
     # created_at only here (never on a plain warm-reuse re-save): see save_terminal_handle's own
     # docstring and the "no terminal" branch's visibility-gap guard below.
-    state.save_terminal_handle(term.get("handle") or term.get("id"), created_at=time.time())
+    state.save_terminal_handle(term.get("handle") or term.get("id"), created_at=time.time(),
+                               generation=generation)
     state.save_head_profile(profile)
 
 
@@ -400,10 +426,15 @@ def _stop_and_confirm_workspace_empty(ws: str) -> bool:
     (`_raw_terminal_count`) that the workspace is truly empty — for the stray-sweep paths only
     (triggered-agents-445, PR #95 review B3, round 2). `_stop_and_confirm`'s own re-check goes
     through `_agent_terminals`'s title/handle recognition filter, which would trivially read as
-    "confirmed empty" for a stray it could never recognize in the first place, stopped or not."""
+    "confirmed empty" for a stray it could never recognize in the first place, stopped or not.
+
+    Only True when the raw list came back AND was empty. A list failure (`_raw_terminal_count`
+    returns None, not 0) is NOT a confirmation: the caller must treat it as "could not confirm the
+    stop worked" and leave the terminal for the next tick, never log a healthy teardown over a pty
+    that may still be live (triggered-agents-445, PR #95 review B1, round 4)."""
     _orca(["terminal", "stop", "--worktree", f"path:{ws}"])
     time.sleep(1.0)
-    return _raw_terminal_count(ws) == 0
+    return _raw_terminal_count(ws) == 0  # None (list failed) != 0 -> not confirmed
 
 
 def _is_idle(handle: str) -> bool:
@@ -467,7 +498,16 @@ def _cleanup_only(agent: str, ws: str, state: AgentState, event: str, terms: lis
         # recognized as this agent's own (review B3) -- sweep the whole workspace so accumulated
         # live orphans actually converge to zero on a no-work tick instead of surviving every
         # "nothing recognized" cleanup forever.
-        if _raw_terminal_count(ws) > 0:
+        raw = _raw_terminal_count(ws)
+        if raw is None:
+            # The raw list itself failed (round 4, review B1): "unknown", not "zero". Declaring the
+            # workspace clean off an Orca hiccup would log a healthy no-op over a stray that is
+            # actually still live -- leave it for the next tick to re-check.
+            state.log_run(event, action="cleanup-stray-check-failed")
+            print(f"dispatch[{agent}]: cleanup — terminal list unavailable, cannot confirm the "
+                  "workspace is clear; leaving it for the next tick")
+            return 0
+        if raw > 0:
             if not _stop_and_confirm_workspace_empty(ws):
                 state.log_run(event, action="cleanup-stray-sweep-failed")
                 print(f"dispatch[{agent}]: cleanup could not confirm the workspace is clear of "
@@ -563,18 +603,28 @@ def run(agent: str, variant: str | None = None, cleanup_only: bool = False) -> i
                 print(f"dispatch[{agent}]: no terminal visible yet but one was created "
                       f"{time.time() - last_created:.1f}s ago — skipping to avoid a duplicate")
                 return 0
-            if _is_ephemeral(agent) and _raw_terminal_count(ws) > 0:
-                # `_agent_terminals` recognized nothing, but Orca still lists a live terminal in
-                # this workspace -- a stray it can't match by title/handle (an orphan from a past
-                # incident, review B3). An ephemeral workspace's whole point is converging to at
-                # most one terminal, so sweep it before creating rather than piling a fresh
-                # session on top of an orphan that would otherwise run forever.
-                if not _stop_and_confirm_workspace_empty(ws):
-                    state.log_run(event, action="stray-sweep-failed")
-                    print(f"dispatch[{agent}]: could not confirm the workspace is clear of stray "
-                          "terminals before creating — leaving it for the next tick")
+            if _is_ephemeral(agent):
+                raw = _raw_terminal_count(ws)
+                if raw is None:
+                    # The raw list itself failed (round 4, review B1): "unknown", not "zero". We
+                    # can't rule out a stray we'd be piling a fresh session on top of, so don't
+                    # create this tick -- the next one retries once Orca answers again.
+                    state.log_run(event, action="stray-check-failed")
+                    print(f"dispatch[{agent}]: terminal list unavailable — skipping create to "
+                          "avoid piling a fresh session on a possible stray")
                     return 0
-                _reap_ghosts(ws)
+                if raw > 0:
+                    # `_agent_terminals` recognized nothing, but Orca still lists a live terminal in
+                    # this workspace -- a stray it can't match by title/handle (an orphan from a
+                    # past incident, review B3). An ephemeral workspace's whole point is converging
+                    # to at most one terminal, so sweep it before creating rather than piling a
+                    # fresh session on top of an orphan that would otherwise run forever.
+                    if not _stop_and_confirm_workspace_empty(ws):
+                        state.log_run(event, action="stray-sweep-failed")
+                        print(f"dispatch[{agent}]: could not confirm the workspace is clear of "
+                              "stray terminals before creating — leaving it for the next tick")
+                        return 0
+                    _reap_ghosts(ws)
             skill, launch, profile = _dispatch_command(agent, variant)
             _ensure_claude_ready(ws)
             _create_terminal(agent, ws, launch, state, profile)
@@ -660,23 +710,59 @@ def run(agent: str, variant: str | None = None, cleanup_only: bool = False) -> i
         return 0
 
 
-def finalize(agent: str) -> int:
-    """Self-teardown for an ephemeral agent's own terminal — the other half of `_with_finalizer`.
-    `_create_terminal` appends `python3 -m triggered_agents <agent> dispatch --finalize` as a `;`
-    trailer to the head's own launch command, so this runs inside the SAME terminal the head just
-    occupied, the instant the head process exits (triggered-agents-445, PR #95 review B1, round
-    3): teardown is now tied to the completion event itself, not just noticed eventually by a
-    future tick's poll. `dispatch.run`'s cleanup-only/watchdog/stray-sweep paths remain the
-    necessary backstop for a terminal that never reaches its own trailer at all (a hard kill, host
-    reboot, Orca restart) — this function only ever handles the common case: a head that ran to
-    completion, successfully or not.
+def _finalize_locked(agent: str, ws: str, state: AgentState, generation: int | None) -> int:
+    """The teardown body of `finalize`, run while holding `state.lock()`.
 
-    Takes `state.lock()` itself, exactly like `run()`: without it, this self-referential stop
-    (`terminal stop --worktree`, which kills EVERY live terminal in the workspace, not just this
-    one) could race a concurrent dispatch tick's own teardown-then-create sequence and kill a
-    brand new replacement terminal moments after that tick created it. Lock contention here means
-    a real tick is already handling this workspace, so this call backs off (state.lock() raises)
-    rather than doing anything — nothing is lost, the same eventual-cleanup backstop still applies.
+    Generation identity is what makes a self-referential `terminal stop --worktree` (it kills EVERY
+    live terminal in the workspace) safe here even if this finalizer only won the lock AFTER a
+    concurrent tick already replaced its terminal (triggered-agents-445, PR #95 review B2, round
+    4). The trailer carries the generation of the terminal it belongs to; `load_terminal_generation`
+    is the generation of the workspace's CURRENT terminal:
+
+      * they differ  -> a newer run already superseded this one (its ephemeral-restart stopped this
+        terminal and created the replacement). Never stop — that would kill the live replacement;
+        only reap any ghost tab this terminal's own exit left behind (a 'ready' replacement tab is
+        never reaped).
+      * they match, or no generation is known (a legacy trailer) -> the live terminal is still this
+        one. Under the lock no concurrent create can be in flight, so a blanket stop can only hit
+        this terminal (plus any stray), confirmed via the unfiltered raw count (review B1)."""
+    live_generation = state.load_terminal_generation()
+    if generation is not None and live_generation is not None and live_generation != generation:
+        reaped = _reap_ghosts(ws)
+        state.log_run("finalize", action="self-teardown-superseded", generation=generation)
+        print(f"dispatch[{agent}]: finalize — terminal already superseded by a newer run"
+              f"{f'; reaped {reaped} ghost(s)' if reaped else ''}")
+        return 0
+    if _stop_and_confirm_workspace_empty(ws):
+        _reap_ghosts(ws)
+        state.save_terminal_handle(None)  # the terminal is gone; drop the stale handle record
+        state.log_run("finalize", action="self-teardown", generation=generation)
+        print(f"dispatch[{agent}]: finalize — self-torn-down after head exit")
+    else:
+        state.log_run("finalize", action="self-teardown-failed", generation=generation)
+        print(f"dispatch[{agent}]: finalize — could not confirm self-teardown; next tick will retry")
+    return 0
+
+
+def finalize(agent: str, generation: int | None = None) -> int:
+    """Self-teardown for an ephemeral agent's own terminal — the other half of `_with_finalizer`.
+    `_create_terminal` appends `python3 -m triggered_agents <agent> dispatch --finalize
+    --generation <n>` as a `;` trailer to the head's own launch command, so this runs inside the
+    SAME terminal the head just occupied, the instant the head process exits (triggered-agents-445,
+    PR #95 review B1, round 3): teardown is now tied to the completion event itself, not just
+    noticed eventually by a future tick's poll. `dispatch.run`'s cleanup-only/watchdog/stray-sweep
+    paths remain the necessary backstop for a terminal that never reaches its own trailer at all (a
+    hard kill, host reboot, Orca restart) — this function only ever handles the common case: a head
+    that ran to completion, successfully or not.
+
+    Takes `state.lock()`, exactly like `run()`, because the teardown stops the whole workspace. On
+    contention it no longer abandons cleanup outright (round 4, review B2): a live tick holds the
+    lock only for the span of its own Orca calls, so `finalize` retries a bounded number of times
+    before deferring. That retry is safe only because the teardown itself is generation-guarded
+    (`_finalize_locked`): even if this finalizer wins the lock right after a concurrent tick already
+    replaced its terminal, it recognizes the newer generation and reaps instead of stopping, so it
+    never kills the fresh replacement. If a tick stays wedged on the lock for the whole window,
+    `finalize` logs `self-teardown-deferred` and lets that tick (or the next one) finish the job.
 
     A no-op for a non-ephemeral agent: `_create_terminal` only ever appends this trailer when
     `_is_ephemeral(agent)`, so retro/steward should never reach here, but staying a no-op keeps it
@@ -686,12 +772,18 @@ def finalize(agent: str) -> int:
         return 0
     ws = _workspace(agent)
     state = AgentState(agent)
-    with state.lock():
-        if _stop_and_confirm_workspace_empty(ws):
-            _reap_ghosts(ws)
-            state.log_run("finalize", action="self-teardown")
-            print(f"dispatch[{agent}]: finalize — self-torn-down after head exit")
-        else:
-            state.log_run("finalize", action="self-teardown-failed")
-            print(f"dispatch[{agent}]: finalize — could not confirm self-teardown; next tick will retry")
+    for attempt in range(FINALIZE_LOCK_ATTEMPTS):
+        try:
+            with state.lock():
+                return _finalize_locked(agent, ws, state, generation)
+        except SystemExit:
+            # state.lock() raises SystemExit when another run holds the lock. Retry within the
+            # bounded window; only give up (and hand off to that tick / the next one) once it's
+            # exhausted, so a brief overlap doesn't strand this terminal's teardown.
+            if attempt + 1 >= FINALIZE_LOCK_ATTEMPTS:
+                state.log_run("finalize", action="self-teardown-deferred", generation=generation)
+                print(f"dispatch[{agent}]: finalize deferred — a live tick holds the lock; it or "
+                      "the next tick will tear this terminal down")
+                return 0
+            time.sleep(FINALIZE_LOCK_RETRY_S)
     return 0

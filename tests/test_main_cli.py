@@ -90,7 +90,8 @@ class FinalizeArgvRoutingTest(unittest.TestCase):
     def setUp(self):
         self.finalize_calls = []
         self.run_calls = []
-        p = mock.patch.object(dispatch, "finalize", lambda agent: self.finalize_calls.append(agent) or 0)
+        p = mock.patch.object(dispatch, "finalize",
+                              lambda agent, generation=None: self.finalize_calls.append((agent, generation)) or 0)
         p.start()
         self.addCleanup(p.stop)
         p = mock.patch.object(dispatch, "run", lambda *a, **kw: self.run_calls.append((a, kw)) or 0)
@@ -99,7 +100,15 @@ class FinalizeArgvRoutingTest(unittest.TestCase):
 
     def test_finalize_flag_routes_to_dispatch_finalize_not_run(self):
         ta_main.main(["curator", "dispatch", "--finalize"])
-        self.assertEqual(self.finalize_calls, ["curator"])
+        self.assertEqual(self.finalize_calls, [("curator", None)])
+        self.assertEqual(self.run_calls, [])
+
+    def test_finalize_generation_is_parsed_and_passed_through(self):
+        """The self-teardown trailer carries `--generation <n>` (review B2, round 4); the CLI must
+        parse it as an int and hand it to `dispatch.finalize` so the finalizer can tell its own
+        terminal apart from a replacement."""
+        ta_main.main(["curator", "dispatch", "--finalize", "--generation", "7"])
+        self.assertEqual(self.finalize_calls, [("curator", 7)])
         self.assertEqual(self.run_calls, [])
 
     def test_plain_dispatch_still_routes_to_run_not_finalize(self):

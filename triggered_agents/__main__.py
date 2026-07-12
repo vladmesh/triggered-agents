@@ -35,6 +35,14 @@ def main(argv=None) -> int:
         dispatch_args = rest[1:]
         cleanup_only = "--cleanup-only" in dispatch_args
         finalize = "--finalize" in dispatch_args
+        generation = None
+        if "--generation" in dispatch_args:
+            gi = dispatch_args.index("--generation")
+            if gi + 1 < len(dispatch_args):
+                try:
+                    generation = int(dispatch_args[gi + 1])
+                except ValueError:
+                    generation = None
         if agent == "pipeline":
             # ta-gate.sh (triggered-agents-445) now sends `--cleanup-only` to EVERY agent on a
             # precheck skip, pipeline included. The dispatcher has no terminal/PTY lifecycle at
@@ -54,8 +62,9 @@ def main(argv=None) -> int:
             # command (triggered-agents-445, PR #95 review B1, round 3) -- runs inside the very
             # terminal it's tearing down, the instant the head process exits. Not `dispatch.run`:
             # it doesn't dispatch anything, doesn't take a variant, and needs its own lock
-            # handling (see dispatch.finalize's docstring).
-            return dispatch.finalize(agent)
+            # handling (see dispatch.finalize's docstring). `--generation` carries the terminal's
+            # identity so it never stops a replacement a concurrent tick created (review B2).
+            return dispatch.finalize(agent, generation=generation)
         # An optional variant name (e.g. the steward's "deep-sweep", triggered-agents-254)
         # selects a second, differently-scheduled mode of the same agent — see automation.toml's
         # [variants.<name>] table and dispatch.run's docstring. `--cleanup-only` (triggered-
