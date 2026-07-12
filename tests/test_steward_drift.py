@@ -212,14 +212,51 @@ randomized_delay_sec = 600
         self.assertTrue(result["in_sync"])
         self.assertEqual(result["drift"], [])
 
-    def test_no_double_schedule_when_automation_state_is_unknown(self):
-        # orca query failed or returned nothing for this name -> don't guess, stay quiet.
+    def test_no_double_schedule_when_no_automation_of_that_name_exists(self):
+        # Query succeeded but returned zero automations (or none named "curator") -> nothing to
+        # double-fire from, correctly not flagged. Distinct from an actual query failure below.
         self._write_synced_curator()
-        # no _fake_orca_automations call -> setUp default (empty automations list) applies
+        # no _fake_orca_automations call -> setUp default (query succeeds, empty list) applies
 
         result = drift.check()
 
         self.assertTrue(result["in_sync"])
+
+    def test_double_schedule_unknown_when_orca_query_fails(self):
+        # triggered-agents-444 review fixup (round 2): a query failure must not silently read as
+        # "confirmed fine" for an agent that opted into single-scheduler ownership and has a live
+        # timer — the whole point of this check is to catch curator's automation coming back
+        # enabled, so an unverifiable state has to stay red, not turn quiet.
+        self._write_synced_curator()
+
+        def _boom(_args):
+            raise RuntimeError("orca unreachable")
+        self._patch(provision, "orca_json", _boom)
+
+        result = drift.check()
+
+        self.assertFalse(result["in_sync"])
+        hits = [h for h in result["drift"] if h["kind"] == "double-schedule-unknown"]
+        self.assertEqual(len(hits), 1)
+        self.assertIn("curator", hits[0]["unit"])
+
+    def test_no_double_schedule_unknown_for_agent_that_never_opted_in_when_query_fails(self):
+        # A query failure must not spuriously flag retro/steward either — they never opted in, so
+        # there is no invariant of theirs left unverified.
+        self._write_spec("retro")
+        service, timer = self._expected("retro")
+        (self.systemd_dir / "ta-retro.service").write_text(service, encoding="utf-8")
+        (self.systemd_dir / "ta-retro.timer").write_text(timer, encoding="utf-8")
+
+        def _boom(_args):
+            raise RuntimeError("orca unreachable")
+        self._patch(provision, "orca_json", _boom)
+
+        result = drift.check()
+
+        kinds = {h["kind"] for h in result["drift"]}
+        self.assertNotIn("double-schedule-unknown", kinds)
+        self.assertNotIn("double-schedule", kinds)
 
     def test_no_double_schedule_when_timer_was_never_provisioned(self):
         # Spec exists but ta-curator.timer isn't live on the host yet -> reported as "missing"
@@ -274,12 +311,27 @@ randomized_delay_sec = 20
         kinds = {h["kind"] for h in result["drift"]}
         self.assertNotIn("double-schedule", kinds)
 
-    def test_orca_automation_states_returns_empty_on_query_failure(self):
+    def test_orca_automation_states_returns_none_on_query_failure(self):
+        # None (not {}): a failed query is distinct from a successful query that found zero
+        # automations — the double-schedule check needs to tell them apart (triggered-agents-444
+        # review fixup, round 2).
         def _boom(_args):
             raise RuntimeError("orca unreachable")
         self._patch(provision, "orca_json", _boom)
 
+        self.assertIsNone(drift._orca_automation_states())
+
+    def test_orca_automation_states_returns_empty_dict_when_none_exist(self):
+        self._patch(provision, "orca_json", lambda args: {"result": {"automations": []}})
+
         self.assertEqual(drift._orca_automation_states(), {})
+
+    def test_orca_automation_states_returns_none_on_malformed_response(self):
+        # No "automations" key at all in the response shape -> treated the same as a failure, not
+        # coerced to {} (which would read as "confirmed zero automations").
+        self._patch(provision, "orca_json", lambda args: {"result": {}})
+
+        self.assertIsNone(drift._orca_automation_states())
 
 
 if __name__ == "__main__":

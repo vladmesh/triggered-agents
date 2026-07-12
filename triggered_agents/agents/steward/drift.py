@@ -74,20 +74,23 @@ def _diff(live: str, expected: str, artifact: str) -> str:
         fromfile=f"{artifact} (live)", tofile=f"{artifact} (expected from current checkout)"))
 
 
-def _orca_automation_states() -> dict[str, bool]:
-    """{Orca automation name: its own `enabled` flag} for every live automation. Best-effort: a
-    query failure (orca unreachable) yields {}, so the double-schedule check below treats every
-    agent as "can't verify" and reports nothing rather than guessing at a false positive/negative.
-    """
+def _orca_automation_states() -> dict[str, bool] | None:
+    """{Orca automation name: its own `enabled` flag} for every live automation, or None if the
+    query itself failed (orca unreachable, or the response has no usable "automations" list at
+    all) — None is distinct from {} (query succeeded, zero automations exist right now): the
+    double-schedule check below must not read a failed query the same as "confirmed nothing to
+    flag", see _double_schedule_drift / triggered-agents-444 review fixup."""
     try:
         data = provision.orca_json(["automations", "list"])
+        automations = provision._unwrap(data, "automations")
+        if automations is None:
+            raise ValueError("orca automations list: response has no 'automations' key")
     except Exception:
-        return {}
-    automations = provision._unwrap(data, "automations") or []
+        return None
     return {a["name"]: bool(a.get("enabled")) for a in automations if a.get("name")}
 
 
-def _double_schedule_drift(automation_states: dict[str, bool]) -> list[dict]:
+def _double_schedule_drift(automation_states: dict[str, bool] | None) -> list[dict]:
     """Flag every agent whose spec OPTS IN to single-scheduler ownership (`[trigger] enabled =
     false`, e.g. curator, triggered-agents-444) but whose live state doesn't match that canon: both
     ta-<agent>.timer live on the host AND the same-named Orca automation still has its own trigger
@@ -101,8 +104,13 @@ def _double_schedule_drift(automation_states: dict[str, bool]) -> list[dict]:
     the blast radius of this check must match the blast radius of the fix, not every agent that
     happens to share the same timer/automation shape.
 
-    `automation_states` comes from `_orca_automation_states`; an agent absent from it (query
-    failed, or no automation of that name exists yet) is skipped rather than assumed either way."""
+    `automation_states` comes from `_orca_automation_states`. `None` means the query itself
+    failed: every opted-in agent with a live timer gets a "double-schedule-unknown" hit instead of
+    being silently skipped — the whole point of this check is to catch curator's automation coming
+    back enabled, and a query failure must not read as "confirmed fine" (triggered-agents-444
+    review fixup, second round: the first version of this fix let exactly that failure mode go
+    quiet). A dict (query succeeded) with an agent's name simply absent means that name has no live
+    automation at all — nothing to double-fire from, correctly not flagged."""
     hits = []
     for agent_dir in sorted(provision.AGENTS_DIR.iterdir()):
         spec_path = agent_dir / "automation.toml"
@@ -116,7 +124,18 @@ def _double_schedule_drift(automation_states: dict[str, bool]) -> list[dict]:
             continue  # never opted into single-scheduler ownership — nothing to check
         if not (SYSTEMD_DIR / f"ta-{agent}.timer").is_file():
             continue
-        if automation_states.get(agent):
+        if automation_states is None:
+            hits.append({
+                "unit": f"ta-{agent}.timer + orca:{agent}",
+                "kind": "double-schedule-unknown",
+                "diff": (
+                    f"ta-{agent}.timer is live on the host and '{agent}' opts into "
+                    "single-scheduler ownership ([trigger] enabled = false), but querying Orca "
+                    "automation state failed — the double-schedule invariant could not be "
+                    "confirmed this run. Re-run once Orca is reachable."
+                ),
+            })
+        elif automation_states.get(agent):
             hits.append({
                 "unit": f"ta-{agent}.timer + orca:{agent}",
                 "kind": "double-schedule",
@@ -143,6 +162,9 @@ def check() -> dict:
       "double-schedule" -> ta-<agent>.timer is live AND the same-named Orca automation's own
                    trigger is enabled (triggered-agents-444) — two schedule owners, not just a
                    stale artifact; see _double_schedule_drift.
+      "double-schedule-unknown" -> same live-timer/opted-in agent as above, but the Orca
+                   automation query itself failed, so the invariant above could not be confirmed
+                   this run — never silently read as "fine".
     Sorted by artifact name for a deterministic report, double-schedule hits appended after."""
     expected = _expected_artifacts()
     live = _live_artifacts()
