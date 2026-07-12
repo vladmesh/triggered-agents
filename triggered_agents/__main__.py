@@ -35,6 +35,7 @@ def main(argv=None) -> int:
         dispatch_args = rest[1:]
         cleanup_only = "--cleanup-only" in dispatch_args
         finalize = "--finalize" in dispatch_args
+        spawn_finalizer = "--spawn-finalizer" in dispatch_args
         generation = None
         if "--generation" in dispatch_args:
             gi = dispatch_args.index("--generation")
@@ -52,18 +53,18 @@ def main(argv=None) -> int:
             # never appended to a pipeline launch command (dispatch.py only does that for an
             # ephemeral singleton-terminal agent, which pipeline isn't), but treat it the same
             # defensive way if it somehow arrives.
-            if cleanup_only or finalize:
+            if cleanup_only or finalize or spawn_finalizer:
                 return 0
             from .agents.pipeline import dispatcher
             return dispatcher.tick()
         from .runtime import dispatch
+        if spawn_finalizer:
+            return dispatch.spawn_finalizer(agent, generation=generation)
         if finalize:
-            # Self-teardown trailer `_with_finalizer` appends to an ephemeral head's own launch
-            # command (triggered-agents-445, PR #95 review B1, round 3) -- runs inside the very
-            # terminal it's tearing down, the instant the head process exits. Not `dispatch.run`:
-            # it doesn't dispatch anything, doesn't take a variant, and needs its own lock
+            # The head's trailer starts a detached helper with `--spawn-finalizer`; this is the
+            # helper's cleanup entrypoint. It never dispatches a skill and needs its own lock
             # handling (see dispatch.finalize's docstring). `--generation` carries the terminal's
-            # identity so it never stops a replacement a concurrent tick created (review B2).
+            # identity so it never stops a replacement a concurrent tick created.
             return dispatch.finalize(agent, generation=generation)
         # An optional variant name (e.g. the steward's "deep-sweep", triggered-agents-254)
         # selects a second, differently-scheduled mode of the same agent — see automation.toml's
