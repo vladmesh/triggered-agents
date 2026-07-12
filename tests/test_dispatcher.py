@@ -32,7 +32,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))       # repo root
 from test_pipeline import FakeBoard  # noqa: E402
 
 from triggered_agents.agents.pipeline import (  # noqa: E402
-    dispatcher, health, heads, model, ops, pause, validate, worker,
+    dispatcher, health, heads, merge_recovery, model, naming, ops, pause, validate, worker,
 )
 from triggered_agents.agents.pipeline import state as pipeline_state  # noqa: E402
 from triggered_agents.runtime import state as runtime_state  # noqa: E402
@@ -58,6 +58,8 @@ class FakeWorker:
         self.polled = []                 # PR urls poll_pr was asked about
         self.merge_result = {"ok": True, "error": None}  # dict returned by merge_pr
         self.merged = []                 # PR urls merge_pr was asked to merge
+        self.merge_base_result = {"result": "updated", "head": "newhead"}  # merge_base_into_branch
+        self.merge_base_calls = []       # (workspace, base_branch, branch) each merge attempt
         self.pr_bases = {}               # pr_url -> baseRefName pr_base_branch returns (default "main")
         self.pr_base_polled = []         # PR urls pr_base_branch was asked about
         self.notified = []               # (handle, text) nudges sent to worker terminals
@@ -186,6 +188,10 @@ class FakeWorker:
         self.merged.append(pr_url)
         return self.merge_result
 
+    def merge_base_into_branch(self, workspace, base_branch, branch):
+        self.merge_base_calls.append((workspace, base_branch, branch))
+        return self.merge_base_result
+
     def pr_base_branch(self, pr_url):
         self.pr_base_polled.append(pr_url)
         return self.pr_bases.get(pr_url, "main")
@@ -275,6 +281,12 @@ class _DispatcherBase(unittest.TestCase):
                             getattr(self.worker, name))
             wp.start()
             self.addCleanup(wp.stop)
+        # The git merge op lives in merge_recovery (leaf module reusing worker._git), not on the
+        # worker host boundary, so it is stubbed on its own module for the dispatcher decision tests.
+        mr = mock.patch("triggered_agents.agents.pipeline.merge_recovery.merge_base_into_branch",
+                        self.worker.merge_base_into_branch)
+        mr.start()
+        self.addCleanup(mr.stop)
 
         dispatcher.STATE.ensure_dir()
         for f in (dispatcher.CARDS_FILE, dispatcher.STATE.dir / "runs.jsonl",
@@ -2034,6 +2046,176 @@ class ValidateTest(_DispatcherBase):
         dispatcher.tick()                                        # escalates -> must clear_review
         self.assertEqual(self._column(ref), "Blocked")
         self.assertTrue(any(w.startswith("/rev/") for w in self.worker.torn_down))
+
+
+class MergeRecoveryTest(_DispatcherBase):
+    """Validate base-freshness recovery (triggered-agents-442): a PR whose head diverged from its
+    base is recovered before any CI branch — a clean BEHIND branch auto-merged and re-validated for
+    the new head, a text conflict returned to the same worker — instead of hanging under the CI
+    watchdog as «checks не появились»."""
+
+    PR = "https://github.com/vladmesh/personal_site/pull/25"
+
+    def _markers(self, ref):
+        tid = next(t["id"] for t in self.board.tasks.values() if t["reference"] == ref)
+        return " ".join(c["comment"] for c in self.board.comments.get(tid, []))
+
+    def _to_validate(self, pr=PR):
+        ref = self._claim_one()
+        ops.report(ref, "done", f"готово\nPR: {pr}")
+        self.worker.pr_status = None
+        dispatcher.tick()
+        self.assertEqual(self._column(ref), "Validate")
+        return ref
+
+    def _status(self, mergeable, rollup="NONE", base_sha="base1", head_sha="head1", **kw):
+        s = {"merged": False, "state": "OPEN", "rollup": rollup, "failed_job": None,
+             "failed_log": None, "mergeable": mergeable, "base_sha": base_sha, "head_sha": head_sha}
+        s.update(kw)
+        return s
+
+    def test_unknown_mergeable_falls_through_to_the_ordinary_ci_path(self):
+        # A still-computing UNKNOWN is neither a conflict nor a green state: no recovery, the card
+        # just rides the normal CI-pending path.
+        ref = self._to_validate()
+        self.worker.pr_status = self._status("UNKNOWN", rollup="PENDING")
+        dispatcher.tick()
+        self.assertEqual(self._column(ref), "Validate")
+        self.assertEqual(self.worker.merge_base_calls, [])
+        self.assertIn("ci_pending_since", dispatcher._load_cards()[ref])
+
+    def test_clean_success_still_reaches_review_without_recovery(self):
+        ref = self._to_validate()
+        self.worker.pr_status = self._status("CLEAN", rollup="SUCCESS")
+        dispatcher.tick()
+        self.assertEqual(self.worker.merge_base_calls, [])
+        self.assertEqual(len(self.worker.reviewer_spawns), 1)
+
+    def test_conflicting_with_zero_checks_returns_to_worker_not_ci_watchdog(self):
+        ref = self._to_validate()
+        self.worker.merge_base_result = {"result": "conflict", "conflict_files": ["docs/STATUS.md"]}
+        self.worker.pr_status = self._status("CONFLICTING", rollup="NONE")
+        dispatcher.tick()
+        self.assertEqual(self._column(ref), model.IN_PROGRESS)
+        # crucial: it never entered the CI-pending watchdog (no ci_pending_since started)
+        self.assertNotIn("ci_pending_since", dispatcher._load_cards()[ref])
+        journal = self._markers(ref)
+        self.assertIn("docs/STATUS.md", journal)
+        self.assertIn("ручное разрешение", journal)
+        self.assertEqual(len(self.worker.notified), 1)
+        self.assertTrue(any(r.get("reason") == "merge-conflict" for r in self._runs()))
+
+    def test_dirty_worktree_returns_to_worker_untouched(self):
+        ref = self._to_validate()
+        self.worker.merge_base_result = {"result": "dirty", "reason": "uncommitted"}
+        self.worker.pr_status = self._status("BEHIND", rollup="NONE")
+        dispatcher.tick()
+        self.assertEqual(self._column(ref), model.IN_PROGRESS)
+        self.assertIn("незакоммиченные изменения", self._markers(ref))
+
+    def test_behind_branch_auto_merges_and_stays_in_validate(self):
+        ref = self._to_validate()
+        ws = dispatcher._load_cards()[ref]["workspace"]
+        self.worker.merge_base_result = {"result": "updated", "head": "mergedhead"}
+        self.worker.pr_status = self._status("BEHIND", rollup="NONE")
+        dispatcher.tick()
+        self.assertEqual(self._column(ref), "Validate")
+        self.assertEqual(self.worker.merge_base_calls,
+                         [(ws, "main", naming.worker_branch(ref))])
+        rec = dispatcher._load_cards()[ref]
+        self.assertEqual(rec["merge_recovery"]["base"], "base1")
+        self.assertEqual(rec["merge_recovery"]["head"], "mergedhead")
+        self.assertIn("merge базы", self._markers(ref))
+        self.assertTrue(any(r["event"] == "validate" and r.get("result") == "merge-updated"
+                            for r in self._runs()))
+
+    def test_behind_update_reruns_layer1_and_never_reuses_the_old_green(self):
+        ref = self._to_validate()
+        # old head goes green and a reviewer is already up
+        self.worker.pr_status = self._status("CLEAN", rollup="SUCCESS")
+        dispatcher.tick()
+        self.assertEqual(len(self.worker.reviewer_spawns), 1)
+        old_review_ws = dispatcher._load_cards()[ref]["review_ws"]
+        # base moves on: the branch is now BEHIND -> auto-update must tear the stale reviewer down
+        # and reset the green marker so layer 1 re-runs for the new head SHA (AC7)
+        self.worker.merge_base_result = {"result": "updated", "head": "newhead"}
+        self.worker.pr_status = self._status("BEHIND", rollup="NONE", base_sha="base2")
+        dispatcher.tick()
+        self.assertEqual(self._column(ref), "Validate")
+        self.assertIn(old_review_ws, self.worker.torn_down)
+        self.assertNotIn("review_ws", dispatcher._load_cards()[ref])
+        # new head green -> a FRESH reviewer spawns, the old verdict/marker never reused
+        self.worker.pr_status = self._status("CLEAN", rollup="SUCCESS", base_sha="base2")
+        dispatcher.tick()
+        self.assertEqual(len(self.worker.reviewer_spawns), 2)
+
+    def test_same_base_and_produced_head_does_not_remerge(self):
+        ref = self._to_validate()
+        self.worker.merge_base_result = {"result": "updated", "head": "newhead"}
+        self.worker.pr_status = self._status("BEHIND", base_sha="base1", head_sha="oldhead")
+        dispatcher.tick()
+        self.assertEqual(len(self.worker.merge_base_calls), 1)
+        # GitHub still lags on mergeStateStatus, but the PR head is now the one we produced: settled,
+        # no second merge for the same base SHA.
+        self.worker.pr_status = self._status("BEHIND", base_sha="base1", head_sha="newhead")
+        dispatcher.tick()
+        self.assertEqual(len(self.worker.merge_base_calls), 1)
+        self.assertTrue(any(r.get("result") == "merge-recovery-settled" for r in self._runs()))
+
+    def test_new_base_sha_gets_a_fresh_merge(self):
+        ref = self._to_validate()
+        self.worker.merge_base_result = {"result": "updated", "head": "h2"}
+        self.worker.pr_status = self._status("BEHIND", base_sha="base1", head_sha="h1")
+        dispatcher.tick()
+        self.assertEqual(len(self.worker.merge_base_calls), 1)
+        # base advanced again -> a different base SHA -> a fresh attempt (counter reset)
+        self.worker.merge_base_result = {"result": "updated", "head": "h3"}
+        self.worker.pr_status = self._status("BEHIND", base_sha="base2", head_sha="h2")
+        dispatcher.tick()
+        self.assertEqual(len(self.worker.merge_base_calls), 2)
+        self.assertEqual(dispatcher._load_cards()[ref]["merge_recovery"]["attempts"], 1)
+
+    def test_persistent_failure_exhausts_budget_and_blocks(self):
+        ref = self._to_validate()
+        orig = merge_recovery.MERGE_RECOVERY_ATTEMPTS
+        merge_recovery.MERGE_RECOVERY_ATTEMPTS = 2
+        self.addCleanup(setattr, merge_recovery, "MERGE_RECOVERY_ATTEMPTS", orig)
+        self.worker.merge_base_result = {"result": "fetch-failed", "reason": "network down"}
+        self.worker.pr_status = self._status("BEHIND", rollup="NONE")
+        dispatcher.tick()                                           # attempt 1, stays in Validate
+        self.assertEqual(self._column(ref), "Validate")
+        self.assertEqual(dispatcher._load_cards()[ref]["merge_recovery"]["attempts"], 1)
+        self.assertTrue(any(r.get("result") == "merge-fetch-failed" for r in self._runs()))
+        dispatcher.tick()                                           # attempt 2 == budget -> Blocked
+        self.assertEqual(self._column(ref), "Blocked")
+        self.assertNotIn(ref, dispatcher._load_cards())
+        self.assertTrue(any(r.get("reason") == "merge-recovery-budget" for r in self._runs()))
+
+    def test_push_failure_is_logged_distinctly(self):
+        ref = self._to_validate()
+        self.worker.merge_base_result = {"result": "push-failed", "reason": "remote rejected",
+                                         "head": "h"}
+        self.worker.pr_status = self._status("BEHIND", rollup="NONE")
+        dispatcher.tick()
+        self.assertEqual(self._column(ref), "Validate")
+        self.assertTrue(any(r.get("result") == "merge-push-failed" for r in self._runs()))
+
+    def test_successful_update_then_new_green_ci_merges(self):
+        # End to end: BEHIND -> auto-update -> new head goes green -> review green -> automerge.
+        ref = self._to_validate()
+        self.worker.merge_base_result = {"result": "updated", "head": "newhead"}
+        self.worker.pr_status = self._status("BEHIND", rollup="NONE")
+        dispatcher.tick()
+        self.assertEqual(self._column(ref), "Validate")
+        self.worker.pr_status = self._status("CLEAN", rollup="SUCCESS", base_sha="base1",
+                                             head_sha="newhead")
+        dispatcher.tick()                                           # layer 1 green -> reviewer
+        self.assertEqual(len(self.worker.reviewer_spawns), 1)
+        ops.verdict(ref, "green", "всё чисто")
+        self.worker.pr_status = self._status("CLEAN", rollup="SUCCESS", base_sha="base1",
+                                             head_sha="newhead")
+        dispatcher.tick()                                           # green verdict -> automerge
+        self.assertIn(self.PR, self.worker.merged)
 
 
 class PostMergeProvisionApplyTest(_DispatcherBase):

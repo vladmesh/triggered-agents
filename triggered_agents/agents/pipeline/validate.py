@@ -3,7 +3,14 @@ independent layer-3 reviewer head.
 
 layer 1 (mechanical, PR project): poll the card's PR through gh (worker.poll_pr) — CI red bounces
     the card back to In progress with a scrubbed comment and a nudge to the live worker; CI green
-    moves on. A rollup stuck on PENDING/NONE (gh answers, but no check ever finishes) is watched by
+    moves on. Base-freshness recovery runs first, apart from CI (model.merge_status,
+    merge_recovery.recover): a PR whose head diverged from its base (GitHub mergeable=CONFLICTING or
+    mergeStateStatus=BEHIND) is recovered there instead of sitting under the CI watchdog as «checks
+    не появились» — a clean BEHIND branch is auto-updated (git merge origin/<base> in the worker
+    workspace, a merge commit, a plain push, no rebase/force), then re-validated for the new head
+    SHA; a real text conflict goes back to the same worker to resolve. Both are capped per base SHA
+    (merge_recovery.MERGE_RECOVERY_ATTEMPTS) so one divergence never loops forever. A rollup stuck on PENDING/NONE
+    (gh answers, but no check ever finishes) is watched by
     its own time-based watchdog (_ci_pending_watchdog, CI_PENDING_STALL_SECONDS) — a required check
     that never posts, a job waiting on manual environment approval, or a removed workflow otherwise
     leaves the card unwatched in Validate forever, the one class neither the worker watchdog
@@ -49,7 +56,9 @@ import re
 import time
 from collections.abc import Callable
 
-from . import health, model, naming, ops, review_spawn, reviewer, validate_review, worker
+from . import (
+    health, merge_recovery, model, naming, ops, review_spawn, reviewer, validate_review, worker,
+)
 from .state import STATE
 
 RefreshWorkerTask = Callable[[dict, dict], None]
@@ -358,6 +367,17 @@ def _validate_card(card: dict, records: dict, watchdog_seconds: int, save_cards,
         records.pop(ref, None)
         STATE.log_run("validate", reference=ref, to="Blocked", reason="pr-closed", pr=pr)
         return True
+    if status.get("mergeable") in ("CONFLICTING", "BEHIND"):
+        # Base-freshness recovery runs BEFORE any CI branch below (triggered-agents-442): a
+        # conflicting or behind PR often has no CI at all (GitHub can't build the synthetic merge
+        # commit, so the pull_request workflow never starts and rollup stays NONE), so left to the
+        # CI branches it would sit in the pending watchdog as «checks не появились» for hours. A
+        # temporary UNKNOWN (poll's mergeable, still recomputing) is deliberately NOT here — it
+        # falls through to the ordinary CI path, treated as neither a conflict nor a green state.
+        return merge_recovery.recover(
+            ref, pr, card, rec, records, status, save_cards, refresh_worker_task,
+            clear_review=clear_review, notify_rework=_notify_worker_for_rework,
+            block_rework=_block_rework_worker_failure) or changed
     if status["rollup"] == "FAILURE":
         job = status.get("failed_job") or "?"
         tail = worker.scrub_secrets(status.get("failed_log") or "(лог недоступен)")

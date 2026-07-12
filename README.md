@@ -42,7 +42,17 @@ CLI: `python3 -m triggered_agents <agent> <cmd>` (`harvest`/`advance`/`precheck`
 
 Code и research-карточки проходят Validate послойно: PR/branch integrity, GitHub CI или явный
 `[validate] ci = "none"` в манифесте проекта, stand/e2e для проектов со стендом, затем LLM-review
-слоя 3 и штатный merge/Done path. PO может отключить только слой 3 для отдельной карточки:
+слоя 3 и штатный merge/Done path.
+
+Слой 1 сперва различает свежесть ветки от CI: если голова PR разошлась с базой (GitHub
+`mergeable`/`mergeStateStatus`), Validate чинит это отдельно, не давая конфликтному PR зависнуть
+под видом «CI не появился». Ветку, отставшую от базы без текстового конфликта, pipeline обновляет
+сам обычным merge базы в существующем воркспейсе воркера (merge-коммит, push, без rebase/force),
+сбрасывает слои и ждёт CI нового head SHA. Текстовый конфликт возвращается тому же воркеру со
+списком конфликтных файлов и base SHA. Попытки ограничены на один base SHA — исчерпание бюджета
+уводит карточку в Blocked с сохранённым воркспейсом.
+
+PO может отключить только слой 3 для отдельной карточки:
 
 ```bash
 python3 -m triggered_agents pipeline --role po create \
