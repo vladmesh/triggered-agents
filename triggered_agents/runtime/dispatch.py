@@ -102,6 +102,7 @@ import os
 import shutil
 import subprocess
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -129,6 +130,15 @@ CREATE_VISIBILITY_GRACE_S = 60
 # lock still hands teardown off rather than spinning forever.
 FINALIZE_LOCK_ATTEMPTS = 4
 FINALIZE_LOCK_RETRY_S = 2.0
+REPORT_VISIBILITY_GAP_SECONDS = 60
+
+
+@dataclass(frozen=True)
+class DispatchCommand:
+    skill: str
+    launch: str
+    profile: str | None
+    card_ref: str | None = None
 
 
 def _orca_json(args: list[str]) -> dict:
@@ -280,16 +290,28 @@ def _is_ephemeral(agent: str) -> bool:
         return False
 
 
-def _dispatch_command(agent: str, variant: str | None) -> tuple[str, str, str | None]:
+def _dispatch_command(agent: str, variant: str | None) -> DispatchCommand:
     """(skill, launch, resolved head profile) for a dispatch about to actually reach the head —
     the one spot that also creates the steward's report card, so every real dispatch (fresh
     create, watchdog restart, idle reuse) carries one and a busy-skip tick never does (no card,
     nobody to close it)."""
     card_ref = _steward_report_card(agent, variant)
-    return _launch_cmd(agent, variant, card_ref=card_ref) if card_ref else _launch_cmd(agent, variant)
+    skill, launch, profile = (_launch_cmd(agent, variant, card_ref=card_ref)
+                              if card_ref else _launch_cmd(agent, variant))
+    return DispatchCommand(skill, launch, profile, card_ref)
 
 
-def _fresh_steward_report_in_progress(agent: str, now: float) -> dict | None:
+def _terminal_handle_live(ws: str, handle: str) -> bool:
+    try:
+        terms = _orca_json(["terminal", "list", "--worktree", f"path:{ws}", "--limit", "50"]) \
+            .get("terminals", []) or []
+    except Exception:
+        return False
+    return any((t.get("handle") or t.get("id")) == handle for t in terms)
+
+
+def _fresh_steward_report_in_progress(agent: str, now: float, ws: str,
+                                      state: AgentState) -> dict | None:
     """A secondary run guard for steward dispatch.
 
     Orca terminal creation is not immediately visible in `terminal list` on every host. If two
@@ -307,8 +329,16 @@ def _fresh_steward_report_in_progress(agent: str, now: float) -> dict | None:
         threshold = steward_signals.STALE_HOURS * 3600
         for card in pipeline_ops.list_cards(column="In progress", project="triggered-agents"):
             moved = card.get("date_moved")
-            if card.get("steward_report") == "1" and moved and now - moved < threshold:
+            if card.get("steward_report") != "1" or not moved or now - moved >= threshold:
+                continue
+            active = state.load_active_report() or {}
+            handle = active.get("terminal_handle") or ""
+            if active.get("reference") != card.get("reference") or not handle:
+                state.clear_active_report(card.get("reference"))
+                continue
+            if _terminal_handle_live(ws, handle) or now - moved < REPORT_VISIBILITY_GAP_SECONDS:
                 return card
+            state.clear_active_report(card.get("reference"))
     except Exception:
         return None
     return None
@@ -387,7 +417,8 @@ def _with_finalizer(agent: str, launch: str, generation: int) -> str:
     return f"{launch}; {finalizer}"
 
 
-def _create_terminal(agent: str, ws: str, launch: str, state: AgentState, profile: str | None) -> None:
+def _create_terminal(agent: str, ws: str, launch: str, state: AgentState,
+                     profile: str | None) -> str | None:
     generation = None
     if _is_ephemeral(agent):
         # Stamp a fresh monotonic generation and bake it into the terminal's own self-teardown
@@ -400,9 +431,53 @@ def _create_terminal(agent: str, ws: str, launch: str, state: AgentState, profil
     term = data.get("terminal", data)
     # created_at only here (never on a plain warm-reuse re-save): see save_terminal_handle's own
     # docstring and the "no terminal" branch's visibility-gap guard below.
-    state.save_terminal_handle(term.get("handle") or term.get("id"), created_at=time.time(),
+    handle = term.get("handle") or term.get("id")
+    state.save_terminal_handle(handle, created_at=time.time(),
                                generation=generation)
     state.save_head_profile(profile)
+    return handle
+
+
+def _recover_steward_dispatch_failure(state: AgentState, event: str, cmd: DispatchCommand,
+                                      failure: BaseException) -> None:
+    if not cmd.card_ref:
+        return
+    state.clear_active_report(cmd.card_ref)
+    body = "steward dispatch failed before the head accepted the report-card run.\n\n" \
+           f"failure: {failure}"
+    try:
+        from ..agents.pipeline import ops as pipeline_ops
+        pipeline_ops.move_card("steward", cmd.card_ref, "Done", reason=body)
+        state.log_run(event, action="dispatch-recovery", result="done", reference=cmd.card_ref)
+    except Exception as recovery_error:
+        state.log_run(event, action="dispatch-recovery", result="failed",
+                      reference=cmd.card_ref, error=str(recovery_error))
+
+
+def _spawn_fresh_terminal(agent: str, variant: str | None, ws: str, state: AgentState,
+                          event: str) -> DispatchCommand:
+    cmd = _dispatch_command(agent, variant)
+    try:
+        _ensure_claude_ready(ws)
+        handle = _create_terminal(agent, ws, cmd.launch, state, cmd.profile)
+    except Exception as exc:
+        _recover_steward_dispatch_failure(state, event, cmd, exc)
+        raise
+    state.save_active_report(cmd.card_ref, handle)
+    return cmd
+
+
+def _send_reuse_dispatch(agent: str, variant: str | None, terminal_handle: str,
+                         state: AgentState, event: str) -> DispatchCommand:
+    cmd = _dispatch_command(agent, variant)
+    try:
+        _orca(["terminal", "send", "--terminal", terminal_handle,
+               "--text", cmd.skill, "--enter"])
+    except Exception as exc:
+        _recover_steward_dispatch_failure(state, event, cmd, exc)
+        raise
+    state.save_active_report(cmd.card_ref, terminal_handle)
+    return cmd
 
 
 def _stop_and_confirm(ws: str, state: AgentState) -> bool:
@@ -609,7 +684,7 @@ def run(agent: str, variant: str | None = None, cleanup_only: bool = False) -> i
             state.log_run(event, action="paused")
             print(f"dispatch[{agent}]: pipeline paused — no dispatch")
             return 0
-        active_report = _fresh_steward_report_in_progress(agent, time.time())
+        active_report = _fresh_steward_report_in_progress(agent, time.time(), ws, state)
         if active_report:
             state.log_run(event, action="active-report-skip", reference=active_report["reference"])
             print(
@@ -680,11 +755,9 @@ def run(agent: str, variant: str | None = None, cleanup_only: bool = False) -> i
                         print(f"dispatch[{agent}]: swept stray terminal but a ghost tab would not "
                               "close; not creating this tick, next tick re-reaps")
                         return 0
-            skill, launch, profile = _dispatch_command(agent, variant)
-            _ensure_claude_ready(ws)
-            _create_terminal(agent, ws, launch, state, profile)
+            cmd = _spawn_fresh_terminal(agent, variant, ws, state, event)
             state.log_run(event, action="created")
-            print(f"dispatch[{agent}]: no terminal — created fresh -> {skill}")
+            print(f"dispatch[{agent}]: no terminal — created fresh -> {cmd.skill}")
             return 0
 
         survivor = max(terms, key=lambda t: t.get("lastOutputAt") or 0)
@@ -711,11 +784,9 @@ def run(agent: str, variant: str | None = None, cleanup_only: bool = False) -> i
                 print(f"dispatch[{agent}]: watchdog stopped the stuck terminal but a ghost tab "
                       "would not close; not restarting this tick, next tick re-reaps")
                 return 0
-            skill, launch, profile = _dispatch_command(agent, variant)
-            _ensure_claude_ready(ws)
-            _create_terminal(agent, ws, launch, state, profile)
+            cmd = _spawn_fresh_terminal(agent, variant, ws, state, event)
             state.log_run(event, action="watchdog-restart")
-            print(f"dispatch[{agent}]: busy but stuck ({int(quiet)}s silent) — watchdog restart -> {skill}")
+            print(f"dispatch[{agent}]: busy but stuck ({int(quiet)}s silent) — watchdog restart -> {cmd.skill}")
             return 0
 
         # idle: an ephemeral agent (curator, triggered-agents-445) never reuses a warm terminal —
@@ -739,12 +810,10 @@ def run(agent: str, variant: str | None = None, cleanup_only: bool = False) -> i
                 print(f"dispatch[{agent}]: ephemeral teardown stopped the finished terminal but a "
                       "ghost tab would not close; not restarting this tick, next tick re-reaps")
                 return 0
-            skill, launch, profile = _dispatch_command(agent, variant)
-            _ensure_claude_ready(ws)
-            _create_terminal(agent, ws, launch, state, profile)
+            cmd = _spawn_fresh_terminal(agent, variant, ws, state, event)
             state.log_run(event, action="ephemeral-restart")
             tail = f"; reaped {reaped} ghost(s)" if reaped else ""
-            print(f"dispatch[{agent}]: ephemeral — torn down finished terminal, fresh session -> {skill}{tail}")
+            print(f"dispatch[{agent}]: ephemeral — torn down finished terminal, fresh session -> {cmd.skill}{tail}")
             return 0
 
         # idle: a warm terminal keeps whatever profile it was spawned with, so a resource that's
@@ -759,11 +828,9 @@ def run(agent: str, variant: str | None = None, cleanup_only: bool = False) -> i
                 print(f"dispatch[{agent}]: red-fallback stop could not confirm the idle terminal "
                       "stopped — leaving it for the next tick")
                 return 0
-            skill, launch, profile = _dispatch_command(agent, variant)
-            _ensure_claude_ready(ws)
-            _create_terminal(agent, ws, launch, state, profile)
+            cmd = _spawn_fresh_terminal(agent, variant, ws, state, event)
             state.log_run(event, action="reused-red-fallback")
-            print(f"dispatch[{agent}]: idle terminal's head is red — stopped, fresh fallback terminal -> {skill}")
+            print(f"dispatch[{agent}]: idle terminal's head is red — stopped, fresh fallback terminal -> {cmd.skill}")
             return 0
 
         # idle: warm reuse, killing nothing -> no ghost. Close only legacy duplicates (one-time).
@@ -773,11 +840,10 @@ def run(agent: str, variant: str | None = None, cleanup_only: bool = False) -> i
             _orca(["terminal", "close", "--terminal", t["handle"]])
         _orca(["terminal", "send", "--terminal", survivor["handle"], "--text", "/clear", "--enter"])
         time.sleep(1.0)  # let /clear settle before the skill lands
-        skill, _launch, _profile = _dispatch_command(agent, variant)
-        _orca(["terminal", "send", "--terminal", survivor["handle"], "--text", skill, "--enter"])
+        cmd = _send_reuse_dispatch(agent, variant, survivor["handle"], state, event)
         state.log_run(event, action="reused")
         tail = f"; closed {len(extras)} dup(s)" if extras else ""
-        print(f"dispatch[{agent}]: reused idle terminal (/clear -> {skill}){tail}")
+        print(f"dispatch[{agent}]: reused idle terminal (/clear -> {cmd.skill}){tail}")
         return 0
 
 

@@ -43,6 +43,7 @@ class AgentState:
         self.head_profile_file = self.dir / "head_profile.json"
         self.terminal_handle_file = self.dir / "terminal_handle.json"
         self.terminal_generation_file = self.dir / "terminal_generation.json"
+        self.active_report_file = self.dir / "active_report.json"
 
     def ensure_dir(self) -> None:
         self.dir.mkdir(parents=True, exist_ok=True)
@@ -177,6 +178,35 @@ class AgentState:
         tmp = self.terminal_handle_file.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
         tmp.replace(self.terminal_handle_file)
+
+    def load_active_report(self) -> dict | None:
+        if not self.active_report_file.is_file():
+            return None
+        try:
+            data = json.loads(self.active_report_file.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            return None
+        return data if isinstance(data, dict) else None
+
+    def save_active_report(self, reference: str | None, terminal_handle: str | None) -> None:
+        self.ensure_dir()
+        if not reference or not terminal_handle:
+            self.clear_active_report(reference)
+            return
+        tmp = self.active_report_file.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps({"reference": reference, "terminal_handle": terminal_handle},
+                                  ensure_ascii=False), encoding="utf-8")
+        tmp.replace(self.active_report_file)
+
+    def clear_active_report(self, reference: str | None = None) -> None:
+        if reference is not None:
+            current = self.load_active_report()
+            if current and current.get("reference") != reference:
+                return
+        try:
+            self.active_report_file.unlink()
+        except FileNotFoundError:
+            pass
 
     def log_run(self, event: str, **fields) -> None:
         """Append a run-telemetry line to runs.jsonl. Best-effort: a logging failure
