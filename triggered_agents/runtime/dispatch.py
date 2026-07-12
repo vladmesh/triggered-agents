@@ -324,6 +324,33 @@ def _recover_steward_dispatch_failure(state: AgentState, event: str, cmd: Dispat
         )
 
 
+def _spawn_fresh_terminal(agent: str, variant: str | None, ws: str, state: AgentState,
+                          event: str, action: str, message: str) -> int:
+    cmd = _dispatch_command(agent, variant)
+    try:
+        _ensure_claude_ready(ws)
+        handle = _create_terminal(agent, ws, cmd.launch, state, cmd.profile)
+    except Exception as e:
+        _recover_steward_dispatch_failure(state, event, cmd, e)
+        raise
+    state.save_active_report(cmd.card_ref, handle)
+    state.log_run(event, action=action)
+    print(f"dispatch[{agent}]: {message} -> {cmd.skill}")
+    return 0
+
+
+def _send_reuse_dispatch(agent: str, variant: str | None, terminal_handle: str,
+                         state: AgentState, event: str) -> DispatchCommand:
+    cmd = _dispatch_command(agent, variant)
+    try:
+        _orca(["terminal", "send", "--terminal", terminal_handle, "--text", cmd.skill, "--enter"])
+    except Exception as e:
+        _recover_steward_dispatch_failure(state, event, cmd, e)
+        raise
+    state.save_active_report(cmd.card_ref, terminal_handle)
+    return cmd
+
+
 def _is_idle(handle: str) -> bool:
     try:
         res = _orca_json(["terminal", "wait", "--terminal", handle, "--for", "tui-idle",
@@ -396,17 +423,9 @@ def run(agent: str, variant: str | None = None) -> int:
             print(f"dispatch[{agent}]: reaped {reaped} ghost tab(s)")
         terms = _agent_terminals(ws, state)
         if not terms:
-            cmd = _dispatch_command(agent, variant)
-            try:
-                _ensure_claude_ready(ws)
-                handle = _create_terminal(agent, ws, cmd.launch, state, cmd.profile)
-            except Exception as e:
-                _recover_steward_dispatch_failure(state, event, cmd, e)
-                raise
-            state.save_active_report(cmd.card_ref, handle)
-            state.log_run(event, action="created")
-            print(f"dispatch[{agent}]: no terminal — created fresh -> {cmd.skill}")
-            return 0
+            return _spawn_fresh_terminal(
+                agent, variant, ws, state, event, "created", "no terminal - created fresh"
+            )
 
         survivor = max(terms, key=lambda t: t.get("lastOutputAt") or 0)
         if not _is_idle(survivor["handle"]):
@@ -418,17 +437,10 @@ def run(agent: str, variant: str | None = None) -> int:
             # busy but silent too long -> stuck: sweep and restart (makes a ghost, but rare)
             _orca(["terminal", "stop", "--worktree", f"path:{ws}"])
             time.sleep(1.0)
-            cmd = _dispatch_command(agent, variant)
-            try:
-                _ensure_claude_ready(ws)
-                handle = _create_terminal(agent, ws, cmd.launch, state, cmd.profile)
-            except Exception as e:
-                _recover_steward_dispatch_failure(state, event, cmd, e)
-                raise
-            state.save_active_report(cmd.card_ref, handle)
-            state.log_run(event, action="watchdog-restart")
-            print(f"dispatch[{agent}]: busy but stuck ({int(quiet)}s silent) — watchdog restart -> {cmd.skill}")
-            return 0
+            return _spawn_fresh_terminal(
+                agent, variant, ws, state, event, "watchdog-restart",
+                f"busy but stuck ({int(quiet)}s silent) - watchdog restart",
+            )
 
         # idle: a warm terminal keeps whatever profile it was spawned with, so a resource that's
         # gone red since spawn would otherwise get the skill anyway (only a fresh spawn
@@ -439,17 +451,10 @@ def run(agent: str, variant: str | None = None) -> int:
         if _reuse_head_is_red(agent, state):
             _orca(["terminal", "stop", "--worktree", f"path:{ws}"])
             time.sleep(1.0)
-            cmd = _dispatch_command(agent, variant)
-            try:
-                _ensure_claude_ready(ws)
-                handle = _create_terminal(agent, ws, cmd.launch, state, cmd.profile)
-            except Exception as e:
-                _recover_steward_dispatch_failure(state, event, cmd, e)
-                raise
-            state.save_active_report(cmd.card_ref, handle)
-            state.log_run(event, action="reused-red-fallback")
-            print(f"dispatch[{agent}]: idle terminal's head is red — stopped, fresh fallback terminal -> {cmd.skill}")
-            return 0
+            return _spawn_fresh_terminal(
+                agent, variant, ws, state, event, "reused-red-fallback",
+                "idle terminal's head is red - stopped, fresh fallback terminal",
+            )
 
         # idle: warm reuse, killing nothing -> no ghost. Close only legacy duplicates (one-time).
         state.save_terminal_handle(survivor.get("handle") or survivor.get("id"))
@@ -458,13 +463,9 @@ def run(agent: str, variant: str | None = None) -> int:
             _orca(["terminal", "close", "--terminal", t["handle"]])
         _orca(["terminal", "send", "--terminal", survivor["handle"], "--text", "/clear", "--enter"])
         time.sleep(1.0)  # let /clear settle before the skill lands
-        cmd = _dispatch_command(agent, variant)
-        try:
-            _orca(["terminal", "send", "--terminal", survivor["handle"], "--text", cmd.skill, "--enter"])
-        except Exception as e:
-            _recover_steward_dispatch_failure(state, event, cmd, e)
-            raise
-        state.save_active_report(cmd.card_ref, survivor.get("handle") or survivor.get("id"))
+        cmd = _send_reuse_dispatch(
+            agent, variant, survivor.get("handle") or survivor.get("id"), state, event
+        )
         state.log_run(event, action="reused")
         tail = f"; closed {len(extras)} dup(s)" if extras else ""
         print(f"dispatch[{agent}]: reused idle terminal (/clear -> {cmd.skill}){tail}")
