@@ -38,19 +38,19 @@ account = "openai-subscription"
 probe = "python3 -m triggered_agents pipeline probe --resource openai-sub"
 
 [profiles.codex]
-# Native OpenAI Codex head (gpt-5.5), verified end to end 2026-07-08 (memory MCP + global AGENTS.md
-# reach the head). This is the default-effort profile: no model_reasoning_effort override is passed,
-# so Codex uses its model default. Standalone fallback: a red openai-sub means claim-skip.
+# Stable default/compatibility id for the native OpenAI Codex head. This is the default-effort
+# GPT-5.6 Terra profile: no model_reasoning_effort override is passed, so Codex uses the model
+# default. Standalone fallback: a red openai-sub means claim-skip.
 resource = "openai-sub"
 adapter = "codex"
-model = "gpt-5.5"
+model = "gpt-5.6-terra"
 effort = "default"
 fallback = []
 
 # Explicit model profiles mirror the visible catalog returned by
 # `CODEX_HOME=/home/dev/.config/orca/codex-runtime-home/home codex debug models` (2026-07-12).
-# Keep `codex` above as
-# the stable default/compatibility id for GPT-5.5; these entries only add per-card choices.
+# Keep `codex` above as the stable default/compatibility id; these entries add explicit per-card
+# choices, including the equivalent `codex-terra` id.
 [profiles.codex-sol]
 resource = "openai-sub"
 adapter = "codex"

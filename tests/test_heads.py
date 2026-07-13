@@ -94,7 +94,7 @@ class RealRegistryTest(unittest.TestCase):
             "codex-sol": "gpt-5.6-sol",
             "codex-terra": "gpt-5.6-terra",
             "codex-luna": "gpt-5.6-luna",
-            "codex": "gpt-5.5",
+            "codex": "gpt-5.6-terra",
             "codex-5-4": "gpt-5.4",
             "codex-mini": "gpt-5.4-mini",
             "codex-spark": "gpt-5.3-codex-spark",
@@ -205,7 +205,7 @@ class RenderCodexTest(unittest.TestCase):
         self.assertIn(f"CODEX_HOME={heads.CODEX_HOME} codex exec", inner)
         self.assertIn("--dangerously-bypass-approvals-and-sandbox", inner)
         self.assertIn("--skip-git-repo-check", inner)
-        self.assertIn("-m gpt-5.5", inner)
+        self.assertIn("-m gpt-5.6-terra", inner)
         self.assertNotIn("model_reasoning_effort", inner)
         self.assertIn(repr("ping"), inner)
 

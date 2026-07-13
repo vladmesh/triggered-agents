@@ -765,7 +765,7 @@ class TestListShowHeads(PatchedBoardTest):
         self.assertEqual(card["effective_head"], "codex")
         self.assertEqual(card["requested_head"], "codex")
         self.assertEqual(card["resolved_head"], "codex")
-        self.assertEqual(card["head_model"], "gpt-5.5")
+        self.assertEqual(card["head_model"], "gpt-5.6-terra")
         self.assertEqual(card["head_effort"], "default")
         self.assertEqual(card["review_head"], "")
         self.assertEqual(card["effective_review_head"], worker.REVIEWER_HEAD)
