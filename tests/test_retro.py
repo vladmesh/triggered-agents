@@ -10,6 +10,7 @@ from pathlib import Path
 from unittest import mock
 
 from triggered_agents.agents.retro import cli as retro_cli
+from triggered_agents.agents.retro import search_log
 from triggered_agents.runtime.state import AgentState, PRECHECK_SKIP
 
 
@@ -80,6 +81,14 @@ class RetroDoneCleanupTest(unittest.TestCase):
             ]
             self.assertEqual(runs[0]["event"], "done-cleanup")
             self.assertEqual(runs[0]["references"], "triggered-agents-1")
+
+
+class RetroSearchLogTest(unittest.TestCase):
+    def test_default_log_follows_live_memory_storage(self):
+        self.assertEqual(
+            search_log.DEFAULT_SEARCH_LOG,
+            Path.home() / "secretary-data" / "memory" / "search-log.jsonl",
+        )
 
 
 if __name__ == "__main__":

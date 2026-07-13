@@ -4,8 +4,8 @@ Each line is `{"ts": ISO, "query": str, "k": int, "hits": [...]}`, appended by m
 every `memory_search`. Retro pairs it with the transcript batch so the judge can tell whether a
 search actually fired near an answer (the "answered from memory without memory_search" failure).
 
-Path is overridable via TA_SEARCH_LOG (default ~/memory-mcp/search-log.jsonl). The file may not
-exist yet — that is not an error, it just means an empty tail.
+Path is overridable via TA_SEARCH_LOG (default ~/secretary-data/memory/search-log.jsonl). The file
+may not exist yet — that is not an error, it just means an empty tail.
 
 Timestamps: Claude transcript ts are UTC (trailing Z); the search log writes naive UTC
 (memory-mcp uses datetime.utcnow().isoformat()). Both normalize to naive UTC for comparison;
@@ -18,7 +18,8 @@ import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-SEARCH_LOG = Path(os.environ.get("TA_SEARCH_LOG", str(Path.home() / "memory-mcp" / "search-log.jsonl")))
+DEFAULT_SEARCH_LOG = Path.home() / "secretary-data" / "memory" / "search-log.jsonl"
+SEARCH_LOG = Path(os.environ.get("TA_SEARCH_LOG", str(DEFAULT_SEARCH_LOG)))
 
 
 def _parse(ts):
