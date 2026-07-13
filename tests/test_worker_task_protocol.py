@@ -47,14 +47,25 @@ class TaskProtocolTest(unittest.TestCase):
         self.assertIn("ready", message)
         self.assertEqual(run.call_args.args[0], ["python3", "-m", "secretary", "task", "report", "--help"])
 
-    def test_rollback_skips_secretary_preflight(self):
-        env = {task_protocol.ROLLBACK_ENV: "1"}
-        self.assertEqual(task_protocol.preflight(env), (True, "worker task protocol rollback enabled; using legacy board-CLI"))
+    def test_rollback_uses_only_exact_value_one(self):
+        self.assertTrue(task_protocol.use_legacy_path({task_protocol.ROLLBACK_ENV: "1"}))
+        for value in ("", "true", "yes", "on", "0", " 1"):
+            self.assertFalse(task_protocol.use_legacy_path({task_protocol.ROLLBACK_ENV: value}))
 
-    def test_worker_prompt_only_names_secretary_task(self):
-        prompt = worker._worker_prompt()
-        self.assertIn("secretary task", prompt)
-        self.assertNotIn("board-CLI", prompt)
+    def test_rollback_preflight_checks_legacy_cli_not_secretary(self):
+        env = self._env()
+        env[task_protocol.ROLLBACK_ENV] = "1"
+        with mock.patch.object(task_protocol.subprocess, "run", return_value=mock.Mock(returncode=0, stdout="--kind")) as run:
+            self.assertEqual(task_protocol.preflight(env), (True, "worker task protocol rollback enabled; using legacy board-CLI"))
+        self.assertEqual(run.call_args.args[0], ["python3", "-m", "triggered_agents", "pipeline", "--role", "worker", "report", "--help"])
+
+    def test_worker_prompt_uses_selected_path(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertIn("secretary task", worker._worker_prompt())
+            self.assertNotIn("board-CLI", worker._worker_prompt())
+        with mock.patch.dict(os.environ, {task_protocol.ROLLBACK_ENV: "1"}, clear=True):
+            self.assertIn("legacy board-CLI", worker._worker_prompt())
+            self.assertNotIn("secretary task", worker._worker_prompt())
 
     def test_default_task_document_uses_secretary_for_comment_and_report(self):
         card = {"reference": "triggered-agents-470", "project": "triggered-agents", "task_type": "code", "title": "Test"}
@@ -65,12 +76,14 @@ class TaskProtocolTest(unittest.TestCase):
         self.assertNotIn("triggered_agents pipeline --role worker report", rendered)
         self.assertNotIn("Kanboard API", rendered)
 
-    def test_rollback_task_document_keeps_legacy_write_command(self):
+    def test_rollback_task_document_uses_legacy_for_comment_and_report(self):
         card = {"reference": "triggered-agents-470", "project": "triggered-agents", "task_type": "code", "title": "Test"}
-        with mock.patch.dict(os.environ, {task_protocol.ROLLBACK_ENV: "true"}, clear=True):
+        with mock.patch.dict(os.environ, {task_protocol.ROLLBACK_ENV: "1"}, clear=True):
             rendered = taskdoc.render(card, {"description": "spec", "comments": []}, "main")
         self.assertIn("triggered_agents pipeline --role worker report", rendered)
+        self.assertIn("triggered_agents pipeline --role worker comment", rendered)
         self.assertNotIn("python3 -m secretary task report", rendered)
+        self.assertNotIn("python3 -m secretary task comment", rendered)
 
     def test_provision_stops_before_project_setup_when_secretary_is_incompatible(self):
         with mock.patch.object(task_protocol, "preflight", return_value=(False, "secretary task runtime is incompatible")), \
