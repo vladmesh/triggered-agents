@@ -499,7 +499,7 @@ def _worker_prompt() -> str:
     return (
         "Ты — воркер task-пайплайна. Твоя задача целиком в TASK.md в корне воркспейса — прочти "
         "его первым и следуй ему. Роль на доске — worker (BOARD_ROLE уже выставлен): карточку сам "
-        "не двигаешь, только comment/report через secretary task. TASK.md в репо не коммить."
+        f"не двигаешь, {task_protocol.launch_instruction()}. TASK.md в репо не коммить."
     )
 
 

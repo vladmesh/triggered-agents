@@ -81,18 +81,8 @@ def render(card: dict, view: dict, base: str) -> str:
     comments = view.get("comments") or []
     is_contrib = worker.is_contrib(card.get("project") or "")
     legacy = task_protocol.use_legacy_path()
-    if legacy:
-        writer = "board-CLI"
-        report_command = (
-            f"`python3 -m triggered_agents pipeline --role worker report --ref {ref} --kind "
-            f"done|blocked --body-file <файл>`"
-        )
-    else:
-        writer = "secretary task"
-        report_command = (
-            f"`{task_protocol.command_prefix()} task report --ref {ref} --role worker --kind "
-            f"done|blocked --body-file <файл>`"
-        )
+    writer = task_protocol.writer()
+    report_command = f"`{task_protocol.command('report', ref)} --kind done|blocked --body-file <файл>`"
     if is_contrib:
         done_clause = (
             f"Контриб-проект (форк): PR в этом пайплайне не открывается — ветку в форк для "
@@ -155,15 +145,17 @@ def render(card: dict, view: dict, base: str) -> str:
             "",
         ]
     lines += _metadata(card, base)
+    lines += [
+        "## Worker write protocol",
+        "",
+        f"Комментарии: `{task_protocol.command('comment', ref)} --body-file <файл>`.",
+    ]
     if not legacy:
         lines += [
-            "## Worker write protocol",
-            "",
-            f"Комментарии: `{task_protocol.command_prefix()} task comment --ref {ref} --role worker --body-file <файл>`.",
             "Совместимый Phase 5 bridge временно оставляет Kanboard credentials в окружении CLI. "
             "Это не техническая граница least-privilege; broker и identity isolation остаются следующими фазами.",
-            "",
         ]
+    lines += [""]
     lines += [naming.memory_block("worker", card.get("project") or "?"), ""]
     lines += ["## Спека", "", view.get("description") or "(описание карточки пустое)", ""]
     lines += _operator_context(comments)
