@@ -21,7 +21,7 @@ import tomllib
 from pathlib import Path
 
 from ...runtime import claude_env, redact
-from . import codex_sessions, heads, model, prompt_delivery, stand, terminal_session
+from . import codex_sessions, heads, model, prompt_delivery, stand, task_protocol, terminal_session
 from .state import STATE
 
 ORCA = os.environ.get("ORCA_BIN") or shutil.which("orca") or str(Path.home() / ".local/bin/orca")
@@ -342,6 +342,9 @@ def remote_head_sha(project: str, branch: str) -> str | None:
 
 def provision(workspace: str) -> tuple[bool, str]:
     """Run the workspace provisioner (setup+smoke). Return (ok, combined log)."""
+    protocol_ok, protocol_log = task_protocol.preflight()
+    if not protocol_ok:
+        return False, protocol_log
     if not PROVISION.is_file():
         return False, f"provisioner missing: {PROVISION}"
     env = dict(os.environ, ORCA_WORKTREE_PATH=workspace)
@@ -352,7 +355,7 @@ def provision(workspace: str) -> tuple[bool, str]:
         )
     except subprocess.TimeoutExpired:
         return False, f"provision timed out after {PROVISION_TIMEOUT_S}s"
-    return p.returncode == 0, (p.stdout or "") + (p.stderr or "")
+    return p.returncode == 0, protocol_log + "\n" + (p.stdout or "") + (p.stderr or "")
 
 
 def _write_excluded(workspace: str, name: str, content: str) -> str:
@@ -496,7 +499,7 @@ def _worker_prompt() -> str:
     return (
         "Ты — воркер task-пайплайна. Твоя задача целиком в TASK.md в корне воркспейса — прочти "
         "его первым и следуй ему. Роль на доске — worker (BOARD_ROLE уже выставлен): карточку сам "
-        "не двигаешь, только report/comment/feedback через board-CLI. TASK.md в репо не коммить."
+        "не двигаешь, только comment/report через secretary task. TASK.md в репо не коммить."
     )
 
 

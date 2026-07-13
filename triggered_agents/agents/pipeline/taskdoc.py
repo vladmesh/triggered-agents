@@ -4,7 +4,7 @@ from __future__ import annotations
 import re
 from datetime import datetime, timezone
 
-from . import heads, naming, worker
+from . import heads, naming, task_protocol, worker
 
 
 _COMMENT_MARKER_RE = re.compile(r"^\[([^\]]+)\]\n?(.*)\Z", re.DOTALL)
@@ -80,6 +80,19 @@ def render(card: dict, view: dict, base: str) -> str:
     branch = naming.worker_branch(ref)
     comments = view.get("comments") or []
     is_contrib = worker.is_contrib(card.get("project") or "")
+    legacy = task_protocol.use_legacy_path()
+    if legacy:
+        writer = "board-CLI"
+        report_command = (
+            f"`python3 -m triggered_agents pipeline --role worker report --ref {ref} --kind "
+            f"done|blocked --body-file <файл>`"
+        )
+    else:
+        writer = "secretary task"
+        report_command = (
+            f"`{task_protocol.command_prefix()} task report --ref {ref} --role worker --kind "
+            f"done|blocked --body-file <файл>`"
+        )
     if is_contrib:
         done_clause = (
             f"Контриб-проект (форк): PR в этом пайплайне не открывается — ветку в форк для "
@@ -88,9 +101,8 @@ def render(card: dict, view: dict, base: str) -> str:
             f"и Co-Authored-By, стиль — как в git log репо."
         )
         report_clause = (
-            f"Отчёт по каждому acceptance criterion (сделано/нет и как проверял) — через board-CLI: "
-            f"`python3 -m triggered_agents pipeline --role worker report --ref {ref} --kind "
-            f"done|blocked --body-file <файл>`. Вместо ссылки на PR отчёт done обязан нести ветку и "
+            f"Отчёт по каждому acceptance criterion (сделано/нет и как проверял) — через {writer}: "
+            f"{report_command}. Вместо ссылки на PR отчёт done обязан нести ветку и "
             f"head sha пуша, ровно этими протокольными строками в теле:\n"
             f"```\nbranch: {branch}\nhead: <sha HEAD после пуша>\n```\n"
             f"Несогласие со спекой — `--kind blocked` с обоснованием. Карточку сам не двигаешь. "
@@ -105,8 +117,7 @@ def render(card: dict, view: dict, base: str) -> str:
         )
         report_clause = (
             f"Отчёт по каждому acceptance criterion (сделано/нет и как проверял, плюс ссылка на PR) "
-            f"— через board-CLI: `python3 -m triggered_agents pipeline --role worker report "
-            f"--ref {ref} --kind done|blocked --body-file <файл>`. Несогласие со спекой — "
+            f"— через {writer}: {report_command}. Несогласие со спекой — "
             f"`--kind blocked` с обоснованием. Карточку сам не двигаешь. TASK.md в репо не коммить."
         )
         history_tail = ("origin, PR может быть уже открыт: начни с `git fetch`, продолжай "
@@ -144,6 +155,15 @@ def render(card: dict, view: dict, base: str) -> str:
             "",
         ]
     lines += _metadata(card, base)
+    if not legacy:
+        lines += [
+            "## Worker write protocol",
+            "",
+            f"Комментарии: `{task_protocol.command_prefix()} task comment --ref {ref} --role worker --body-file <файл>`.",
+            "Совместимый Phase 5 bridge временно оставляет Kanboard credentials в окружении CLI. "
+            "Это не техническая граница least-privilege; broker и identity isolation остаются следующими фазами.",
+            "",
+        ]
     lines += [naming.memory_block("worker", card.get("project") or "?"), ""]
     lines += ["## Спека", "", view.get("description") or "(описание карточки пустое)", ""]
     lines += _operator_context(comments)
