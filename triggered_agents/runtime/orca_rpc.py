@@ -11,6 +11,7 @@ the reply is newline-delimited JSON, possibly interleaved with {"_keepalive":tru
 """
 from __future__ import annotations
 
+import codecs
 import json
 import os
 import socket
@@ -35,11 +36,13 @@ def call(method: str, params=None, timeout: float = 20.0) -> dict:
     try:
         s.connect(endpoint)
         s.sendall((json.dumps({"id": rid, "authToken": token, "method": method, "params": params}) + "\n").encode())
+        decoder = codecs.getincrementaldecoder("utf-8")()
         buf = ""
         while True:
-            chunk = s.recv(65536).decode()
-            if not chunk:
+            raw = s.recv(65536)
+            if not raw:
                 raise RuntimeError(f"orca rpc {method}: connection closed before reply")
+            chunk = decoder.decode(raw)
             buf += chunk
             while "\n" in buf:
                 line, buf = buf.split("\n", 1)
