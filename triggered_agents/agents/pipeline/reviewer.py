@@ -6,9 +6,11 @@ that is NOT the card's worker and has no write access to the code. It reads the 
 full PR (not just the diff) and posts one structured verdict, then the dispatcher acts on it like
 it acts on a worker report — including, on green, squash-merging the PR itself (validate.py). A
 green verdict is no longer double-checked by a human before merge, so this prompt also has the
-reviewer itself re-run whatever live checks the worker's report claims (smoke, a manual probe, a
-local script) where that is safe and reproducible right in its own worktree, recording per-check
-whether it ran or couldn't — the class of proof-of-work a human skim used to catch.
+reviewer verify whatever live checks the worker's report claims. Safe local checks are re-run in
+the review worktree; heavyweight checks that need Docker, a stand or external writes are verified
+through the exact green mechanical gate for the current head SHA, its workflow and logs. This is
+the class of proof-of-work a human skim used to catch without forcing a read-only reviewer to
+repeat side effects that the lower validation layers already own.
 
 This module only builds the text of REVIEW.md. The host side (worktree + head) lives in worker.py,
 so the dispatcher keeps talking to a single host boundary. The thermo-nuclear quality lens is not
@@ -128,10 +130,14 @@ def build_task(card: dict, ref: str, pr: str | None, spec: str, base_branch: str
         "него больше нет. Если в отчёте воркера заявлена конкретная живая проверка (смоук, "
         "ручной прогон, curl на эндпоинт, запуск скрипта/команды) — прогони её сам там, где это "
         "безопасно и воспроизводимо прямо в этом воркспейсе (без стенда, без докера, без записи "
-        "во внешние сервисы или чужие данные). Заявленная, но не прогнанная проверка — тот же "
-        "случай «на бумаге», что и в линзе 1: если что-то не удалось прогнать — не догадывайся, "
-        "фиксируй как «не смог» и почему (нужен стенд/секреты/внешний сервис, которых нет в "
-        "этом воркспейсе).",
+        "во внешние сервисы или чужие данные). Для heavyweight-проверки, которую reviewer "
+        "сознательно не должен повторять (Docker, стенд, внешняя запись), допускается независимое "
+        "механическое evidence: проверь, что точная CI/stand job зелёная на ТЕКУЩЕМ head SHA, "
+        "прочитай её workflow/команду и релевантные логи или artifact, и убедись, что job реально "
+        "исполняет заявленный путь, а не мок или no-op. Такое evidence считается реальным "
+        "выполнением criterion; отсутствие личного Docker-прогона само по себе не блокер. Если "
+        "нет ни безопасного rerun, ни подходящего механического evidence текущего SHA — не "
+        "догадывайся, фиксируй как «на бумаге» и объясни, чего не хватает.",
         "",
         "## Семантика блокировки (важно — что блокер, а что нет)",
         "",
@@ -147,8 +153,9 @@ def build_task(card: dict, ref: str, pr: str | None, spec: str, base_branch: str
         "Один вердикт-коммент через board-CLI. Красный — если есть блокер любой линзы; иначе "
         "зелёный. Тело вердикта:",
         "1. По каждому criterion спеки: реально / на бумаге + почему.",
-        "2. По каждой живой проверке из отчёта воркера: прогнал сам (что вышло) ИЛИ не смог "
-        "(почему) — не пропускай молча.",
+        "2. По каждой живой проверке из отчёта воркера: прогнал сам (что вышло), ИЛИ подтвердил "
+        "механическим evidence текущего SHA (какая job, workflow/команда и результат), ИЛИ не "
+        "смог подтвердить (почему) — не пропускай молча.",
         "3. Находки, ранжированные блокер / замечание, КАЖДАЯ с файлом и сценарием поломки.",
         "",
         "```",

@@ -56,6 +56,14 @@ class BuildTaskTest(unittest.TestCase):
         self.assertIn("прогнал", text)
         self.assertIn("не смог", text)
 
+    def test_accepts_current_sha_mechanical_evidence_for_heavyweight_checks(self):
+        text = self._build()
+        self.assertIn("heavyweight-проверки", text)
+        self.assertIn("ТЕКУЩЕМ head SHA", text)
+        self.assertIn("workflow/команду", text)
+        self.assertIn("отсутствие личного Docker-прогона само по себе не блокер", text)
+        self.assertIn("ни безопасного rerun, ни подходящего механического evidence", text)
+
     def test_points_at_the_worker_report_via_show_command(self):
         ref = "triggered-agents-220"
         text = self._build(ref=ref)
