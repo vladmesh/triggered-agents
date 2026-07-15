@@ -579,6 +579,8 @@ def claim_card(reference: str, worker: str, cap: int = 3, resolved_head: str | N
     compare-and-swap, so with a single dispatcher the host-local lock is what closes the
     read-check-write race between two overlapping claims.
     """
+    if not reference:
+        raise model.GuardError("claim needs non-empty card reference")
     pid = board_id()
     with STATE.lock():
         task = _get_by_ref(reference)
@@ -609,6 +611,10 @@ def claim_card(reference: str, worker: str, cap: int = 3, resolved_head: str | N
 
         task_type = meta.get(model.META_TASK_TYPE)
         project = meta.get(model.META_PROJECT)
+        if not task_type or not project:
+            raise model.GuardError(
+                f"{reference!r} is missing project/task_type metadata"
+            )
         actives = call("getAllTasks", project_id=pid, status_id=1) or []
 
         # Validate counts toward both guards too: a card there still owns its worker session.

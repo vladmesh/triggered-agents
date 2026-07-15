@@ -726,7 +726,15 @@ def _claim_next(records: dict, statuses: dict[str, str]) -> None:
     ready = ops.list_cards(column="Ready")
     ready.sort(key=lambda c: (c["position"], c["id"]))
     for card in ready:
-        ref = card["reference"]
+        ref = card.get("reference") or ""
+        if not ref:
+            STATE.log_run("claim-skip", reference="", task_id=card.get("id"),
+                          reason="missing card reference")
+            continue
+        if not card.get("project") or not card.get("task_type"):
+            STATE.log_run("claim-skip", reference=ref, task_id=card.get("id"),
+                          reason="missing project/task_type metadata")
+            continue
         preferred = card.get("head") or heads.DEFAULT_PROFILE
         try:
             heads.load_registry().profile(preferred)
