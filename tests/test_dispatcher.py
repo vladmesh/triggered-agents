@@ -609,6 +609,26 @@ class DispatcherTest(_DispatcherBase):
         self.assertEqual(self._column(ref_b), "Ready")       # skipped, predecessor not Done
         self.assertEqual(self._column(ref_a), model.IN_PROGRESS)
 
+    def test_claim_skips_malformed_ready_card_without_reference_or_metadata(self):
+        self.board.add_task("broken", "Ready", swimlane="codegen_orchestrator",
+                            reference="", meta={})
+        ref = self._ready_card("A", project="personal_site")
+        for t in self.board.tasks.values():
+            if t["title"] == "broken":
+                t["position"] = 1
+            elif t["reference"] == ref:
+                t["position"] = 2
+
+        dispatcher.tick()
+
+        broken = next(t for t in self.board.tasks.values() if t["title"] == "broken")
+        self.assertEqual(self.board._column_title_for(broken["id"]), "Ready")
+        self.assertEqual(self._column(ref), model.IN_PROGRESS)
+        self.assertEqual(self.worker.workspace_calls, [("personal_site", f"{naming.card_id(ref)}-a", "main")])
+        runs = [r for r in self._runs() if r["event"] == "claim-skip"]
+        self.assertTrue(any(r.get("task_id") == broken["id"] and "missing card reference" in r["reason"]
+                            for r in runs))
+
     def test_claim_stops_at_cap(self):
         busy = self.board.add_task("busy", "In progress", swimlane="other",
                                    meta={model.META_TASK_TYPE: "research", model.META_PROJECT: "other",
