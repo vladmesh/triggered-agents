@@ -478,6 +478,36 @@ class CloseOrphanTerminalsTest(unittest.TestCase):
 
         self.assertEqual(calls, ["term-default"])
 
+    def test_keeps_same_pty_when_orca_aliases_created_handle(self):
+        calls = []
+        keep = {
+            "handle": "term-create",
+            "ptyId": "repo::/ws@@pty-1",
+            "paneKey": "tab-1:leaf-1",
+            "tabId": "tab-1",
+        }
+
+        def fake_orca_json(args):
+            if args[:2] == ["terminal", "list"]:
+                return {"terminals": [
+                    {
+                        "handle": "term-list-alias",
+                        "ptyId": "repo::/ws@@pty-1",
+                        "tabId": "tab-1",
+                        "leafId": "leaf-1",
+                    },
+                    {"handle": "term-default", "ptyId": "repo::/ws@@pty-2"},
+                ]}
+            if args[:2] == ["terminal", "close"]:
+                calls.append(args[args.index("--terminal") + 1])
+                return {"close": {"handle": calls[-1]}}
+            raise AssertionError(f"unexpected orca call: {args}")
+
+        with mock.patch.object(worker, "_orca_json", fake_orca_json):
+            worker._close_orphan_terminals("/ws", "term-create", keep)
+
+        self.assertEqual(calls, ["term-default"])
+
     def test_empty_keep_handle_closes_nothing_including_the_head_itself(self):
         # Regression (review verdict, triggered-agents-247): a `terminal create` response with
         # neither "handle" nor "id" makes launch_worker/spawn_reviewer pass keep_handle="" — an
@@ -537,7 +567,7 @@ class LaunchWorkerClosesOrphanTest(unittest.TestCase):
              mock.patch.object(worker, "_close_orphan_terminals") as close:
             handle = worker.launch_worker("/ws", None, "w1", "title")
         self.assertEqual(handle, "term-new")
-        close.assert_called_once_with("/ws", "term-new")
+        close.assert_called_once_with("/ws", "term-new", {"handle": "term-new"})
 
 
 class SpawnReviewerClosesOrphanTest(unittest.TestCase):
@@ -556,7 +586,7 @@ class SpawnReviewerClosesOrphanTest(unittest.TestCase):
                 "proj", "rev1", "main", "REVIEW.md content", "title", "pr-branch", "review-branch")
         self.assertEqual(ws, "/ws")
         self.assertEqual(handle, "term-rev")
-        close.assert_called_once_with("/ws", "term-rev")
+        close.assert_called_once_with("/ws", "term-rev", {"handle": "term-rev"})
 
 
 class TerminalLiveTest(unittest.TestCase):

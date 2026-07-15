@@ -531,7 +531,27 @@ def ensure_theme() -> None:
         raise WorkspaceError(str(e)) from e
 
 
-def _close_orphan_terminals(workspace: str, keep_handle: str) -> None:
+def _terminal_identity_tokens(term: dict) -> set[str]:
+    tokens = set()
+    for key in ("handle", "id", "ptyId", "leafId", "paneKey"):
+        value = term.get(key)
+        if value:
+            tokens.add(f"{key}:{value}")
+    tab_id = term.get("tabId")
+    leaf_id = term.get("leafId")
+    if tab_id and leaf_id:
+        tokens.add(f"tab_leaf:{tab_id}:{leaf_id}")
+    pane_key = term.get("paneKey")
+    if isinstance(pane_key, str) and ":" in pane_key:
+        tab, leaf = pane_key.split(":", 1)
+        if tab and leaf:
+            tokens.add(f"tab_leaf:{tab}:{leaf}")
+            tokens.add(f"leafId:{leaf}")
+    return tokens
+
+
+def _close_orphan_terminals(workspace: str, keep_handle: str,
+                            keep_terminal: dict | None = None) -> None:
     """Best-effort: close every terminal in `workspace` other than `keep_handle`. `create_workspace`'s
     `--activate` makes Orca reveal the fresh worktree with an empty default shell tab already open
     (confirmed empirically — orca has no `--activate --no-default-terminal` to suppress it, see
@@ -548,6 +568,9 @@ def _close_orphan_terminals(workspace: str, keep_handle: str) -> None:
     degenerate response: no orphan gets closed, but the head survives."""
     if not keep_handle:
         return
+    keep_tokens = _terminal_identity_tokens({"handle": keep_handle})
+    if keep_terminal:
+        keep_tokens.update(_terminal_identity_tokens(keep_terminal))
     try:
         data = _orca_json(["terminal", "list", "--worktree", f"path:{workspace}", "--limit", "50"])
     except (WorkspaceError, subprocess.TimeoutExpired):
@@ -555,6 +578,8 @@ def _close_orphan_terminals(workspace: str, keep_handle: str) -> None:
     for t in data.get("terminals") or []:
         handle = t.get("handle") or t.get("id")
         if not handle or handle == keep_handle:
+            continue
+        if keep_tokens and (_terminal_identity_tokens(t) & keep_tokens):
             continue
         try:
             _orca_json(["terminal", "close", "--terminal", handle])
@@ -606,7 +631,7 @@ def _create_head_terminal(workspace: str, title: str, launch: heads.LaunchSpec) 
     except Exception:
         _close_terminal(handle)
         raise
-    _close_orphan_terminals(workspace, handle)
+    _close_orphan_terminals(workspace, handle, term)
     return handle
 
 
